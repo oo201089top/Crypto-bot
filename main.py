@@ -2,6 +2,7 @@ import os
 import time
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, List, Optional, Tuple
@@ -22,27 +23,29 @@ ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "5m")
 CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "15m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 
-SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "3"))
+SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "1"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "68"))
 WATCH_SCORE = int(os.getenv("WATCH_SCORE", "58"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "90"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "120"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
 STATUS_EVERY_SCANS = int(os.getenv("STATUS_EVERY_SCANS", "20"))
 MIN_RR = float(os.getenv("MIN_RR", "1.5"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "3.5"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "500000"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
+SYMBOL_REFRESH_MINUTES = int(os.getenv("SYMBOL_REFRESH_MINUTES", "30"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+MAX_PRE_PUMP_PCT = float(os.getenv("MAX_PRE_PUMP_PCT", "18"))
 
-DEFAULT_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT",
-    "ARBUSDT", "OPUSDT", "INJUSDT", "APTUSDT", "RIFUSDT"
-]
+EXCLUDED_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX",
+    "LINK", "DOT", "LTC", "BCH", "SUI", "TON", "SHIB", "PEPE",
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "TRY", "BRL"
+}
 
-SYMBOLS = [
-    s.strip().upper()
-    for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",")
-    if s.strip()
-]
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
+SYMBOL_CACHE: Dict[str, object] = {"symbols": [], "updated_at": 0.0}
+
 
 STATE_FILE = Path("smart_signal_state.json")
 SESSION = requests.Session()
@@ -84,6 +87,50 @@ def get_klines(symbol: str, interval: str, limit: int = 260) -> List[Dict]:
             "quote_volume": float(x[7]),
         })
     return candles
+
+
+def get_dynamic_symbols() -> List[str]:
+    now = time.time()
+    cached = SYMBOL_CACHE.get("symbols", [])
+    updated_at = float(SYMBOL_CACHE.get("updated_at", 0.0))
+    if cached and now - updated_at < SYMBOL_REFRESH_MINUTES * 60:
+        return list(cached)
+
+    exchange = SESSION.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=25)
+    exchange.raise_for_status()
+    ticker = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=25)
+    ticker.raise_for_status()
+
+    quote_volume = {
+        item.get("symbol", ""): float(item.get("quoteVolume", 0.0) or 0.0)
+        for item in ticker.json()
+    }
+
+    candidates: List[Tuple[str, float]] = []
+    for item in exchange.json().get("symbols", []):
+        symbol = item.get("symbol", "")
+        base = item.get("baseAsset", "")
+        quote = item.get("quoteAsset", "")
+
+        if item.get("status") != "TRADING" or quote != "USDT":
+            continue
+        if not item.get("isSpotTradingAllowed", True):
+            continue
+        if base in EXCLUDED_BASES:
+            continue
+        if base.endswith(LEVERAGED_SUFFIXES):
+            continue
+
+        volume = quote_volume.get(symbol, 0.0)
+        if volume < MIN_QUOTE_VOLUME:
+            continue
+        candidates.append((symbol, volume))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    symbols = [symbol for symbol, _ in candidates[:MAX_SYMBOLS]]
+    SYMBOL_CACHE["symbols"] = symbols
+    SYMBOL_CACHE["updated_at"] = now
+    return symbols
 
 
 # =========================
@@ -378,6 +425,8 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
 
     atr_pct = current_atr / price * 100
     distance_ema20 = abs(price - e20) / price * 100
+    lookback_price = closes[-13] if len(closes) >= 13 else closes[0]
+    recent_change_pct = ((price / lookback_price) - 1) * 100 if lookback_price else 0.0
 
     long_score = 0
     short_score = 0
@@ -496,6 +545,14 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
         short_score -= 6
         warnings.append("تشبع بيعي")
 
+    if recent_change_pct >= MAX_PRE_PUMP_PCT:
+        long_score -= 20
+        warnings.append(f"ارتفاع سابق {recent_change_pct:.1f}%: احتمال دخول متأخر")
+
+    if volume_ratio < 1.10:
+        long_score -= 8
+        short_score -= 8
+
     if avg_quote_volume < MIN_QUOTE_VOLUME:
         return None
 
@@ -559,6 +616,7 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
         "adx": adx_now,
         "volume_ratio": volume_ratio,
         "atr_pct": atr_pct,
+        "recent_change_pct": recent_change_pct,
         "regime": regime,
         "reasons": reasons[:7],
         "warnings": list(dict.fromkeys(warnings))[:3],
@@ -584,35 +642,47 @@ def fmt(value: float) -> str:
 def signal_message(result: Dict) -> str:
     side_icon = "🟢" if result["side"] == "LONG" else "🔴"
     side_ar = "لونغ" if result["side"] == "LONG" else "شورت"
-    type_ar = "إشارة دخول" if result["signal_type"] == "ENTRY" else "تحت المراقبة"
-
     reasons = "\n".join(f"• {reason}" for reason in result["reasons"])
+
     warnings = ""
     if result["warnings"]:
         warnings = "\n\nتحذيرات:\n" + "\n".join(
             f"• {warning}" for warning in result["warnings"]
         )
 
-    return (
-        f"{side_icon} {type_ar} — {result['symbol']}\n\n"
+    header = (
+        f"{side_icon} {'إشارة دخول' if result['signal_type'] == 'ENTRY' else 'تحت المراقبة'} — {result['symbol']}\n\n"
         f"الاتجاه: {side_ar}\n"
         f"النموذج: {result['setup']}\n"
         f"الثقة الذكية: {result['confidence']}%\n"
         f"التقييم: {result['score']}\n"
         f"الفريم: {ENTRY_TIMEFRAME}\n"
-        f"حالة السوق: {result['regime']}\n\n"
-        f"الدخول التقريبي: {fmt(result['entry'])}\n"
-        f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
-        f"الهدف الأول: {fmt(result['target1'])}\n"
-        f"الهدف الثاني: {fmt(result['target2'])}\n"
-        f"الهدف الثالث: {fmt(result['target3'])}\n\n"
-        f"RSI: {result['rsi']:.1f}\n"
-        f"ADX: {result['adx']:.1f}\n"
+        f"حالة السوق: {result['regime']}\n"
         f"الفوليوم: ×{result['volume_ratio']:.1f}\n"
-        f"ATR: {result['atr_pct']:.2f}%\n\n"
-        f"الأسباب:\n{reasons}"
-        f"{warnings}\n\n"
-        "⚠️ تحليل فني آلي وليس ضمانًا للربح. استخدم وقف الخسارة."
+        f"الحركة الأخيرة: {result['recent_change_pct']:.1f}%\n"
+    )
+
+    if result["signal_type"] == "WATCH":
+        return (
+            header
+            + f"\nالأسباب:\n{reasons}"
+            + warnings
+            + "\n\n⏳ مراقبة فقط، لا يوجد دخول مؤكد حتى الآن."
+        )
+
+    return (
+        header
+        + f"\nالدخول التقريبي: {fmt(result['entry'])}\n"
+        + f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
+        + f"الهدف الأول: {fmt(result['target1'])}\n"
+        + f"الهدف الثاني: {fmt(result['target2'])}\n"
+        + f"الهدف الثالث: {fmt(result['target3'])}\n\n"
+        + f"RSI: {result['rsi']:.1f}\n"
+        + f"ADX: {result['adx']:.1f}\n"
+        + f"ATR: {result['atr_pct']:.2f}%\n\n"
+        + f"الأسباب:\n{reasons}"
+        + warnings
+        + "\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح. استخدم وقف الخسارة."
     )
 
 
@@ -636,15 +706,21 @@ def scan(state: Dict) -> None:
     btc_filter = trend_snapshot(btc_candles)
 
     results: List[Dict] = []
+    symbols = get_dynamic_symbols()
 
-    for symbol in SYMBOLS:
+    def worker(symbol: str) -> Optional[Dict]:
         try:
-            result = analyze_symbol(symbol, state, btc_filter)
-            if result and is_cooled(state, result):
-                results.append(result)
-            time.sleep(0.15)
+            return analyze_symbol(symbol, state, btc_filter)
         except Exception as exc:
             print(f"{symbol}: {exc}", flush=True)
+            return None
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(worker, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            result = future.result()
+            if result and is_cooled(state, result):
+                results.append(result)
 
     results.sort(
         key=lambda item: (
@@ -670,7 +746,7 @@ def scan(state: Dict) -> None:
     if STATUS_EVERY_SCANS > 0 and state["scan_count"] % STATUS_EVERY_SCANS == 0:
         send_message(
             "🤖 البوت يعمل ويواصل الفحص.\n"
-            f"عدد العملات: {len(SYMBOLS)}\n"
+            f"عدد العملات: {len(symbols)}\n"
             f"الفريمات: {ENTRY_TIMEFRAME} / {CONFIRM_TIMEFRAME} / {TREND_TIMEFRAME}\n"
             f"آخر فحص: تم العثور على {sent} تنبيه."
         )
@@ -689,7 +765,8 @@ def main() -> None:
         "✅ تم تشغيل بوت المضاربة الذكي.\n"
         f"فريم الدخول: {ENTRY_TIMEFRAME}\n"
         f"التأكيد: {CONFIRM_TIMEFRAME} و{TREND_TIMEFRAME}\n"
-        "المميزات: لونغ وشورت، اختراق وارتداد، فلتر بيتكوين، "
+        "المميزات: اكتشاف تلقائي لعملات Binance Spot، استبعاد العملات الكبرى، "
+        "لونغ وشورت، اختراق وارتداد، فلتر بيتكوين، "
         "فوليوم، MACD، ADX، VWAP، OBV، ATR، Bollinger، "
         "وفلترة الاختراق الوهمي."
     )
