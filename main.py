@@ -15,6 +15,7 @@ import requests
 # ============================================================
 
 BINANCE_BASE = "https://data-api.binance.vision"
+BYBIT_BASE = "https://api.bybit.com"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -30,19 +31,19 @@ MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
 STATUS_EVERY_SCANS = int(os.getenv("STATUS_EVERY_SCANS", "20"))
 MIN_RR = float(os.getenv("MIN_RR", "1.5"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "3.5"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "500000"))
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "1000000"))
+MAX_QUOTE_VOLUME = float(os.getenv("MAX_QUOTE_VOLUME", "250000000"))
+MAX_SYMBOLS_PER_EXCHANGE = int(os.getenv("MAX_SYMBOLS_PER_EXCHANGE", "45"))
 
-DEFAULT_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT",
-    "ARBUSDT", "OPUSDT", "INJUSDT", "APTUSDT", "RIFUSDT"
-]
+# سبوت فقط: نستبعد العملات الكبيرة والعملات المستقرة والرموز ذات الرافعة.
+EXCLUDED_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "AVAX",
+    "LINK", "SUI", "TON", "DOT", "LTC", "BCH", "SHIB", "HBAR", "XLM",
+    "UNI", "AAVE", "ETC", "NEAR", "APT", "PEPE", "TAO", "ICP", "FIL",
+    "USDC", "USDT", "FDUSD", "TUSD", "DAI", "USDE", "PYUSD", "EUR",
+}
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
-SYMBOLS = [
-    s.strip().upper()
-    for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",")
-    if s.strip()
-]
 
 STATE_FILE = Path("smart_signal_state.json")
 SESSION = requests.Session()
@@ -64,26 +65,122 @@ def send_message(text: str) -> None:
     response.raise_for_status()
 
 
-def get_klines(symbol: str, interval: str, limit: int = 260) -> List[Dict]:
+def _bybit_interval(interval: str) -> str:
+    mapping = {
+        "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+        "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+        "1d": "D", "1w": "W", "1M": "M",
+    }
+    if interval not in mapping:
+        raise ValueError(f"Bybit does not support timeframe: {interval}")
+    return mapping[interval]
+
+
+def get_klines(exchange: str, symbol: str, interval: str, limit: int = 260) -> List[Dict]:
+    if exchange == "BINANCE":
+        response = SESSION.get(
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=20,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        return [{
+            "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+            "close": float(x[4]), "volume": float(x[5]),
+            "close_time": int(x[6]), "quote_volume": float(x[7]),
+        } for x in rows]
+
     response = SESSION.get(
-        f"{BINANCE_BASE}/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
+        f"{BYBIT_BASE}/v5/market/kline",
+        params={
+            "category": "spot", "symbol": symbol,
+            "interval": _bybit_interval(interval), "limit": limit,
+        },
         timeout=20,
     )
     response.raise_for_status()
+    payload = response.json()
+    if payload.get("retCode") != 0:
+        raise RuntimeError(payload.get("retMsg", "Bybit kline error"))
 
-    candles: List[Dict] = []
-    for x in response.json():
-        candles.append({
-            "open": float(x[1]),
-            "high": float(x[2]),
-            "low": float(x[3]),
-            "close": float(x[4]),
-            "volume": float(x[5]),
-            "close_time": int(x[6]),
-            "quote_volume": float(x[7]),
-        })
-    return candles
+    # Bybit returns newest first; indicators need oldest first.
+    rows = list(reversed(payload["result"]["list"]))
+    interval_ms = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+        "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+        "4h": 14_400_000, "6h": 21_600_000, "12h": 43_200_000,
+        "1d": 86_400_000, "1w": 604_800_000,
+    }.get(interval, 0)
+    return [{
+        "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+        "close": float(x[4]), "volume": float(x[5]),
+        "quote_volume": float(x[6]),
+        "close_time": int(x[0]) + interval_ms - 1,
+    } for x in rows]
+
+
+def _valid_small_mid_symbol(symbol: str) -> bool:
+    if not symbol.endswith("USDT"):
+        return False
+    base = symbol[:-4]
+    if base in EXCLUDED_BASES or base.endswith(LEVERAGED_SUFFIXES):
+        return False
+    return bool(base) and base.isalnum()
+
+
+def discover_binance_symbols() -> List[Dict]:
+    response = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=25)
+    response.raise_for_status()
+    candidates = []
+    for item in response.json():
+        symbol = item.get("symbol", "")
+        if not _valid_small_mid_symbol(symbol):
+            continue
+        quote_volume = float(item.get("quoteVolume", 0) or 0)
+        change = abs(float(item.get("priceChangePercent", 0) or 0))
+        if MIN_QUOTE_VOLUME <= quote_volume <= MAX_QUOTE_VOLUME:
+            candidates.append({
+                "exchange": "BINANCE", "symbol": symbol,
+                "quote_volume": quote_volume, "change": change,
+            })
+    candidates.sort(key=lambda x: (x["change"], x["quote_volume"]), reverse=True)
+    return candidates[:MAX_SYMBOLS_PER_EXCHANGE]
+
+
+def discover_bybit_symbols() -> List[Dict]:
+    response = SESSION.get(
+        f"{BYBIT_BASE}/v5/market/tickers", params={"category": "spot"}, timeout=25
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("retCode") != 0:
+        raise RuntimeError(payload.get("retMsg", "Bybit tickers error"))
+
+    candidates = []
+    for item in payload["result"]["list"]:
+        symbol = item.get("symbol", "")
+        if not _valid_small_mid_symbol(symbol):
+            continue
+        quote_volume = float(item.get("turnover24h", 0) or 0)
+        change = abs(float(item.get("price24hPcnt", 0) or 0)) * 100
+        if MIN_QUOTE_VOLUME <= quote_volume <= MAX_QUOTE_VOLUME:
+            candidates.append({
+                "exchange": "BYBIT", "symbol": symbol,
+                "quote_volume": quote_volume, "change": change,
+            })
+    candidates.sort(key=lambda x: (x["change"], x["quote_volume"]), reverse=True)
+    return candidates[:MAX_SYMBOLS_PER_EXCHANGE]
+
+
+def discover_symbols() -> List[Dict]:
+    combined: List[Dict] = []
+    for finder in (discover_binance_symbols, discover_bybit_symbols):
+        try:
+            combined.extend(finder())
+        except Exception as exc:
+            print(f"Symbol discovery error: {exc}", flush=True)
+    return combined
 
 
 # =========================
@@ -329,10 +426,10 @@ def market_regime(candles: List[Dict]) -> str:
 # =========================
 # التحليل الذكي
 # =========================
-def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]:
-    entry_candles = get_klines(symbol, ENTRY_TIMEFRAME)
-    confirm_candles = get_klines(symbol, CONFIRM_TIMEFRAME)
-    trend_candles = get_klines(symbol, TREND_TIMEFRAME)
+def analyze_symbol(exchange: str, symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]:
+    entry_candles = get_klines(exchange, symbol, ENTRY_TIMEFRAME)
+    confirm_candles = get_klines(exchange, symbol, CONFIRM_TIMEFRAME)
+    trend_candles = get_klines(exchange, symbol, TREND_TIMEFRAME)
 
     closed = entry_candles[:-1]
     closes = [c["close"] for c in closed]
@@ -458,9 +555,10 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     add_short(trend["bearish"], 8, f"اتجاه {TREND_TIMEFRAME} هابط")
 
     # فلتر بيتكوين
-    if symbol != "BTCUSDT":
-        add_long(btc_filter["bullish"], 5, "بيتكوين داعم")
-        add_short(btc_filter["bearish"], 5, "بيتكوين ضاغط")
+    add_long(btc_filter["bullish"], 5, "بيتكوين داعم")
+    if btc_filter["bearish"]:
+        long_score -= 7
+        warnings.append("بيتكوين ضاغط على السوق")
 
     # تكيف مع حالة السوق
     if regime == "TRENDING":
@@ -503,9 +601,10 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     long_score += adaptive_bonus(state, "LONG")
     short_score += adaptive_bonus(state, "SHORT")
 
-    side = "LONG" if long_score >= short_score else "SHORT"
-    score = max(long_score, short_score)
-    reasons = long_reasons if side == "LONG" else short_reasons
+    # سبوت فقط: لا نرسل إشارات شورت.
+    side = "LONG"
+    score = long_score
+    reasons = long_reasons
 
     if side == "LONG":
         stop = min(
@@ -543,6 +642,7 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     setup = "اختراق" if (breakout_long if side == "LONG" else breakout_short) else "ارتداد"
 
     return {
+        "exchange": exchange,
         "symbol": symbol,
         "side": side,
         "score": score,
@@ -582,10 +682,7 @@ def fmt(value: float) -> str:
 
 
 def signal_message(result: Dict) -> str:
-    side_icon = "🟢" if result["side"] == "LONG" else "🔴"
-    side_ar = "لونغ" if result["side"] == "LONG" else "شورت"
-    type_ar = "إشارة دخول" if result["signal_type"] == "ENTRY" else "تحت المراقبة"
-
+    type_ar = "🟢 إشارة دخول" if result["signal_type"] == "ENTRY" else "🟡 تحت المراقبة"
     reasons = "\n".join(f"• {reason}" for reason in result["reasons"])
     warnings = ""
     if result["warnings"]:
@@ -593,26 +690,42 @@ def signal_message(result: Dict) -> str:
             f"• {warning}" for warning in result["warnings"]
         )
 
-    return (
-        f"{side_icon} {type_ar} — {result['symbol']}\n\n"
-        f"الاتجاه: {side_ar}\n"
+    header = (
+        f"{type_ar} — {result['symbol']}\n"
+        f"المنصة: {result['exchange']} SPOT\n\n"
+        f"الاتجاه: شراء سبوت\n"
         f"النموذج: {result['setup']}\n"
         f"الثقة الذكية: {result['confidence']}%\n"
         f"التقييم: {result['score']}\n"
         f"الفريم: {ENTRY_TIMEFRAME}\n"
         f"حالة السوق: {result['regime']}\n\n"
+    )
+
+    metrics = (
+        f"RSI: {result['rsi']:.1f}\n"
+        f"ADX: {result['adx']:.1f}\n"
+        f"الفوليوم: ×{result['volume_ratio']:.1f}\n"
+        f"ATR: {result['atr_pct']:.2f}%\n\n"
+        f"الأسباب:\n{reasons}{warnings}"
+    )
+
+    if result["signal_type"] == "WATCH":
+        return (
+            header + metrics +
+            "\n\n⏳ انتظر تأكيد الدخول، لا تدخل الآن."
+            "\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح."
+        )
+
+    levels = (
         f"الدخول التقريبي: {fmt(result['entry'])}\n"
         f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
         f"الهدف الأول: {fmt(result['target1'])}\n"
         f"الهدف الثاني: {fmt(result['target2'])}\n"
         f"الهدف الثالث: {fmt(result['target3'])}\n\n"
-        f"RSI: {result['rsi']:.1f}\n"
-        f"ADX: {result['adx']:.1f}\n"
-        f"الفوليوم: ×{result['volume_ratio']:.1f}\n"
-        f"ATR: {result['atr_pct']:.2f}%\n\n"
-        f"الأسباب:\n{reasons}"
-        f"{warnings}\n\n"
-        "⚠️ تحليل فني آلي وليس ضمانًا للربح. استخدم وقف الخسارة."
+    )
+    return (
+        header + levels + metrics +
+        "\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح. استخدم وقف الخسارة."
     )
 
 
@@ -620,31 +733,33 @@ def signal_message(result: Dict) -> str:
 # الفحص الدوري
 # =========================
 def is_cooled(state: Dict, result: Dict) -> bool:
-    key = f"{result['symbol']}:{result['side']}:{result['signal_type']}"
+    key = f"{result['exchange']}:{result['symbol']}:{result['side']}:{result['signal_type']}"
     previous = int(state.get("alerts", {}).get(key, 0))
     elapsed = result["candle_close"] - previous
     return elapsed >= COOLDOWN_MINUTES * 60 * 1000
 
 
 def remember_alert(state: Dict, result: Dict) -> None:
-    key = f"{result['symbol']}:{result['side']}:{result['signal_type']}"
+    key = f"{result['exchange']}:{result['symbol']}:{result['side']}:{result['signal_type']}"
     state.setdefault("alerts", {})[key] = result["candle_close"]
 
 
 def scan(state: Dict) -> None:
-    btc_candles = get_klines("BTCUSDT", CONFIRM_TIMEFRAME)
+    btc_candles = get_klines("BINANCE", "BTCUSDT", CONFIRM_TIMEFRAME)
     btc_filter = trend_snapshot(btc_candles)
+    symbols = discover_symbols()
 
     results: List[Dict] = []
-
-    for symbol in SYMBOLS:
+    for item in symbols:
+        exchange = item["exchange"]
+        symbol = item["symbol"]
         try:
-            result = analyze_symbol(symbol, state, btc_filter)
+            result = analyze_symbol(exchange, symbol, state, btc_filter)
             if result and is_cooled(state, result):
                 results.append(result)
-            time.sleep(0.15)
+            time.sleep(0.12)
         except Exception as exc:
-            print(f"{symbol}: {exc}", flush=True)
+            print(f"{exchange}:{symbol}: {exc}", flush=True)
 
     results.sort(
         key=lambda item: (
@@ -659,25 +774,25 @@ def scan(state: Dict) -> None:
     for result in results:
         if sent >= MAX_ALERTS_PER_SCAN:
             break
-
         send_message(signal_message(result))
         remember_alert(state, result)
         sent += 1
         time.sleep(0.3)
 
     state["scan_count"] = int(state.get("scan_count", 0)) + 1
-
     if STATUS_EVERY_SCANS > 0 and state["scan_count"] % STATUS_EVERY_SCANS == 0:
         send_message(
             "🤖 البوت يعمل ويواصل الفحص.\n"
-            f"عدد العملات: {len(SYMBOLS)}\n"
+            f"عدد الأزواج المفحوصة: {len(symbols)}\n"
+            "الأسواق: Binance Spot + Bybit Spot\n"
+            "التركيز: العملات الصغيرة والمتوسطة فقط\n"
             f"الفريمات: {ENTRY_TIMEFRAME} / {CONFIRM_TIMEFRAME} / {TREND_TIMEFRAME}\n"
-            f"آخر فحص: تم العثور على {sent} تنبيه."
+            f"آخر فحص: تم إرسال {sent} تنبيه."
         )
 
     save_state(state)
     print(
-        f"Scan finished | candidates={len(results)} | sent={sent}",
+        f"Scan finished | symbols={len(symbols)} | candidates={len(results)} | sent={sent}",
         flush=True,
     )
 
@@ -686,12 +801,13 @@ def main() -> None:
     state = load_state()
 
     send_message(
-        "✅ تم تشغيل بوت المضاربة الذكي.\n"
+        "✅ تم تشغيل بوت صيد العملات الصغيرة والمتوسطة.\n"
+        "الأسواق: Binance Spot + Bybit Spot\n"
+        "النوع: شراء سبوت فقط — بدون شورت أو رافعة\n"
         f"فريم الدخول: {ENTRY_TIMEFRAME}\n"
         f"التأكيد: {CONFIRM_TIMEFRAME} و{TREND_TIMEFRAME}\n"
-        "المميزات: لونغ وشورت، اختراق وارتداد، فلتر بيتكوين، "
-        "فوليوم، MACD، ADX، VWAP، OBV، ATR، Bollinger، "
-        "وفلترة الاختراق الوهمي."
+        "يستبعد العملات الكبيرة والمستقرة والعملات ضعيفة السيولة، "
+        "ويركز على الفوليوم والزخم والاختراقات والارتدادات."
     )
 
     while True:
