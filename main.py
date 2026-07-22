@@ -201,7 +201,11 @@ def atr(candles: List[Dict], period: int = 14) -> float:
     return mean(values[-period:])
 
 
-def macd(values: List[float]) -> Tuple[float, float, float]:
+def macd(values: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    # MACD يحتاج 26 شمعة على الأقل، وخط الإشارة يحتاج 9 قيم MACD إضافية.
+    if len(values) < 35:
+        return None, None, None
+
     fast = ema(values, 12)
     slow = ema(values, 26)
 
@@ -210,9 +214,15 @@ def macd(values: List[float]) -> Tuple[float, float, float]:
         if fast_value is not None and slow_value is not None:
             series.append(fast_value - slow_value)
 
+    if len(series) < 9:
+        return None, None, None
+
     signal = ema(series, 9)
     macd_now = series[-1]
     signal_now = signal[-1]
+    if signal_now is None:
+        return None, None, None
+
     return macd_now, signal_now, macd_now - signal_now
 
 
@@ -339,22 +349,29 @@ def trend_snapshot(candles: List[Dict]) -> Dict:
     closed = candles[:-1]
     closes = [c["close"] for c in closed]
 
+    # العملات الحديثة قد لا تملك 200 شمعة على فريم الساعة.
+    # في هذه الحالة نعيد اتجاهًا محايدًا بدل حدوث خطأ NoneType.
+    if len(closes) < 200:
+        return {"bullish": False, "bearish": False, "neutral": True, "rsi": None}
+
     e20 = ema(closes, 20)[-1]
     e50 = ema(closes, 50)[-1]
     e200 = ema(closes, 200)[-1]
     rsi_now = rsi(closes)[-1]
     _, _, histogram = macd(closes)
 
+    required = (e20, e50, e200, rsi_now, histogram)
+    if any(value is None for value in required):
+        return {"bullish": False, "bearish": False, "neutral": True, "rsi": rsi_now}
+
     price = closes[-1]
+    bullish = price > e20 > e50 and price > e200 and histogram > 0
+    bearish = price < e20 < e50 and price < e200 and histogram < 0
 
     return {
-        "bullish": price > e20 > e50 and price > e200 and histogram > 0,
-        "bearish": price < e20 < e50 and price < e200 and histogram < 0,
-        "neutral": not (
-            price > e20 > e50 and price > e200 and histogram > 0
-        ) and not (
-            price < e20 < e50 and price < e200 and histogram < 0
-        ),
+        "bullish": bullish,
+        "bearish": bearish,
+        "neutral": not bullish and not bearish,
         "rsi": rsi_now,
     }
 
@@ -386,6 +403,10 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     volumes = [c["volume"] for c in closed]
     quote_volumes = [c["quote_volume"] for c in closed]
 
+    # تجاهل العملات الجديدة أو البيانات غير المكتملة بأمان.
+    if len(closed) < 60 or len(confirm_candles) < 35 or len(trend_candles) < 35:
+        return None
+
     price = closes[-1]
     candle = closed[-1]
 
@@ -398,6 +419,11 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     rsi_prev = rsi_values[-2]
 
     macd_now, macd_signal, macd_hist = macd(closes)
+
+    required_indicators = (e9, e20, e50, rsi_now, rsi_prev, macd_now, macd_signal, macd_hist)
+    if any(value is None for value in required_indicators):
+        return None
+
     current_atr = atr(closed)
     adx_now = adx(closed)
     bb_mid, bb_upper, bb_lower = bollinger(closes)
@@ -762,7 +788,7 @@ def main() -> None:
     state = load_state()
 
     send_message(
-        "✅ تم تشغيل بوت المضاربة الذكي.\n"
+        "✅ تم تشغيل بوت المضاربة الذكي V2.1.\n"
         f"فريم الدخول: {ENTRY_TIMEFRAME}\n"
         f"التأكيد: {CONFIRM_TIMEFRAME} و{TREND_TIMEFRAME}\n"
         "المميزات: اكتشاف تلقائي لعملات Binance Spot، استبعاد العملات الكبرى، "
