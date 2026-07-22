@@ -14,7 +14,7 @@ import requests
 # يرسل إشارات فنية فقط ولا ينفذ صفقات.
 # ============================================================
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
