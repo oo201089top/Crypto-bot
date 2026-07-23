@@ -24,23 +24,23 @@ CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "15m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 
 SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "1"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "68"))
-WATCH_SCORE = int(os.getenv("WATCH_SCORE", "58"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "76"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "120"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
-STATUS_EVERY_SCANS = int(os.getenv("STATUS_EVERY_SCANS", "20"))
+STATUS_EVERY_SCANS = int(os.getenv("STATUS_EVERY_SCANS", "0"))
 MIN_RR = float(os.getenv("MIN_RR", "1.5"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "3.5"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "500000"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "250000"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))
 SYMBOL_REFRESH_MINUTES = int(os.getenv("SYMBOL_REFRESH_MINUTES", "30"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-MAX_PRE_PUMP_PCT = float(os.getenv("MAX_PRE_PUMP_PCT", "18"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
+MAX_PRE_PUMP_PCT = float(os.getenv("MAX_PRE_PUMP_PCT", "12"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.8"))
+MIN_ADX = float(os.getenv("MIN_ADX", "22"))
 
 EXCLUDED_BASES = {
-    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX",
-    "LINK", "DOT", "LTC", "BCH", "SUI", "TON", "SHIB", "PEPE",
-    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "TRY", "BRL"
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "TRY", "BRL",
+    "GBP", "AUD", "BIDR", "IDRT", "UAH", "RUB", "NGN", "VAI"
 }
 
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
@@ -127,7 +127,7 @@ def get_dynamic_symbols() -> List[str]:
         candidates.append((symbol, volume))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
-    symbols = [symbol for symbol, _ in candidates[:MAX_SYMBOLS]]
+    symbols = [symbol for symbol, _ in candidates] if MAX_SYMBOLS <= 0 else [symbol for symbol, _ in candidates[:MAX_SYMBOLS]]
     SYMBOL_CACHE["symbols"] = symbols
     SYMBOL_CACHE["updated_at"] = now
     return symbols
@@ -393,250 +393,135 @@ def market_regime(candles: List[Dict]) -> str:
 # =========================
 # التحليل الذكي
 # =========================
+
+# =========================
+# التحليل الذكي — سبوت لونغ فقط
+# =========================
 def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]:
     entry_candles = get_klines(symbol, ENTRY_TIMEFRAME)
     confirm_candles = get_klines(symbol, CONFIRM_TIMEFRAME)
-    trend_candles = get_klines(symbol, TREND_TIMEFRAME)
 
     closed = entry_candles[:-1]
+    if len(closed) < 80 or len(confirm_candles) < 60:
+        return None
+
     closes = [c["close"] for c in closed]
     volumes = [c["volume"] for c in closed]
     quote_volumes = [c["quote_volume"] for c in closed]
-
-    # تجاهل العملات الجديدة أو البيانات غير المكتملة بأمان.
-    if len(closed) < 60 or len(confirm_candles) < 35 or len(trend_candles) < 35:
-        return None
-
     price = closes[-1]
     candle = closed[-1]
 
     e9 = ema(closes, 9)[-1]
     e20 = ema(closes, 20)[-1]
     e50 = ema(closes, 50)[-1]
-
     rsi_values = rsi(closes)
-    rsi_now = rsi_values[-1]
-    rsi_prev = rsi_values[-2]
-
+    rsi_now, rsi_prev = rsi_values[-1], rsi_values[-2]
     macd_now, macd_signal, macd_hist = macd(closes)
 
-    required_indicators = (e9, e20, e50, rsi_now, rsi_prev, macd_now, macd_signal, macd_hist)
-    if any(value is None for value in required_indicators):
+    required = (e9, e20, e50, rsi_now, rsi_prev, macd_now, macd_signal, macd_hist)
+    if any(v is None for v in required):
         return None
 
     current_atr = atr(closed)
+    if current_atr <= 0 or price <= 0:
+        return None
+
     adx_now = adx(closed)
-    bb_mid, bb_upper, bb_lower = bollinger(closes)
     current_vwap = vwap(closed)
     obv_values = obv(closed)
+    _, bb_upper, _ = bollinger(closes)
 
     avg_volume = mean(volumes[-21:-1])
     volume_ratio = volumes[-1] / avg_volume if avg_volume else 0.0
     avg_quote_volume = mean(quote_volumes[-12:])
-
-    resistance = max(c["high"] for c in closed[-21:-1])
-    support = min(c["low"] for c in closed[-21:-1])
-
-    confirm = trend_snapshot(confirm_candles)
-    trend = trend_snapshot(trend_candles)
-    regime = market_regime(entry_candles)
-
-    candle_range = max(candle["high"] - candle["low"], 1e-12)
-    body = abs(candle["close"] - candle["open"])
-    body_ratio = body / candle_range
-    upper_wick = candle["high"] - max(candle["open"], candle["close"])
-    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-    upper_wick_ratio = upper_wick / candle_range
-    lower_wick_ratio = lower_wick / candle_range
-
-    atr_pct = current_atr / price * 100
-    distance_ema20 = abs(price - e20) / price * 100
-    lookback_price = closes[-13] if len(closes) >= 13 else closes[0]
-    recent_change_pct = ((price / lookback_price) - 1) * 100 if lookback_price else 0.0
-
-    long_score = 0
-    short_score = 0
-    long_reasons: List[str] = []
-    short_reasons: List[str] = []
-    warnings: List[str] = []
-
-    def add_long(condition: bool, points: int, reason: str) -> None:
-        nonlocal long_score
-        if condition:
-            long_score += points
-            long_reasons.append(reason)
-
-    def add_short(condition: bool, points: int, reason: str) -> None:
-        nonlocal short_score
-        if condition:
-            short_score += points
-            short_reasons.append(reason)
-
-    # الزخم السريع
-    add_long(price > e9 > e20, 10, "EMA9 وEMA20 إيجابيان")
-    add_short(price < e9 < e20, 10, "EMA9 وEMA20 سلبيان")
-
-    add_long(e20 > e50, 8, "الاتجاه القصير صاعد")
-    add_short(e20 < e50, 8, "الاتجاه القصير هابط")
-
-    add_long(48 <= rsi_now <= 70 and rsi_now > rsi_prev, 9, f"RSI صاعد {rsi_now:.1f}")
-    add_short(30 <= rsi_now <= 52 and rsi_now < rsi_prev, 9, f"RSI هابط {rsi_now:.1f}")
-
-    add_long(macd_now > macd_signal and macd_hist > 0, 9, "MACD إيجابي")
-    add_short(macd_now < macd_signal and macd_hist < 0, 9, "MACD سلبي")
-
-    # السيولة والحركة
-    add_long(volume_ratio >= 1.20, 9, f"الفوليوم ×{volume_ratio:.1f}")
-    add_short(volume_ratio >= 1.20, 9, f"الفوليوم ×{volume_ratio:.1f}")
-
-    add_long(adx_now >= 18, 6, f"ADX {adx_now:.0f}")
-    add_short(adx_now >= 18, 6, f"ADX {adx_now:.0f}")
-
-    add_long(price > current_vwap, 6, "السعر فوق VWAP")
-    add_short(price < current_vwap, 6, "السعر تحت VWAP")
-
-    add_long(obv_values[-1] > obv_values[-4], 5, "OBV يدعم الشراء")
-    add_short(obv_values[-1] < obv_values[-4], 5, "OBV يدعم البيع")
-
-    # شمعة الدخول
-    add_long(body_ratio >= 0.50 and candle["close"] > candle["open"], 7, "شمعة شرائية قوية")
-    add_short(body_ratio >= 0.50 and candle["close"] < candle["open"], 7, "شمعة بيعية قوية")
-
-    # الاختراق أو الارتداد
-    breakout_long = price > resistance and volume_ratio >= 1.15
-    breakout_short = price < support and volume_ratio >= 1.15
-
-    pullback_long = (
-        e9 > e20 > e50
-        and candle["low"] <= e20 * 1.003
-        and price > e20
-        and candle["close"] > candle["open"]
-    )
-
-    pullback_short = (
-        e9 < e20 < e50
-        and candle["high"] >= e20 * 0.997
-        and price < e20
-        and candle["close"] < candle["open"]
-    )
-
-    add_long(breakout_long, 12, "اختراق مقاومة")
-    add_short(breakout_short, 12, "كسر دعم")
-    add_long(pullback_long, 10, "ارتداد من EMA20")
-    add_short(pullback_short, 10, "رفض من EMA20")
-
-    # تأكيد الفريمات
-    add_long(confirm["bullish"], 8, f"تأكيد {CONFIRM_TIMEFRAME}")
-    add_short(confirm["bearish"], 8, f"تأكيد {CONFIRM_TIMEFRAME}")
-
-    add_long(trend["bullish"], 8, f"اتجاه {TREND_TIMEFRAME} صاعد")
-    add_short(trend["bearish"], 8, f"اتجاه {TREND_TIMEFRAME} هابط")
-
-    # فلتر بيتكوين
-    if symbol != "BTCUSDT":
-        add_long(btc_filter["bullish"], 5, "بيتكوين داعم")
-        add_short(btc_filter["bearish"], 5, "بيتكوين ضاغط")
-
-    # تكيف مع حالة السوق
-    if regime == "TRENDING":
-        long_score += 3
-        short_score += 3
-    elif regime == "RANGING":
-        if breakout_long:
-            long_score -= 5
-            warnings.append("السوق عرضي: احتمال اختراق وهمي")
-        if breakout_short:
-            short_score -= 5
-            warnings.append("السوق عرضي: احتمال كسر وهمي")
-
-    # عقوبات المطاردة والاختراق الوهمي
-    if distance_ema20 > 2.2:
-        long_score -= 7
-        short_score -= 7
-        warnings.append("السعر بعيد عن EMA20")
-
-    if upper_wick_ratio > 0.45:
-        long_score -= 7
-        warnings.append("ذيل علوي كبير")
-
-    if lower_wick_ratio > 0.45:
-        short_score -= 7
-        warnings.append("ذيل سفلي كبير")
-
-    if price > bb_upper and rsi_now > 72:
-        long_score -= 6
-        warnings.append("تشبع شرائي")
-
-    if price < bb_lower and rsi_now < 28:
-        short_score -= 6
-        warnings.append("تشبع بيعي")
-
-    if recent_change_pct >= MAX_PRE_PUMP_PCT:
-        long_score -= 20
-        warnings.append(f"ارتفاع سابق {recent_change_pct:.1f}%: احتمال دخول متأخر")
-
-    if volume_ratio < 1.10:
-        long_score -= 8
-        short_score -= 8
-
     if avg_quote_volume < MIN_QUOTE_VOLUME:
         return None
 
-    # التعلم البسيط من النتائج المخزنة
-    long_score += adaptive_bonus(state, "LONG")
-    short_score += adaptive_bonus(state, "SHORT")
+    resistance = max(c["high"] for c in closed[-21:-1])
+    support = min(c["low"] for c in closed[-21:-1])
+    confirm = trend_snapshot(confirm_candles)
+    regime = market_regime(entry_candles)
 
-    side = "LONG" if long_score >= short_score else "SHORT"
-    score = max(long_score, short_score)
-    reasons = long_reasons if side == "LONG" else short_reasons
+    candle_range = max(candle["high"] - candle["low"], 1e-12)
+    body_ratio = abs(candle["close"] - candle["open"]) / candle_range
+    upper_wick_ratio = (candle["high"] - max(candle["open"], candle["close"])) / candle_range
+    distance_ema20 = abs(price - e20) / price * 100
+    recent_change_pct = ((price / closes[-13]) - 1) * 100
+    atr_pct = current_atr / price * 100
 
-    if side == "LONG":
-        stop = min(
-            support,
-            price - 1.25 * current_atr
-        )
-        risk = price - stop
-        target1 = price + 1.5 * risk
-        target2 = price + 2.2 * risk
-        target3 = price + 3.0 * risk
-    else:
-        stop = max(
-            resistance,
-            price + 1.25 * current_atr
-        )
-        risk = stop - price
-        target1 = price - 1.5 * risk
-        target2 = price - 2.2 * risk
-        target3 = price - 3.0 * risk
+    breakout = price > resistance and candle["close"] > candle["open"]
+    early_momentum = (
+        e9 > e20 > e50
+        and price > current_vwap
+        and macd_now > macd_signal
+        and macd_hist > 0
+        and rsi_now > rsi_prev
+        and obv_values[-1] > obv_values[-4]
+    )
 
-    if risk <= 0:
+    # شروط إلزامية: لا تجميع نقاط على فرصة ضعيفة.
+    if not breakout:
+        return None
+    if not early_momentum:
+        return None
+    if volume_ratio < MIN_VOLUME_RATIO:
+        return None
+    if adx_now < MIN_ADX:
+        return None
+    if not (52 <= rsi_now <= 70):
+        return None
+    if body_ratio < 0.45:
+        return None
+    if upper_wick_ratio > 0.38:
+        return None
+    if distance_ema20 > 3.0:
+        return None
+    if recent_change_pct > MAX_PRE_PUMP_PCT:
+        return None
+    if price > bb_upper * 1.015:
+        return None
+    if symbol != "BTCUSDT" and btc_filter.get("bearish"):
         return None
 
+    score = 60
+    reasons: List[str] = [
+        "اختراق مقاومة مؤكد",
+        f"الفوليوم ×{volume_ratio:.1f}",
+        "EMA9 فوق EMA20 فوق EMA50",
+        f"RSI صاعد {rsi_now:.1f}",
+        "MACD إيجابي",
+        "السعر فوق VWAP",
+        "OBV يدعم الشراء",
+    ]
+    score += min(12, int((volume_ratio - MIN_VOLUME_RATIO) * 5))
+    score += min(8, int(max(0, adx_now - MIN_ADX) * 0.8))
+    score += 6 if confirm.get("bullish") else 0
+    score += 5 if regime == "TRENDING" else 0
+    score += 4 if body_ratio >= 0.65 else 0
+    score += adaptive_bonus(state, "LONG")
+
+    if score < MIN_SCORE:
+        return None
+
+    stop = max(e20 * 0.995, price - 1.35 * current_atr)
+    if stop >= price:
+        return None
+    risk = price - stop
     risk_pct = risk / price * 100
-    rr = 1.5
-
-    if risk_pct > MAX_RISK_PCT or rr < MIN_RR:
+    if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
         return None
-
-    signal_type = "ENTRY" if score >= MIN_SCORE else "WATCH"
-    if score < WATCH_SCORE:
-        return None
-
-    confidence = min(95, max(50, score))
-    setup = "اختراق" if (breakout_long if side == "LONG" else breakout_short) else "ارتداد"
 
     return {
         "symbol": symbol,
-        "side": side,
+        "side": "LONG",
         "score": score,
-        "confidence": confidence,
-        "signal_type": signal_type,
-        "setup": setup,
+        "confidence": min(95, max(60, score)),
+        "setup": "اختراق مبكر",
         "entry": price,
         "stop": stop,
-        "target1": target1,
-        "target2": target2,
-        "target3": target3,
+        "target1": price + 1.5 * risk,
+        "target2": price + 2.2 * risk,
+        "target3": price + 3.0 * risk,
         "risk_pct": risk_pct,
         "rsi": rsi_now,
         "adx": adx_now,
@@ -644,8 +529,7 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
         "atr_pct": atr_pct,
         "recent_change_pct": recent_change_pct,
         "regime": regime,
-        "reasons": reasons[:7],
-        "warnings": list(dict.fromkeys(warnings))[:3],
+        "reasons": reasons,
         "candle_close": candle["close_time"],
     }
 
@@ -666,49 +550,26 @@ def fmt(value: float) -> str:
 
 
 def signal_message(result: Dict) -> str:
-    side_icon = "🟢" if result["side"] == "LONG" else "🔴"
-    side_ar = "لونغ" if result["side"] == "LONG" else "شورت"
     reasons = "\n".join(f"• {reason}" for reason in result["reasons"])
-
-    warnings = ""
-    if result["warnings"]:
-        warnings = "\n\nتحذيرات:\n" + "\n".join(
-            f"• {warning}" for warning in result["warnings"]
-        )
-
-    header = (
-        f"{side_icon} {'إشارة دخول' if result['signal_type'] == 'ENTRY' else 'تحت المراقبة'} — {result['symbol']}\n\n"
-        f"الاتجاه: {side_ar}\n"
+    return (
+        f"🟢 إشارة شراء سبوت — {result['symbol']}\n\n"
         f"النموذج: {result['setup']}\n"
-        f"الثقة الذكية: {result['confidence']}%\n"
+        f"الثقة: {result['confidence']}%\n"
         f"التقييم: {result['score']}\n"
         f"الفريم: {ENTRY_TIMEFRAME}\n"
         f"حالة السوق: {result['regime']}\n"
         f"الفوليوم: ×{result['volume_ratio']:.1f}\n"
-        f"الحركة الأخيرة: {result['recent_change_pct']:.1f}%\n"
-    )
-
-    if result["signal_type"] == "WATCH":
-        return (
-            header
-            + f"\nالأسباب:\n{reasons}"
-            + warnings
-            + "\n\n⏳ مراقبة فقط، لا يوجد دخول مؤكد حتى الآن."
-        )
-
-    return (
-        header
-        + f"\nالدخول التقريبي: {fmt(result['entry'])}\n"
-        + f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
-        + f"الهدف الأول: {fmt(result['target1'])}\n"
-        + f"الهدف الثاني: {fmt(result['target2'])}\n"
-        + f"الهدف الثالث: {fmt(result['target3'])}\n\n"
-        + f"RSI: {result['rsi']:.1f}\n"
-        + f"ADX: {result['adx']:.1f}\n"
-        + f"ATR: {result['atr_pct']:.2f}%\n\n"
-        + f"الأسباب:\n{reasons}"
-        + warnings
-        + "\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح. استخدم وقف الخسارة."
+        f"الحركة الأخيرة: {result['recent_change_pct']:.1f}%\n\n"
+        f"الدخول التقريبي: {fmt(result['entry'])}\n"
+        f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
+        f"الهدف الأول: {fmt(result['target1'])}\n"
+        f"الهدف الثاني: {fmt(result['target2'])}\n"
+        f"الهدف الثالث: {fmt(result['target3'])}\n\n"
+        f"RSI: {result['rsi']:.1f}\n"
+        f"ADX: {result['adx']:.1f}\n"
+        f"ATR: {result['atr_pct']:.2f}%\n\n"
+        f"الأسباب:\n{reasons}\n\n"
+        "⚠️ تحليل فني آلي وليس ضمانًا للربح."
     )
 
 
@@ -716,23 +577,19 @@ def signal_message(result: Dict) -> str:
 # الفحص الدوري
 # =========================
 def is_cooled(state: Dict, result: Dict) -> bool:
-    key = f"{result['symbol']}:{result['side']}:{result['signal_type']}"
+    key = result["symbol"]
     previous = int(state.get("alerts", {}).get(key, 0))
-    elapsed = result["candle_close"] - previous
-    return elapsed >= COOLDOWN_MINUTES * 60 * 1000
+    return result["candle_close"] - previous >= COOLDOWN_MINUTES * 60 * 1000
 
 
 def remember_alert(state: Dict, result: Dict) -> None:
-    key = f"{result['symbol']}:{result['side']}:{result['signal_type']}"
-    state.setdefault("alerts", {})[key] = result["candle_close"]
+    state.setdefault("alerts", {})[result["symbol"]] = result["candle_close"]
 
 
 def scan(state: Dict) -> None:
-    btc_candles = get_klines("BTCUSDT", CONFIRM_TIMEFRAME)
-    btc_filter = trend_snapshot(btc_candles)
-
-    results: List[Dict] = []
+    btc_filter = trend_snapshot(get_klines("BTCUSDT", CONFIRM_TIMEFRAME))
     symbols = get_dynamic_symbols()
+    results: List[Dict] = []
 
     def worker(symbol: str) -> Optional[Dict]:
         try:
@@ -742,68 +599,43 @@ def scan(state: Dict) -> None:
             return None
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(worker, symbol): symbol for symbol in symbols}
+        futures = [executor.submit(worker, symbol) for symbol in symbols]
         for future in as_completed(futures):
             result = future.result()
             if result and is_cooled(state, result):
                 results.append(result)
 
-    results.sort(
-        key=lambda item: (
-            item["signal_type"] == "ENTRY",
-            item["score"],
-            item["volume_ratio"],
-        ),
-        reverse=True,
-    )
-
+    results.sort(key=lambda x: (x["score"], x["volume_ratio"]), reverse=True)
     sent = 0
-    for result in results:
-        if sent >= MAX_ALERTS_PER_SCAN:
-            break
-
+    for result in results[:MAX_ALERTS_PER_SCAN]:
         send_message(signal_message(result))
         remember_alert(state, result)
         sent += 1
-        time.sleep(0.3)
+        time.sleep(0.25)
 
     state["scan_count"] = int(state.get("scan_count", 0)) + 1
-
-    if STATUS_EVERY_SCANS > 0 and state["scan_count"] % STATUS_EVERY_SCANS == 0:
-        send_message(
-            "🤖 البوت يعمل ويواصل الفحص.\n"
-            f"عدد العملات: {len(symbols)}\n"
-            f"الفريمات: {ENTRY_TIMEFRAME} / {CONFIRM_TIMEFRAME} / {TREND_TIMEFRAME}\n"
-            f"آخر فحص: تم العثور على {sent} تنبيه."
-        )
-
     save_state(state)
-    print(
-        f"Scan finished | candidates={len(results)} | sent={sent}",
-        flush=True,
-    )
+    print(f"Scan finished | symbols={len(symbols)} | candidates={len(results)} | sent={sent}", flush=True)
 
 
 def main() -> None:
     state = load_state()
-
+    symbols = get_dynamic_symbols()
     send_message(
-        "✅ تم تشغيل بوت المضاربة الذكي V2.1.\n"
-        f"فريم الدخول: {ENTRY_TIMEFRAME}\n"
-        f"التأكيد: {CONFIRM_TIMEFRAME} و{TREND_TIMEFRAME}\n"
-        "المميزات: اكتشاف تلقائي لعملات Binance Spot، استبعاد العملات الكبرى، "
-        "لونغ وشورت، اختراق وارتداد، فلتر بيتكوين، "
-        "فوليوم، MACD، ADX، VWAP، OBV، ATR، Bollinger، "
-        "وفلترة الاختراق الوهمي."
+        "✅ تم تشغيل بوت إشارات Binance Spot.\n"
+        "النوع: شراء سبوت فقط — بدون شورت وبدون WATCH.\n"
+        f"عدد أزواج USDT الحالية: {len(symbols)}\n"
+        f"الفحص كل {SCAN_MINUTES} دقيقة."
     )
 
     while True:
+        started = time.time()
         try:
             scan(state)
         except Exception as exc:
             print(f"Scan error: {exc}", flush=True)
-
-        time.sleep(SCAN_MINUTES * 60)
+        elapsed = time.time() - started
+        time.sleep(max(5, SCAN_MINUTES * 60 - elapsed))
 
 
 if __name__ == "__main__":
