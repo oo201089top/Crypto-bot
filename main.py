@@ -24,7 +24,7 @@ CONFIRM_TIMEFRAME = os.getenv("CONFIRM_TIMEFRAME", "15m")
 TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h")
 
 SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "1"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "76"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "68"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "120"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
 STATUS_EVERY_SCANS = int(os.getenv("STATUS_EVERY_SCANS", "0"))
@@ -35,8 +35,8 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))
 SYMBOL_REFRESH_MINUTES = int(os.getenv("SYMBOL_REFRESH_MINUTES", "30"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
 MAX_PRE_PUMP_PCT = float(os.getenv("MAX_PRE_PUMP_PCT", "12"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.8"))
-MIN_ADX = float(os.getenv("MIN_ADX", "22"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.25"))
+MIN_ADX = float(os.getenv("MIN_ADX", "18"))
 
 EXCLUDED_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "TRY", "BRL",
@@ -449,74 +449,116 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
     recent_change_pct = ((price / closes[-13]) - 1) * 100
     atr_pct = current_atr / price * 100
 
-    breakout = price > resistance and candle["close"] > candle["open"]
-    early_momentum = (
-        e9 > e20 > e50
-        and price > current_vwap
-        and macd_now > macd_signal
-        and macd_hist > 0
-        and rsi_now > rsi_prev
-        and obv_values[-1] > obv_values[-4]
+    # مرحلتان: أولاً ترشيح الزخم والسيولة، ثم تقييم فني كامل.
+    green_candle = candle["close"] > candle["open"]
+    near_breakout = price >= resistance * 0.997
+    confirmed_breakout = price > resistance
+    pullback_reclaim = (
+        e9 > e20
+        and candle["low"] <= e20 * 1.006
+        and price > e20
+        and green_candle
     )
 
-    # شروط إلزامية: لا تجميع نقاط على فرصة ضعيفة.
-    if not breakout:
-        return None
-    if not early_momentum:
-        return None
+    momentum_checks = [
+        e9 > e20,
+        price > e20,
+        price > current_vwap,
+        macd_now > macd_signal and macd_hist > 0,
+        rsi_now > rsi_prev,
+        obv_values[-1] > obv_values[-4],
+    ]
+    momentum_count = sum(bool(x) for x in momentum_checks)
+
+    # شروط أمان أساسية فقط، حتى لا يصبح البوت صامتاً.
     if volume_ratio < MIN_VOLUME_RATIO:
         return None
     if adx_now < MIN_ADX:
         return None
-    if not (52 <= rsi_now <= 70):
+    if not green_candle:
         return None
-    if body_ratio < 0.45:
+    if momentum_count < 4:
         return None
-    if upper_wick_ratio > 0.38:
+    if not (near_breakout or pullback_reclaim):
         return None
-    if distance_ema20 > 3.0:
+    if not (47 <= rsi_now <= 73):
+        return None
+    if body_ratio < 0.30:
+        return None
+    if upper_wick_ratio > 0.48:
+        return None
+    if distance_ema20 > 4.0:
         return None
     if recent_change_pct > MAX_PRE_PUMP_PCT:
         return None
-    if price > bb_upper * 1.015:
+    if price > bb_upper * 1.025:
         return None
-    if symbol != "BTCUSDT" and btc_filter.get("bearish"):
+    if symbol != "BTCUSDT" and btc_filter.get("bearish") and not confirmed_breakout:
         return None
 
-    score = 60
-    reasons: List[str] = [
-        "اختراق مقاومة مؤكد",
-        f"الفوليوم ×{volume_ratio:.1f}",
-        "EMA9 فوق EMA20 فوق EMA50",
-        f"RSI صاعد {rsi_now:.1f}",
-        "MACD إيجابي",
-        "السعر فوق VWAP",
-        "OBV يدعم الشراء",
-    ]
-    score += min(12, int((volume_ratio - MIN_VOLUME_RATIO) * 5))
-    score += min(8, int(max(0, adx_now - MIN_ADX) * 0.8))
-    score += 6 if confirm.get("bullish") else 0
-    score += 5 if regime == "TRENDING" else 0
-    score += 4 if body_ratio >= 0.65 else 0
+    score = 42
+    reasons: List[str] = []
+
+    if confirmed_breakout:
+        score += 15
+        reasons.append("اختراق مقاومة")
+    elif near_breakout:
+        score += 9
+        reasons.append("قريب من اختراق المقاومة")
+    if pullback_reclaim:
+        score += 8
+        reasons.append("ارتداد ناجح فوق EMA20")
+    if e9 > e20:
+        score += 6
+        reasons.append("EMA9 فوق EMA20")
+    if e20 > e50:
+        score += 4
+        reasons.append("EMA20 فوق EMA50")
+    if price > current_vwap:
+        score += 5
+        reasons.append("السعر فوق VWAP")
+    if macd_now > macd_signal and macd_hist > 0:
+        score += 5
+        reasons.append("MACD إيجابي")
+    if rsi_now > rsi_prev:
+        score += 4
+        reasons.append(f"RSI صاعد {rsi_now:.1f}")
+    if obv_values[-1] > obv_values[-4]:
+        score += 4
+        reasons.append("OBV يدعم الشراء")
+
+    score += min(10, int(max(0.0, volume_ratio - MIN_VOLUME_RATIO) * 5))
+    score += min(7, int(max(0.0, adx_now - MIN_ADX) * 0.7))
+    if confirm.get("bullish"):
+        score += 6
+        reasons.append(f"تأكيد {CONFIRM_TIMEFRAME} صاعد")
+    if regime == "TRENDING":
+        score += 4
+    if body_ratio >= 0.60:
+        score += 3
     score += adaptive_bonus(state, "LONG")
 
     if score < MIN_SCORE:
         return None
 
-    stop = max(e20 * 0.995, price - 1.35 * current_atr)
+    stop = max(support, e20 * 0.992, price - 1.45 * current_atr)
+    if stop >= price:
+        stop = price - 1.25 * current_atr
     if stop >= price:
         return None
+
     risk = price - stop
     risk_pct = risk / price * 100
     if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
         return None
 
+    setup = "اختراق" if confirmed_breakout else "تهيؤ للاختراق" if near_breakout else "ارتداد"
     return {
         "symbol": symbol,
         "side": "LONG",
         "score": score,
-        "confidence": min(95, max(60, score)),
-        "setup": "اختراق مبكر",
+        "confidence": min(94, max(60, score)),
+        "setup": setup,
         "entry": price,
         "stop": stop,
         "target1": price + 1.5 * risk,
@@ -529,7 +571,7 @@ def analyze_symbol(symbol: str, state: Dict, btc_filter: Dict) -> Optional[Dict]
         "atr_pct": atr_pct,
         "recent_change_pct": recent_change_pct,
         "regime": regime,
-        "reasons": reasons,
+        "reasons": reasons[:8],
         "candle_close": candle["close_time"],
     }
 
@@ -622,7 +664,7 @@ def main() -> None:
     state = load_state()
     symbols = get_dynamic_symbols()
     send_message(
-        "✅ تم تشغيل بوت إشارات Binance Spot.\n"
+        "✅ تم تشغيل بوت إشارات Binance Spot — النسخة المتوازنة.\n"
         "النوع: شراء سبوت فقط — بدون شورت وبدون WATCH.\n"
         f"عدد أزواج USDT الحالية: {len(symbols)}\n"
         f"الفحص كل {SCAN_MINUTES} دقيقة."
