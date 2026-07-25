@@ -49,7 +49,7 @@ STABLE_BASES = {
     "UAH", "RUB", "NGN", "VAI", "PAX", "UST", "USTC"
 }
 
-# العملات الكبيرة مستبعدة لأن الهدف اصطياد الصغيرة والمتوسطة.
+# لا يتم استبعاد العملات الكبيرة افتراضيًا، ويمكن تحديد المستبعد من Railway.
 # احذف أي رمز من المتغير EXCLUDED_MAJORS في Railway إذا أردت إدخاله لاحقًا.
 DEFAULT_EXCLUDED_MAJORS = set()
 EXCLUDED_MAJORS = {
