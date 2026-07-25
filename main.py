@@ -31,10 +31,10 @@ MIN_ADX = float(os.getenv("MIN_ADX", "20"))
 MAX_1H_RISE_PCT = float(os.getenv("MAX_1H_RISE_PCT", "8"))
 MAX_4H_RISE_PCT = float(os.getenv("MAX_4H_RISE_PCT", "14"))
 MAX_15M_RISE_PCT = float(os.getenv("MAX_15M_RISE_PCT", "3"))
-MIN_15M_VOLUME_RATIO = float(os.getenv("MIN_15M_VOLUME_RATIO", "1.8"))
+MIN_15M_VOLUME_RATIO = float(os.getenv("MIN_15M_VOLUME_RATIO", "1.6"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "4"))
 MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
-MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.0"))
+MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.5"))
 MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "2"))
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "55"))
 TRACK_RESULTS = os.getenv("TRACK_RESULTS", "1") == "1"
@@ -625,7 +625,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         older_window = closed15[-80:-22]
         if older_window:
             next_resistance = max(c["high"] for c in older_window)
-            if next_resistance > price and (next_resistance - price) < 1.5 * risk:
+            if next_resistance > price and (next_resistance - price) < 1.2 * risk:
                 return None
 
         return {
@@ -824,7 +824,7 @@ def main() -> None:
         "✅ تم تشغيل بوت إشارات الشراء للسبوت.\n"
         "يفحص جميع العملات غير المستقرة على Binance Spot مقابل USDT.\n"
         "الفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\n"
-        "بدون شورت وبدون WATCH، مع دخول مبكر ومنع مطاردة السعر."
+        "بدون شورت وبدون WATCH، مع دخول مبكر وفلاتر متوازنة لتقليل تفويت الفرص."
     )
     while True:
         started = time.time()
