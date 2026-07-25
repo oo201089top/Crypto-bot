@@ -30,10 +30,12 @@ MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.45"))
 MIN_ADX = float(os.getenv("MIN_ADX", "20"))
 MAX_1H_RISE_PCT = float(os.getenv("MAX_1H_RISE_PCT", "8"))
 MAX_4H_RISE_PCT = float(os.getenv("MAX_4H_RISE_PCT", "14"))
+MAX_15M_RISE_PCT = float(os.getenv("MAX_15M_RISE_PCT", "3"))
+MIN_15M_VOLUME_RATIO = float(os.getenv("MIN_15M_VOLUME_RATIO", "1.8"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "4"))
 MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
-MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "2.5"))
-MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "3"))
+MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.0"))
+MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "2"))
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "55"))
 TRACK_RESULTS = os.getenv("TRACK_RESULTS", "1") == "1"
 
@@ -410,22 +412,38 @@ def frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
     closed = candles[:-1]
     if len(closed) < 210:
         return None
+
     closes = [c["close"] for c in closed]
-    e20 = ema(closes, 20)[-1]
-    e50 = ema(closes, 50)[-1]
-    e200 = ema(closes, 200)[-1]
+    e20_values = ema(closes, 20)
+    e50_values = ema(closes, 50)
+    e200_values = ema(closes, 200)
+
+    e20 = e20_values[-1]
+    e50 = e50_values[-1]
+    e200 = e200_values[-1]
+    e20_prev = e20_values[-4]
+    e50_prev = e50_values[-4]
     r = rsi(closes)[-1]
     _, _, hist = macd(closes)
-    if None in (e20, e50, e200, r, hist):
+    trend_adx = adx(closed)
+
+    if None in (e20, e50, e200, e20_prev, e50_prev, r, hist):
         return None
+
     price = closes[-1]
     return {
-        "price": price, "e20": e20, "e50": e50, "e200": e200,
-        "rsi": r, "macd_hist": hist,
+        "price": price,
+        "e20": e20,
+        "e50": e50,
+        "e200": e200,
+        "rsi": r,
+        "macd_hist": hist,
+        "adx": trend_adx,
+        "e20_rising": e20 > e20_prev,
+        "e50_rising": e50 > e50_prev,
         "bullish": price > e20 > e50 and price > e200 and hist > 0,
-        "not_bearish": price > e50 and hist >= 0,
+        "not_bearish": (price > e50 or price > e200) and hist > -abs(price) * 0.002,
     }
-
 
 def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
     try:
@@ -433,81 +451,41 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         c15 = get_klines(symbol, "15m", 260)
         c1h = get_klines(symbol, "1h", 260)
         c4h = get_klines(symbol, "4h", 260)
-        closed = c5[:-1]
-        if min(len(closed), len(c15) - 1, len(c1h) - 1, len(c4h) - 1) < 210:
+
+        closed5 = c5[:-1]
+        closed15 = c15[:-1]
+        if min(len(closed5), len(closed15), len(c1h) - 1, len(c4h) - 1) < 210:
             return None
 
-        closes = [c["close"] for c in closed]
-        volumes = [c["volume"] for c in closed]
-        trades = [c["trades"] for c in closed]
-        price = closes[-1]
-        candle = closed[-1]
+        closes5 = [c["close"] for c in closed5]
+        volumes5 = [c["volume"] for c in closed5]
+        price = closes5[-1]
+        candle5 = closed5[-1]
 
-        e9 = ema(closes, 9)[-1]
-        e20 = ema(closes, 20)[-1]
-        e50 = ema(closes, 50)[-1]
-        rsi_values = rsi(closes)
-        rsi_now, rsi_prev = rsi_values[-1], rsi_values[-2]
-        macd_now, macd_sig, macd_hist = macd(closes)
-        if None in (e9, e20, e50, rsi_now, rsi_prev, macd_now, macd_sig, macd_hist):
+        e9 = ema(closes5, 9)[-1]
+        e20 = ema(closes5, 20)[-1]
+        e50 = ema(closes5, 50)[-1]
+        rsi5_values = rsi(closes5)
+        rsi5, rsi5_prev = rsi5_values[-1], rsi5_values[-2]
+        macd5, macd5_sig, macd5_hist = macd(closes5)
+        if None in (e9, e20, e50, rsi5, rsi5_prev, macd5, macd5_sig, macd5_hist):
             return None
 
-        atr_now = atr(closed)
-        adx_now = adx(closed)
-        vw = vwap(closed)
-        obv_values = obv(closed)
-        _, bb_upper, _, bb_width = bollinger(closes)
+        atr5 = atr(closed5)
+        vw5 = vwap(closed5)
+        obv5 = obv(closed5)
+        avg_vol5 = mean(volumes5[-21:-1])
+        volume_ratio5 = volumes5[-1] / avg_vol5 if avg_vol5 else 0.0
 
-        avg_vol = mean(volumes[-21:-1])
-        volume_ratio = volumes[-1] / avg_vol if avg_vol else 0.0
-        avg_trades = mean(trades[-21:-1])
-        trade_ratio = trades[-1] / avg_trades if avg_trades else 0.0
-        # المقاومة تُحسب بدون آخر شمعتين حتى يمكن اكتشاف:
-        # 1) اختراق في الشمعة السابقة
-        # 2) إعادة اختبار في الشمعة الحالية
-        resistance = max(c["high"] for c in closed[-22:-2])
-        previous_candle = closed[-2]
-        recent_support = min(c["low"] for c in closed[-12:-1])
+        ema20_distance_pct = abs(price / e20 - 1) * 100 if e20 else 999.0
+        rise_15m = pct_change(closed5[-4]["close"], price)
+        rise_1h = pct_change(closed5[-13]["close"], price)
+        rise_4h = pct_change(closed5[-49]["close"], price)
+        candle_body_pct = abs(candle5["close"] - candle5["open"]) / candle5["open"] * 100 if candle5["open"] else 0.0
+        green_streak = consecutive_green(closed5)
 
-        breakout = (
-            price > resistance
-            and volume_ratio >= 1.2
-            and candle["close"] > candle["open"]
-        )
-        near_breakout = (
-            price >= resistance * 0.997
-            and candle["close"] > candle["open"]
-        )
-        retest = (
-            previous_candle["close"] > resistance
-            and previous_candle["high"] > resistance
-            and candle["low"] <= resistance * 1.004
-            and candle["low"] >= resistance * 0.990
-            and price > resistance
-            and candle["close"] > candle["open"]
-        )
-
-        # انضغاط البولنجر: العرض الحالي أو السابق منخفض مقارنة بآخر 40 شمعة.
-        widths = []
-        for i in range(40, 0, -1):
-            segment = closes[:-i] if i else closes
-            if len(segment) >= 20:
-                widths.append(bollinger(segment)[3])
-        squeeze = bool(widths) and bb_width <= sorted(widths)[max(0, int(len(widths) * 0.30) - 1)]
-        squeeze_breakout = squeeze and price >= bb_upper * 0.995 and volume_ratio >= 1.3
-
-        snap15 = frame_snapshot(c15)
-        snap1h = frame_snapshot(c1h)
-        snap4h = frame_snapshot(c4h)
-        if not snap15 or not snap1h or not snap4h:
+        if rise_15m > MAX_15M_RISE_PCT:
             return None
-
-        rise_1h = pct_change(closed[-13]["close"], price)
-        rise_4h = pct_change(closed[-49]["close"], price)
-        candle_body_pct = abs(candle["close"] - candle["open"]) / candle["open"] * 100 if candle["open"] else 0.0
-        ema20_distance_pct = (price / e20 - 1) * 100 if e20 else 999.0
-        green_streak = consecutive_green(closed)
-
         if rise_1h > MAX_1H_RISE_PCT or rise_4h > MAX_4H_RISE_PCT:
             return None
         if candle_body_pct > MAX_CANDLE_BODY_PCT:
@@ -515,6 +493,92 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if ema20_distance_pct > MAX_EMA20_DISTANCE_PCT:
             return None
         if green_streak > MAX_CONSECUTIVE_GREEN:
+            return None
+        if not (price > e20 and price > vw5 and macd5_hist >= 0):
+            return None
+
+        closes15 = [c["close"] for c in closed15]
+        volumes15 = [c["volume"] for c in closed15]
+        trades15 = [c["trades"] for c in closed15]
+        candle15 = closed15[-1]
+        previous15 = closed15[-2]
+
+        e20_15_values = ema(closes15, 20)
+        e50_15_values = ema(closes15, 50)
+        e200_15 = ema(closes15, 200)[-1]
+        e20_15 = e20_15_values[-1]
+        e50_15 = e50_15_values[-1]
+        e20_15_prev = e20_15_values[-4]
+        e50_15_prev = e50_15_values[-4]
+        rsi15 = rsi(closes15)[-1]
+        macd15, macd15_sig, macd15_hist = macd(closes15)
+        adx15 = adx(closed15)
+
+        if None in (e20_15, e50_15, e200_15, e20_15_prev, e50_15_prev,
+                    rsi15, macd15, macd15_sig, macd15_hist):
+            return None
+
+        avg_vol15 = mean(volumes15[-21:-1])
+        volume_ratio15 = volumes15[-1] / avg_vol15 if avg_vol15 else 0.0
+        avg_trades15 = mean(trades15[-21:-1])
+        trade_ratio15 = trades15[-1] / avg_trades15 if avg_trades15 else 0.0
+
+        resistance15 = max(c["high"] for c in closed15[-22:-2])
+        support15 = min(c["low"] for c in closed15[-12:-1])
+
+        breakout15 = (
+            candle15["close"] > resistance15
+            and candle15["close"] > candle15["open"]
+            and volume_ratio15 >= MIN_15M_VOLUME_RATIO
+        )
+        retest15 = (
+            previous15["close"] > resistance15
+            and previous15["high"] > resistance15
+            and candle15["low"] <= resistance15 * 1.004
+            and candle15["low"] >= resistance15 * 0.990
+            and candle15["close"] > resistance15
+            and candle15["close"] > candle15["open"]
+        )
+
+        widths15 = []
+        for i in range(40, 0, -1):
+            segment = closes15[:-i]
+            if len(segment) >= 20:
+                widths15.append(bollinger(segment)[3])
+
+        _, bb_upper15, _, bb_width15 = bollinger(closes15)
+        squeeze15 = bool(widths15) and bb_width15 <= sorted(widths15)[max(0, int(len(widths15) * 0.30) - 1)]
+        squeeze_breakout15 = (
+            squeeze15
+            and candle15["close"] >= bb_upper15 * 0.995
+            and volume_ratio15 >= MIN_15M_VOLUME_RATIO
+        )
+
+        if not (breakout15 or retest15 or squeeze_breakout15):
+            return None
+        if not (52 <= rsi15 <= 65):
+            return None
+        if adx15 < 22:
+            return None
+        if volume_ratio15 < MIN_15M_VOLUME_RATIO:
+            return None
+        if not (e20_15 > e50_15 and e20_15 > e20_15_prev and e50_15 >= e50_15_prev):
+            return None
+
+        snap1h = frame_snapshot(c1h)
+        snap4h = frame_snapshot(c4h)
+        if not snap1h or not snap4h:
+            return None
+
+        if not (
+            snap1h["e20"] > snap1h["e50"]
+            and snap1h["macd_hist"] > 0
+            and 50 <= snap1h["rsi"] <= 68
+            and snap1h["adx"] >= 18
+        ):
+            return None
+
+        if not snap4h["not_bearish"]:
             return None
 
         score = 0
@@ -526,47 +590,43 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 score += points
                 reasons.append(reason)
 
-        add(price > e9 > e20 > e50, 12, "ترتيب المتوسطات صاعد على 5 دقائق")
-        add(price > vw, 6, "السعر ثابت فوق VWAP")
-        add(54 <= rsi_now <= 70 and rsi_now >= rsi_prev, 8, f"RSI إيجابي {rsi_now:.1f}")
-        add(macd_now > macd_sig and macd_hist > 0, 8, "MACD إيجابي")
-        add(adx_now >= MIN_ADX, 7, f"قوة الاتجاه ADX {adx_now:.0f}")
-        add(obv_values[-1] > obv_values[-5], 6, "OBV يؤكد دخول السيولة")
-        add(volume_ratio >= MIN_VOLUME_RATIO, 11, f"ارتفاع الحجم ×{volume_ratio:.1f}")
-        add(trade_ratio >= 1.25, 5, f"نشاط الصفقات ×{trade_ratio:.1f}")
-        add(breakout, 13, "اختراق مقاومة بإغلاق")
-        add(retest, 14, "إعادة اختبار ناجحة")
-        add(squeeze_breakout, 10, "خروج من انضغاط Bollinger")
-        add(near_breakout and not breakout, 5, "قريب جدًا من الاختراق")
-        add(snap15["bullish"], 9, "تأكيد صاعد على 15 دقيقة")
-        add(snap1h["bullish"], 10, "تأكيد صاعد على الساعة")
-        add(snap4h["not_bearish"], 6, "فريم 4 ساعات لا يعاكس الصفقة")
-        add(supertrend(c15[:-1]) is True, 6, "SuperTrend شراء على 15 دقيقة")
+        add(breakout15, 18, "اختراق مؤكد على 15 دقيقة")
+        add(retest15, 20, "إعادة اختبار ناجحة على 15 دقيقة")
+        add(squeeze_breakout15, 14, "خروج من انضغاط Bollinger على 15 دقيقة")
+        add(volume_ratio15 >= 2.0, 12, f"حجم 15 دقيقة ×{volume_ratio15:.1f}")
+        add(trade_ratio15 >= 1.4, 6, f"نشاط الصفقات ×{trade_ratio15:.1f}")
+        add(52 <= rsi15 <= 62, 8, f"RSI 15m مناسب {rsi15:.1f}")
+        add(adx15 >= 25, 8, f"اتجاه 15m قوي ADX {adx15:.0f}")
+        add(e20_15 > e50_15 and e20_15 > e20_15_prev, 8, "متوسطات 15m صاعدة")
+        add(snap1h["e20"] > snap1h["e50"] and snap1h["macd_hist"] > 0, 10, "تأكيد صاعد على الساعة")
+        add(snap4h["not_bearish"], 5, "4 ساعات لا يعاكس الصفقة")
+        add(price > e20 and ema20_distance_pct <= 0.6, 8, "دخول مبكر قريب من EMA20")
+        add(macd5 > macd5_sig and rsi5 >= rsi5_prev, 6, "تأكيد دخول على 5 دقائق")
+        add(obv5[-1] > obv5[-5], 5, "OBV يؤكد السيولة")
+
         relative_strength = rise_1h - float(market.get("btc", {}).get("rise_1h", 0.0))
-        add(relative_strength >= 1.0, 8, f"قوة نسبية أعلى من BTC بـ {relative_strength:.1f}%")
+        add(relative_strength >= 0.8, 7, f"قوة نسبية أعلى من BTC بـ {relative_strength:.1f}%")
         add(market.get("regime") == "إيجابي", 4, "السوق العام داعم")
 
-        # شروط إجبارية تمنع الإشارات الضعيفة والمتأخرة.
-        if not (snap15["bullish"] and snap1h["not_bearish"] and snap4h["not_bearish"]):
-            return None
-        if not (breakout or retest or squeeze_breakout):
-            return None
-        if volume_ratio < float(market.get("required_volume_ratio", MIN_VOLUME_RATIO)) or adx_now < MIN_ADX:
-            return None
-        if price < e20 or price < vw:
-            return None
-        if rsi_now > float(market.get("rsi_cap", 67.0)):
-            return None
-        if score < int(market.get("required_score", MIN_SCORE)):
+        required_score = max(82, int(market.get("required_score", MIN_SCORE)))
+        if score < required_score:
             return None
 
-        stop = min(recent_support, price - 1.25 * atr_now)
+        recent_support5 = min(c["low"] for c in closed5[-12:-1])
+        stop = min(recent_support5, support15, price - 1.25 * atr5)
         risk = price - stop
         if risk <= 0:
             return None
+
         risk_pct = risk / price * 100
         if risk_pct > MAX_RISK_PCT:
             return None
+
+        older_window = closed15[-80:-22]
+        if older_window:
+            next_resistance = max(c["high"] for c in older_window)
+            if next_resistance > price and (next_resistance - price) < 1.5 * risk:
+                return None
 
         return {
             "symbol": symbol,
@@ -577,20 +637,22 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             "tp3": price + 3.0 * risk,
             "risk_pct": risk_pct,
             "score": min(score, 99),
-            "volume_ratio": volume_ratio,
-            "rsi": rsi_now,
-            "adx": adx_now,
-            "setup": "إعادة اختبار" if retest else ("انضغاط واختراق" if squeeze_breakout else "اختراق"),
-            "reasons": reasons[:7],
-            "candle_close": candle["close_time"],
+            "volume_ratio": volume_ratio15,
+            "rsi": rsi15,
+            "adx": adx15,
+            "setup": "إعادة اختبار 15m" if retest15 else (
+                "انضغاط واختراق 15m" if squeeze_breakout15 else "اختراق 15m"
+            ),
+            "reasons": reasons[:8],
+            "candle_close": candle5["close_time"],
             "market_regime": market.get("regime", "غير متاح"),
             "btc_1h": float(market.get("btc", {}).get("rise_1h", 0.0)),
             "relative_strength": relative_strength,
         }
+
     except Exception as exc:
         print(f"Analyze {symbol}: {exc}", flush=True)
         return None
-
 
 def fmt(value: float) -> str:
     if value >= 1000:
@@ -610,7 +672,7 @@ def signal_message(result: Dict) -> str:
         f"🟢 إشارة شراء سبوت — {result['symbol']}\n\n"
         f"النموذج: {result['setup']}\n"
         f"قوة الإشارة: {result['score']}%\n"
-        f"الفريمات: 5m / 15m / 1h / 4h\n"
+        f"الفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\n"
         f"حالة السوق: {result['market_regime']} | BTC ساعة: {result['btc_1h']:+.2f}%\n"
         f"القوة النسبية أمام BTC: {result['relative_strength']:+.2f}%\n\n"
         f"سعر الشراء التقريبي: {fmt(result['entry'])}\n"
@@ -761,8 +823,8 @@ def main() -> None:
     send_message(
         "✅ تم تشغيل بوت إشارات الشراء للسبوت.\n"
         "يفحص جميع العملات غير المستقرة على Binance Spot مقابل USDT.\n"
-        "الفريمات: 5m / 15m / 1h / 4h\n"
-        "بدون شورت وبدون WATCH، مع فلتر BTC وETH ومنع الدخول المتأخر."
+        "الفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\n"
+        "بدون شورت وبدون WATCH، مع دخول مبكر ومنع مطاردة السعر."
     )
     while True:
         started = time.time()
