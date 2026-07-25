@@ -31,10 +31,16 @@ MIN_ADX = float(os.getenv("MIN_ADX", "20"))
 MAX_1H_RISE_PCT = float(os.getenv("MAX_1H_RISE_PCT", "8"))
 MAX_4H_RISE_PCT = float(os.getenv("MAX_4H_RISE_PCT", "14"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "4"))
+MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
+MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "2.5"))
+MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "3"))
+MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "55"))
+TRACK_RESULTS = os.getenv("TRACK_RESULTS", "1") == "1"
 
 STATE_FILE = Path("spot_signal_state.json")
 SESSION = requests.Session()
 SYMBOL_CACHE: Dict[str, object] = {"symbols": [], "updated_at": 0.0}
+MARKET_CACHE: Dict[str, object] = {"data": None, "updated_at": 0.0}
 
 # العملات المستقرة والعملات المرتبطة بعملات ورقية
 STABLE_BASES = {
@@ -45,11 +51,7 @@ STABLE_BASES = {
 
 # العملات الكبيرة مستبعدة لأن الهدف اصطياد الصغيرة والمتوسطة.
 # احذف أي رمز من المتغير EXCLUDED_MAJORS في Railway إذا أردت إدخاله لاحقًا.
-DEFAULT_EXCLUDED_MAJORS = {
-    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "LINK",
-    "AVAX", "SUI", "DOT", "TON", "SHIB", "PEPE", "LTC", "BCH", "XLM",
-    "HBAR", "UNI", "AAVE", "ETC", "NEAR", "APT", "ICP", "FIL"
-}
+DEFAULT_EXCLUDED_MAJORS = set()
 EXCLUDED_MAJORS = {
     x.strip().upper()
     for x in os.getenv("EXCLUDED_MAJORS", ",".join(sorted(DEFAULT_EXCLUDED_MAJORS))).split(",")
@@ -272,6 +274,108 @@ def pct_change(old: float, new: float) -> float:
     return ((new / old) - 1) * 100 if old else 0.0
 
 
+
+
+def consecutive_green(candles: List[Dict], lookback: int = 6) -> int:
+    count = 0
+    for candle in reversed(candles[-lookback:]):
+        if candle["close"] > candle["open"]:
+            count += 1
+        else:
+            break
+    return count
+
+
+def market_context() -> Dict:
+    """فلتر سوق مرن: لا يمنع كل الإشارات عند ضعف BTC، بل يشدد الشروط."""
+    now = time.time()
+    cached = MARKET_CACHE.get("data")
+    updated_at = float(MARKET_CACHE.get("updated_at", 0.0))
+    if cached and now - updated_at < MARKET_CACHE_SECONDS:
+        return dict(cached)
+
+    def asset_snapshot(symbol: str) -> Dict:
+        c15 = get_klines(symbol, "15m", 120)[:-1]
+        c1h = get_klines(symbol, "1h", 120)[:-1]
+        close15 = [c["close"] for c in c15]
+        close1h = [c["close"] for c in c1h]
+        e20_15 = ema(close15, 20)[-1]
+        e50_15 = ema(close15, 50)[-1]
+        e20_1h = ema(close1h, 20)[-1]
+        e50_1h = ema(close1h, 50)[-1]
+        _, _, hist15 = macd(close15)
+        _, _, hist1h = macd(close1h)
+        p15 = close15[-1]
+        p1h = close1h[-1]
+        return {
+            "price": p15,
+            "rise_1h": pct_change(close15[-5], p15),
+            "rise_4h": pct_change(close1h[-5], p1h),
+            "bull15": bool(e20_15 and e50_15 and hist15 is not None and p15 > e20_15 > e50_15 and hist15 >= 0),
+            "bear15": bool(e20_15 and e50_15 and hist15 is not None and p15 < e20_15 < e50_15 and hist15 < 0),
+            "bull1h": bool(e20_1h and e50_1h and hist1h is not None and p1h > e20_1h > e50_1h and hist1h >= 0),
+            "bear1h": bool(e20_1h and e50_1h and hist1h is not None and p1h < e20_1h < e50_1h and hist1h < 0),
+        }
+
+    try:
+        btc = asset_snapshot("BTCUSDT")
+        eth = asset_snapshot("ETHUSDT")
+        points = 0
+        points += 2 if btc["bull1h"] else (-2 if btc["bear1h"] else 0)
+        points += 1 if btc["bull15"] else (-1 if btc["bear15"] else 0)
+        points += 1 if eth["bull1h"] else (-1 if eth["bear1h"] else 0)
+        points += 1 if eth["bull15"] else (-1 if eth["bear15"] else 0)
+
+        severe_drop = btc["rise_1h"] <= -1.4 or btc["rise_4h"] <= -3.0
+        if severe_drop or points <= -4:
+            regime = "ضعيف جدًا"
+            score_bonus_required = 12
+            volume_multiplier = 1.35
+            rsi_cap = 64.0
+        elif points <= -2:
+            regime = "ضعيف"
+            score_bonus_required = 7
+            volume_multiplier = 1.18
+            rsi_cap = 66.0
+        elif points >= 3:
+            regime = "إيجابي"
+            score_bonus_required = 0
+            volume_multiplier = 1.0
+            rsi_cap = 69.0
+        else:
+            regime = "محايد"
+            score_bonus_required = 3
+            volume_multiplier = 1.08
+            rsi_cap = 67.0
+
+        data = {
+            "regime": regime,
+            "points": points,
+            "btc": btc,
+            "eth": eth,
+            "required_score": MIN_SCORE + score_bonus_required,
+            "required_volume_ratio": MIN_VOLUME_RATIO * volume_multiplier,
+            "rsi_cap": rsi_cap,
+            "severe_drop": severe_drop,
+        }
+    except Exception as exc:
+        print(f"Market filter error: {exc}", flush=True)
+        data = {
+            "regime": "غير متاح",
+            "points": 0,
+            "btc": {"rise_1h": 0.0, "rise_4h": 0.0},
+            "eth": {"rise_1h": 0.0, "rise_4h": 0.0},
+            "required_score": MIN_SCORE + 3,
+            "required_volume_ratio": MIN_VOLUME_RATIO * 1.08,
+            "rsi_cap": 67.0,
+            "severe_drop": False,
+        }
+
+    MARKET_CACHE["data"] = data
+    MARKET_CACHE["updated_at"] = now
+    return dict(data)
+
+
 def safe_last(values: List[Optional[float]], offset: int = 1) -> Optional[float]:
     if len(values) < offset:
         return None
@@ -323,7 +427,7 @@ def frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
     }
 
 
-def analyze_symbol(symbol: str) -> Optional[Dict]:
+def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
     try:
         c5 = get_klines(symbol, "5m", 260)
         c15 = get_klines(symbol, "15m", 260)
@@ -358,13 +462,27 @@ def analyze_symbol(symbol: str) -> Optional[Dict]:
         volume_ratio = volumes[-1] / avg_vol if avg_vol else 0.0
         avg_trades = mean(trades[-21:-1])
         trade_ratio = trades[-1] / avg_trades if avg_trades else 0.0
-        resistance = max(c["high"] for c in closed[-21:-1])
+        # المقاومة تُحسب بدون آخر شمعتين حتى يمكن اكتشاف:
+        # 1) اختراق في الشمعة السابقة
+        # 2) إعادة اختبار في الشمعة الحالية
+        resistance = max(c["high"] for c in closed[-22:-2])
+        previous_candle = closed[-2]
         recent_support = min(c["low"] for c in closed[-12:-1])
-        breakout = price > resistance and volume_ratio >= 1.2
-        near_breakout = price >= resistance * 0.997 and candle["close"] > candle["open"]
+
+        breakout = (
+            price > resistance
+            and volume_ratio >= 1.2
+            and candle["close"] > candle["open"]
+        )
+        near_breakout = (
+            price >= resistance * 0.997
+            and candle["close"] > candle["open"]
+        )
         retest = (
-            closed[-2]["high"] > resistance
+            previous_candle["close"] > resistance
+            and previous_candle["high"] > resistance
             and candle["low"] <= resistance * 1.004
+            and candle["low"] >= resistance * 0.990
             and price > resistance
             and candle["close"] > candle["open"]
         )
@@ -386,7 +504,17 @@ def analyze_symbol(symbol: str) -> Optional[Dict]:
 
         rise_1h = pct_change(closed[-13]["close"], price)
         rise_4h = pct_change(closed[-49]["close"], price)
+        candle_body_pct = abs(candle["close"] - candle["open"]) / candle["open"] * 100 if candle["open"] else 0.0
+        ema20_distance_pct = (price / e20 - 1) * 100 if e20 else 999.0
+        green_streak = consecutive_green(closed)
+
         if rise_1h > MAX_1H_RISE_PCT or rise_4h > MAX_4H_RISE_PCT:
+            return None
+        if candle_body_pct > MAX_CANDLE_BODY_PCT:
+            return None
+        if ema20_distance_pct > MAX_EMA20_DISTANCE_PCT:
+            return None
+        if green_streak > MAX_CONSECUTIVE_GREEN:
             return None
 
         score = 0
@@ -414,19 +542,22 @@ def analyze_symbol(symbol: str) -> Optional[Dict]:
         add(snap1h["bullish"], 10, "تأكيد صاعد على الساعة")
         add(snap4h["not_bearish"], 6, "فريم 4 ساعات لا يعاكس الصفقة")
         add(supertrend(c15[:-1]) is True, 6, "SuperTrend شراء على 15 دقيقة")
+        relative_strength = rise_1h - float(market.get("btc", {}).get("rise_1h", 0.0))
+        add(relative_strength >= 1.0, 8, f"قوة نسبية أعلى من BTC بـ {relative_strength:.1f}%")
+        add(market.get("regime") == "إيجابي", 4, "السوق العام داعم")
 
         # شروط إجبارية تمنع الإشارات الضعيفة والمتأخرة.
         if not (snap15["bullish"] and snap1h["not_bearish"] and snap4h["not_bearish"]):
             return None
         if not (breakout or retest or squeeze_breakout):
             return None
-        if volume_ratio < MIN_VOLUME_RATIO or adx_now < MIN_ADX:
+        if volume_ratio < float(market.get("required_volume_ratio", MIN_VOLUME_RATIO)) or adx_now < MIN_ADX:
             return None
         if price < e20 or price < vw:
             return None
-        if rsi_now > 74:
+        if rsi_now > float(market.get("rsi_cap", 67.0)):
             return None
-        if score < MIN_SCORE:
+        if score < int(market.get("required_score", MIN_SCORE)):
             return None
 
         stop = min(recent_support, price - 1.25 * atr_now)
@@ -452,6 +583,9 @@ def analyze_symbol(symbol: str) -> Optional[Dict]:
             "setup": "إعادة اختبار" if retest else ("انضغاط واختراق" if squeeze_breakout else "اختراق"),
             "reasons": reasons[:7],
             "candle_close": candle["close_time"],
+            "market_regime": market.get("regime", "غير متاح"),
+            "btc_1h": float(market.get("btc", {}).get("rise_1h", 0.0)),
+            "relative_strength": relative_strength,
         }
     except Exception as exc:
         print(f"Analyze {symbol}: {exc}", flush=True)
@@ -476,7 +610,9 @@ def signal_message(result: Dict) -> str:
         f"🟢 إشارة شراء سبوت — {result['symbol']}\n\n"
         f"النموذج: {result['setup']}\n"
         f"قوة الإشارة: {result['score']}%\n"
-        f"الفريمات: 5m / 15m / 1h / 4h\n\n"
+        f"الفريمات: 5m / 15m / 1h / 4h\n"
+        f"حالة السوق: {result['market_regime']} | BTC ساعة: {result['btc_1h']:+.2f}%\n"
+        f"القوة النسبية أمام BTC: {result['relative_strength']:+.2f}%\n\n"
         f"سعر الشراء التقريبي: {fmt(result['entry'])}\n"
         f"وقف الخسارة: {fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
         f"الهدف الأول: {fmt(result['tp1'])}\n"
@@ -506,7 +642,76 @@ def cooled(state: Dict, result: Dict) -> bool:
     return result["candle_close"] - previous >= COOLDOWN_MINUTES * 60 * 1000
 
 
+
+
+def track_open_signals(state: Dict) -> None:
+    if not TRACK_RESULTS:
+        return
+
+    open_signals = state.setdefault("open_signals", {})
+    stats = state.setdefault("stats", {"tp1": 0, "tp2": 0, "tp3": 0, "stop": 0})
+    now_ms = int(time.time() * 1000)
+
+    for symbol, signal in list(open_signals.items()):
+        try:
+            candles = get_klines(symbol, "5m", 100)[:-1]
+            last_checked = int(signal.get("last_checked", signal["time"]))
+            relevant = [c for c in candles if c["close_time"] > last_checked]
+
+            if not relevant:
+                if now_ms - int(signal["time"]) > 48 * 60 * 60 * 1000:
+                    del open_signals[symbol]
+                continue
+
+            reached = int(signal.get("reached", 0))
+            closed_signal = False
+
+            # فحص زمني شمعة بشمعة بدل استخدام أعلى/أدنى الفترة كاملة.
+            for candle in relevant:
+                high = float(candle["high"])
+                low = float(candle["low"])
+
+                # إذا ضربت الشمعة الوقف والهدف معًا، نستخدم ترتيبًا محافظًا:
+                # الوقف أولًا لأن ترتيب الحركة داخل الشمعة غير معروف.
+                if low <= float(signal["stop"]):
+                    stats["stop"] = int(stats.get("stop", 0)) + 1
+                    del open_signals[symbol]
+                    closed_signal = True
+                    break
+
+                if reached < 1 and high >= float(signal["tp1"]):
+                    stats["tp1"] = int(stats.get("tp1", 0)) + 1
+                    reached = 1
+
+                if reached < 2 and high >= float(signal["tp2"]):
+                    stats["tp2"] = int(stats.get("tp2", 0)) + 1
+                    reached = 2
+
+                if reached < 3 and high >= float(signal["tp3"]):
+                    stats["tp3"] = int(stats.get("tp3", 0)) + 1
+                    reached = 3
+                    del open_signals[symbol]
+                    closed_signal = True
+                    break
+
+                signal["last_checked"] = candle["close_time"]
+
+            if closed_signal:
+                continue
+
+            signal["reached"] = reached
+            signal["last_checked"] = relevant[-1]["close_time"]
+
+            if now_ms - int(signal["time"]) > 48 * 60 * 60 * 1000:
+                del open_signals[symbol]
+
+        except Exception as exc:
+            print(f"Track {symbol}: {exc}", flush=True)
+
+
 def scan(state: Dict) -> None:
+    track_open_signals(state)
+    market = market_context()
     symbols = get_symbols()
     ranked: List[Tuple[str, float]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -520,7 +725,7 @@ def scan(state: Dict) -> None:
 
     results: List[Dict] = []
     with ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS // 2)) as pool:
-        futures = [pool.submit(analyze_symbol, symbol) for symbol in shortlist]
+        futures = [pool.submit(analyze_symbol, symbol, market) for symbol in shortlist]
         for future in as_completed(futures):
             result = future.result()
             if result and cooled(state, result):
@@ -531,12 +736,22 @@ def scan(state: Dict) -> None:
     for result in results[:MAX_ALERTS_PER_SCAN]:
         send_message(signal_message(result))
         state.setdefault("alerts", {})[result["symbol"]] = result["candle_close"]
+        state.setdefault("open_signals", {})[result["symbol"]] = {
+            "time": result["candle_close"],
+            "last_checked": result["candle_close"],
+            "entry": result["entry"],
+            "stop": result["stop"],
+            "tp1": result["tp1"],
+            "tp2": result["tp2"],
+            "tp3": result["tp3"],
+            "reached": 0,
+        }
         sent += 1
         time.sleep(0.3)
 
     save_state(state)
     print(
-        f"Scan finished | universe={len(symbols)} | shortlist={len(shortlist)} | candidates={len(results)} | sent={sent}",
+        f"Scan finished | market={market.get('regime')} | universe={len(symbols)} | shortlist={len(shortlist)} | candidates={len(results)} | sent={sent}",
         flush=True,
     )
 
@@ -545,9 +760,9 @@ def main() -> None:
     state = load_state()
     send_message(
         "✅ تم تشغيل بوت إشارات الشراء للسبوت.\n"
-        "يفحص العملات الصغيرة والمتوسطة غير المستقرة على Binance Spot.\n"
+        "يفحص جميع العملات غير المستقرة على Binance Spot مقابل USDT.\n"
         "الفريمات: 5m / 15m / 1h / 4h\n"
-        "بدون شورت وبدون WATCH."
+        "بدون شورت وبدون WATCH، مع فلتر BTC وETH ومنع الدخول المتأخر."
     )
     while True:
         started = time.time()
