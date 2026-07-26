@@ -1,4 +1,5 @@
 import os, time, json
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from statistics import mean, pstdev
@@ -26,6 +27,18 @@ MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
 MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.5"))
 MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "2"))
 
+# فلاتر جودة الاختراق V2.1
+BREAKOUT_CONFIRM_5M = os.getenv("BREAKOUT_CONFIRM_5M", "1") == "1"
+CONFIRM_MAX_DIP_PCT = float(os.getenv("CONFIRM_MAX_DIP_PCT", "0.8"))
+MIN_CONFIRM_CLOSE_LOCATION = float(os.getenv("MIN_CONFIRM_CLOSE_LOCATION", "0.55"))
+MAX_RSI_HARD = float(os.getenv("MAX_RSI_HARD", "70"))
+MAX_BREAKOUT_RANGE_ATR = float(os.getenv("MAX_BREAKOUT_RANGE_ATR", "2.0"))
+MAX_BREAKOUT_BODY_ATR = float(os.getenv("MAX_BREAKOUT_BODY_ATR", "1.6"))
+MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MIN_NEXT_RESISTANCE_PCT", "2.5"))
+MOMENTUM_MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MOMENTUM_MIN_NEXT_RESISTANCE_PCT", "1.5"))
+REJECTION_LOG_ENABLED = os.getenv("REJECTION_LOG_ENABLED", "1") == "1"
+REJECTION_LOG_FILE = Path(os.getenv("REJECTION_LOG_FILE", "rejected_signals.jsonl"))
+
 # مسار الزخم القوي مثل SHIB
 MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
 MOMENTUM_MIN_VOLUME_15M = float(os.getenv("MOMENTUM_MIN_VOLUME_15M", "3.0"))
@@ -45,10 +58,43 @@ STATE_FILE = Path("spot_signal_state.json")
 SESSION = requests.Session()
 SYMBOL_CACHE = {"symbols": [], "updated_at": 0.0}
 MARKET_CACHE = {"data": None, "updated_at": 0.0}
+REJECTION_LOCK = Lock()
 
 STABLE_BASES = {"USDC","FDUSD","TUSD","USDP","DAI","USD1","BUSD","USDS","EUR","AEUR","EURT","TRY","BRL","GBP","AUD","BIDR","IDRT","UAH","RUB","NGN","VAI","PAX","UST","USTC"}
 EXCLUDED_MAJORS = {x.strip().upper() for x in os.getenv("EXCLUDED_MAJORS", "").split(",") if x.strip()}
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
+
+
+
+def log_rejection(symbol: str, reason: str, details: Optional[Dict] = None) -> None:
+    """يسجل فقط أسباب رفض فلاتر الجودة الجديدة بدون إرسالها إلى تيليجرام."""
+    if not REJECTION_LOG_ENABLED:
+        return
+    row = {
+        "time": int(time.time() * 1000),
+        "symbol": symbol,
+        "reason": reason,
+        "details": details or {},
+    }
+    print(f"Rejected {symbol}: {reason} | {row['details']}", flush=True)
+    try:
+        with REJECTION_LOCK:
+            with REJECTION_LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"Rejection log error: {exc}", flush=True)
+
+
+def nearest_overhead_resistance(candles: List[Dict], price: float, lookback: int = 80) -> Optional[float]:
+    """أقرب قمة سابقة أعلى من السعر من شموع مغلقة."""
+    levels = [c["high"] for c in candles[-lookback:-1] if c["high"] > price]
+    return min(levels) if levels else None
+
+
+def close_location(candle: Dict) -> float:
+    """موضع الإغلاق داخل مدى الشمعة: 0 عند القاع و1 عند القمة."""
+    span = candle["high"] - candle["low"]
+    return (candle["close"] - candle["low"]) / span if span > 0 else 0.5
 
 
 def send_message(text: str) -> None:
@@ -236,6 +282,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if None in (e20_15,e50_15,r15,m15,s15,h15): return None
         av15=mean(vols15[-21:-1]); vr15=vols15[-1]/av15 if av15 else 0; at15=mean(trades15[-21:-1]); tr15=trades15[-1]/at15 if at15 else 0
         resistance=max(c["high"] for c in closed15[-22:-2]); support=min(c["low"] for c in closed15[-12:-1])
+        atr15=atr(closed15)
+        breakout_range=candle15["high"]-candle15["low"]
+        breakout_body=abs(candle15["close"]-candle15["open"])
         breakout=candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MIN_15M_VOLUME_RATIO
         retest=prev15["close"]>resistance and candle15["low"]<=resistance*1.004 and candle15["low"]>=resistance*0.990 and candle15["close"]>resistance and candle15["close"]>candle15["open"]
         widths=[bollinger(closes15[:-i])[3] for i in range(40,0,-1) if len(closes15[:-i])>=20]; _,bbup,_,bbw=bollinger(closes15)
@@ -244,12 +293,54 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         s1,s4=frame_snapshot(c1h),frame_snapshot(c4h)
         if not s1 or not s4: return None
 
+        # فلتر RSI قاسٍ: يمنع الإشارات المتأخرة حتى لو اجتازت المسارات الأخرى.
+        if r15 > MAX_RSI_HARD:
+            log_rejection(symbol, "RSI مرتفع", {"rsi15": round(r15, 2), "limit": MAX_RSI_HARD})
+            return None
+
+        # شمعة اختراق مفرطة غالبًا تكون استنزافًا لا بداية آمنة.
+        if breakout and atr15 > 0 and (breakout_range > MAX_BREAKOUT_RANGE_ATR * atr15 or breakout_body > MAX_BREAKOUT_BODY_ATR * atr15):
+            log_rejection(symbol, "شمعة اختراق استنزافية", {
+                "range_atr": round(breakout_range / atr15, 2),
+                "body_atr": round(breakout_body / atr15, 2),
+            })
+            return None
+
+        # يجب أن تكون آخر شمعة 5m مغلقة بعد شمعة الاختراق 15m، وتثبت فوق المستوى.
+        if BREAKOUT_CONFIRM_5M and breakout:
+            confirm_after_breakout = candle5["close_time"] > candle15["close_time"]
+            held_level = candle5["close"] > resistance and candle5["low"] >= resistance * (1 - CONFIRM_MAX_DIP_PCT / 100)
+            healthy_close = candle5["close"] >= candle5["open"] and close_location(candle5) >= MIN_CONFIRM_CLOSE_LOCATION
+            if not (confirm_after_breakout and held_level and healthy_close and h5 >= 0):
+                log_rejection(symbol, "فشل تأكيد الاختراق 5m", {
+                    "after_breakout": confirm_after_breakout,
+                    "held_level": held_level,
+                    "healthy_close": healthy_close,
+                    "confirm_close": candle5["close"],
+                    "resistance": resistance,
+                })
+                return None
+
         momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
 
         rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
+
+        # مقاومة أعلى قريبة: نستخدم قمم الساعة السابقة، مع سماح أكبر لمسار الزخم.
+        overhead = nearest_overhead_resistance(c1h[:-1], price, 100)
+        if overhead:
+            overhead_pct = pct_change(price, overhead)
+            required_room = MOMENTUM_MIN_NEXT_RESISTANCE_PCT if momentum else MIN_NEXT_RESISTANCE_PCT
+            if overhead_pct < required_room:
+                log_rejection(symbol, "مقاومة قريبة", {
+                    "distance_pct": round(overhead_pct, 2),
+                    "required_pct": required_room,
+                    "resistance": overhead,
+                })
+                return None
+
         if momentum:
             score=20+18+10+10+10+7+7+4+4
-            reasons=["اختراق قمة 15m بإغلاق واضح",f"حجم انفجاري 15m ×{vr15:.1f}",f"تأكيد حجم 5m ×{vr5:.1f}",f"قوة اتجاه ADX {a15:.0f}",f"RSI زخم مناسب {r15:.1f}","MACD إيجابي على 15m و5m","السعر فوق VWAP","الساعة و4 ساعات لا يعاكسان الزخم"]
+            reasons=["اختراق قمة 15m بإغلاق واضح","تأكيد 5m حافظ على مستوى الاختراق",f"حجم انفجاري 15m ×{vr15:.1f}",f"تأكيد حجم 5m ×{vr5:.1f}",f"قوة اتجاه ADX {a15:.0f}",f"RSI زخم مناسب {r15:.1f}","MACD إيجابي على 15m و5m","السعر فوق VWAP","الساعة و4 ساعات لا يعاكسان الزخم"]
             if obv5[-1]>obv5[-5]: score+=6
             if tr15>=1.4: score+=6
             if rel>=0.25: score+=5
@@ -265,7 +356,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             score=(18 if breakout else 0)+(20 if retest else 0)+(14 if squeeze_break else 0)+(12 if vr15>=2 else 0)+(6 if tr15>=1.4 else 0)+(8 if 52<=r15<=62 else 0)+(8 if a15>=25 else 0)+8+10+5+(8 if dist<=0.6 else 0)+(6 if m5>s5 and r5>=r5p else 0)+(5 if obv5[-1]>obv5[-5] else 0)+(7 if rel>=0.8 else 0)+(4 if market.get("regime")=="إيجابي" else 0)
             if score<max(82,int(market.get("required_score",MIN_SCORE))): return None
             reasons=[]
-            if breakout: reasons.append("اختراق مؤكد على 15 دقيقة")
+            if breakout: reasons += ["اختراق مؤكد على 15 دقيقة","تأكيد 5m حافظ على مستوى الاختراق"]
             if retest: reasons.append("إعادة اختبار ناجحة على 15 دقيقة")
             if squeeze_break: reasons.append("خروج من انضغاط Bollinger")
             reasons += [f"حجم 15 دقيقة ×{vr15:.1f}",f"RSI 15m مناسب {r15:.1f}",f"ADX 15m {a15:.0f}","تأكيد صاعد على الساعة","4 ساعات لا يعاكس الصفقة"]
@@ -339,7 +430,7 @@ def scan(state: Dict) -> None:
 
 
 def main() -> None:
-    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات المشابهة لـ SHIB.\nبدون شورت وبدون WATCH.")
+    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.1.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات المشابهة لـ SHIB.\nتم تفعيل تأكيد الاختراق 5m وفلاتر المقاومة والاستنزاف.\nبدون شورت وبدون WATCH.")
     while True:
         started=time.time()
         try: scan(state)
