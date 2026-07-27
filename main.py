@@ -27,7 +27,7 @@ MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
 MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.5"))
 MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "2"))
 
-# فلاتر جودة الاختراق V2.1
+# فلاتر جودة الاختراق V2.2
 BREAKOUT_CONFIRM_5M = os.getenv("BREAKOUT_CONFIRM_5M", "1") == "1"
 CONFIRM_MAX_DIP_PCT = float(os.getenv("CONFIRM_MAX_DIP_PCT", "0.8"))
 MIN_CONFIRM_CLOSE_LOCATION = float(os.getenv("MIN_CONFIRM_CLOSE_LOCATION", "0.55"))
@@ -36,6 +36,10 @@ MAX_BREAKOUT_RANGE_ATR = float(os.getenv("MAX_BREAKOUT_RANGE_ATR", "2.0"))
 MAX_BREAKOUT_BODY_ATR = float(os.getenv("MAX_BREAKOUT_BODY_ATR", "1.6"))
 MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MIN_NEXT_RESISTANCE_PCT", "2.5"))
 MOMENTUM_MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MOMENTUM_MIN_NEXT_RESISTANCE_PCT", "1.5"))
+RESISTANCE_MAX_DISTANCE_PCT = float(os.getenv("RESISTANCE_MAX_DISTANCE_PCT", "15"))
+RESISTANCE_SWING_WINDOW = int(os.getenv("RESISTANCE_SWING_WINDOW", "2"))
+RESISTANCE_CLUSTER_TOLERANCE_PCT = float(os.getenv("RESISTANCE_CLUSTER_TOLERANCE_PCT", "0.45"))
+RESISTANCE_MIN_TOUCHES = int(os.getenv("RESISTANCE_MIN_TOUCHES", "2"))
 REJECTION_LOG_ENABLED = os.getenv("REJECTION_LOG_ENABLED", "1") == "1"
 REJECTION_LOG_FILE = Path(os.getenv("REJECTION_LOG_FILE", "rejected_signals.jsonl"))
 
@@ -85,10 +89,51 @@ def log_rejection(symbol: str, reason: str, details: Optional[Dict] = None) -> N
         print(f"Rejection log error: {exc}", flush=True)
 
 
-def nearest_overhead_resistance(candles: List[Dict], price: float, lookback: int = 80) -> Optional[float]:
-    """أقرب قمة سابقة أعلى من السعر من شموع مغلقة."""
-    levels = [c["high"] for c in candles[-lookback:-1] if c["high"] > price]
-    return min(levels) if levels else None
+def nearest_overhead_resistance(candles: List[Dict], price: float, lookback: int = 100) -> Optional[Dict]:
+    """يرجع أقرب مقاومة موثوقة فوق السعر من قمم محورية متكررة، لا من أي ذيل عشوائي."""
+    if price <= 0 or len(candles) < (RESISTANCE_SWING_WINDOW * 2 + 5):
+        return None
+
+    sample = candles[-lookback:]
+    swing_levels: List[float] = []
+    w = max(1, RESISTANCE_SWING_WINDOW)
+
+    # القمة المحورية يجب أن تتفوق على الشموع المحيطة بها.
+    for i in range(w, len(sample) - w):
+        high = float(sample[i]["high"])
+        neighbors = sample[i-w:i] + sample[i+1:i+w+1]
+        if high >= max(float(c["high"]) for c in neighbors):
+            distance_pct = pct_change(price, high)
+            if 0 < distance_pct <= RESISTANCE_MAX_DISTANCE_PCT:
+                swing_levels.append(high)
+
+    if not swing_levels:
+        return None
+
+    # نجمع القمم المتقاربة في منطقة مقاومة واحدة ونشترط تكرار اللمس.
+    swing_levels.sort()
+    clusters: List[List[float]] = []
+    for level in swing_levels:
+        placed = False
+        for cluster in clusters:
+            center = mean(cluster)
+            if abs(level / center - 1) * 100 <= RESISTANCE_CLUSTER_TOLERANCE_PCT:
+                cluster.append(level)
+                placed = True
+                break
+        if not placed:
+            clusters.append([level])
+
+    valid = []
+    for cluster in clusters:
+        if len(cluster) < RESISTANCE_MIN_TOUCHES:
+            continue
+        level = mean(cluster)
+        distance_pct = pct_change(price, level)
+        if 0 < distance_pct <= RESISTANCE_MAX_DISTANCE_PCT:
+            valid.append({"level": level, "distance_pct": distance_pct, "touches": len(cluster)})
+
+    return min(valid, key=lambda x: x["distance_pct"]) if valid else None
 
 
 def close_location(candle: Dict) -> float:
@@ -325,16 +370,17 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
 
-        # مقاومة أعلى قريبة: نستخدم قمم الساعة السابقة، مع سماح أكبر لمسار الزخم.
+        # مقاومة أعلى قريبة: لا نعتمد أي ذيل منفرد؛ نستخدم منطقة قمم محورية متكررة على الساعة.
         overhead = nearest_overhead_resistance(c1h[:-1], price, 100)
         if overhead:
-            overhead_pct = pct_change(price, overhead)
+            overhead_pct = float(overhead["distance_pct"])
             required_room = MOMENTUM_MIN_NEXT_RESISTANCE_PCT if momentum else MIN_NEXT_RESISTANCE_PCT
             if overhead_pct < required_room:
-                log_rejection(symbol, "مقاومة قريبة", {
+                log_rejection(symbol, "مقاومة قريبة مؤكدة", {
                     "distance_pct": round(overhead_pct, 2),
                     "required_pct": required_room,
-                    "resistance": overhead,
+                    "resistance": round(float(overhead["level"]), 10),
+                    "touches": int(overhead["touches"]),
                 })
                 return None
 
@@ -430,7 +476,7 @@ def scan(state: Dict) -> None:
 
 
 def main() -> None:
-    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.1.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات المشابهة لـ SHIB.\nتم تفعيل تأكيد الاختراق 5m وفلاتر المقاومة والاستنزاف.\nبدون شورت وبدون WATCH.")
+    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.2.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات المشابهة لـ SHIB.\nتم تفعيل تأكيد الاختراق 5m وفلتر المقاومة المحورية والاستنزاف.\nبدون شورت وبدون WATCH.")
     while True:
         started=time.time()
         try: scan(state)
