@@ -78,6 +78,25 @@ MOMENTUM_MAX_EMA20_DISTANCE = float(os.getenv("MOMENTUM_MAX_EMA20_DISTANCE", "2.
 MOMENTUM_MAX_GREEN = int(os.getenv("MOMENTUM_MAX_GREEN", "4"))
 MOMENTUM_MIN_SCORE = int(os.getenv("MOMENTUM_MIN_SCORE", "84"))
 
+# المسار الرابع: تجميع مبكر قبل الانطلاقة
+ACCUMULATION_ENABLED = os.getenv("ACCUMULATION_ENABLED", "1") == "1"
+ACCUMULATION_LOOKBACK_15M = int(os.getenv("ACCUMULATION_LOOKBACK_15M", "16"))
+ACCUMULATION_MAX_BASE_RANGE_PCT = float(os.getenv("ACCUMULATION_MAX_BASE_RANGE_PCT", "4.2"))
+ACCUMULATION_MAX_AVG_BODY_ATR = float(os.getenv("ACCUMULATION_MAX_AVG_BODY_ATR", "0.75"))
+ACCUMULATION_MIN_HIGHER_LOW_PCT = float(os.getenv("ACCUMULATION_MIN_HIGHER_LOW_PCT", "0.10"))
+ACCUMULATION_MIN_VOLUME_BUILD = float(os.getenv("ACCUMULATION_MIN_VOLUME_BUILD", "1.12"))
+ACCUMULATION_MIN_VOLUME_15M = float(os.getenv("ACCUMULATION_MIN_VOLUME_15M", "1.25"))
+ACCUMULATION_MIN_VOLUME_5M = float(os.getenv("ACCUMULATION_MIN_VOLUME_5M", "1.10"))
+ACCUMULATION_MIN_RSI_15M = float(os.getenv("ACCUMULATION_MIN_RSI_15M", "48"))
+ACCUMULATION_MAX_RSI_15M = float(os.getenv("ACCUMULATION_MAX_RSI_15M", "67"))
+ACCUMULATION_MIN_ADX_15M = float(os.getenv("ACCUMULATION_MIN_ADX_15M", "16"))
+ACCUMULATION_MAX_15M_RISE = float(os.getenv("ACCUMULATION_MAX_15M_RISE", "2.8"))
+ACCUMULATION_MAX_1H_RISE = float(os.getenv("ACCUMULATION_MAX_1H_RISE", "6.0"))
+ACCUMULATION_MAX_EMA20_DISTANCE = float(os.getenv("ACCUMULATION_MAX_EMA20_DISTANCE", "1.35"))
+ACCUMULATION_MIN_NEXT_RESISTANCE_PCT = float(os.getenv("ACCUMULATION_MIN_NEXT_RESISTANCE_PCT", "1.2"))
+ACCUMULATION_MIN_SCORE = int(os.getenv("ACCUMULATION_MIN_SCORE", "84"))
+ACCUMULATION_MAX_RISK_PCT = float(os.getenv("ACCUMULATION_MAX_RISK_PCT", "4.0"))
+
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "55"))
 TRACK_RESULTS = os.getenv("TRACK_RESULTS", "1") == "1"
 STATE_FILE = Path("spot_signal_state.json")
@@ -307,6 +326,44 @@ def consecutive_green(candles: List[Dict], lookback: int = 6) -> int:
     return n
 
 
+def accumulation_base(candles: List[Dict], lookback: int = ACCUMULATION_LOOKBACK_15M) -> Optional[Dict]:
+    """يكشف قاعدة تجميع مضغوطة مع قيعان صاعدة وبناء تدريجي للحجم قبل الانطلاقة."""
+    if len(candles) < lookback + 6:
+        return None
+    base = candles[-lookback-1:-1]
+    if len(base) < lookback:
+        return None
+    highs = [float(c["high"]) for c in base]
+    lows = [float(c["low"]) for c in base]
+    opens = [float(c["open"]) for c in base]
+    closes = [float(c["close"]) for c in base]
+    vols = [float(c["volume"]) for c in base]
+    base_low, base_high = min(lows), max(highs)
+    range_pct = pct_change(base_low, base_high) if base_low > 0 else 999.0
+    base_atr = atr(base)
+    avg_body = mean(abs(c-o) for o,c in zip(opens, closes))
+    avg_body_atr = avg_body / base_atr if base_atr > 0 else 999.0
+    half = max(3, lookback // 2)
+    first_low = min(lows[:half])
+    second_low = min(lows[half:])
+    higher_low_pct = pct_change(first_low, second_low) if first_low > 0 else -999.0
+    prior_vol = mean(vols[:max(4, lookback-5)])
+    recent_vol = mean(vols[-5:])
+    volume_build = recent_vol / prior_vol if prior_vol > 0 else 0.0
+    resistance = max(highs[-8:])
+    return {
+        "range_pct": range_pct,
+        "avg_body_atr": avg_body_atr,
+        "higher_low_pct": higher_low_pct,
+        "volume_build": volume_build,
+        "base_low": base_low,
+        "resistance": resistance,
+        "compressed": range_pct <= ACCUMULATION_MAX_BASE_RANGE_PCT and avg_body_atr <= ACCUMULATION_MAX_AVG_BODY_ATR,
+        "higher_lows": higher_low_pct >= ACCUMULATION_MIN_HIGHER_LOW_PCT,
+        "building_volume": volume_build >= ACCUMULATION_MIN_VOLUME_BUILD,
+    }
+
+
 def frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
     closed=candles[:-1]
     if len(closed)<210: return None
@@ -390,6 +447,13 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
         dd=recent_drawdown_pct(c, 24)
         rv=rsi(closes)
         if REVERSAL_ENABLED and dd>=REVERSAL_MIN_DRAWDOWN_PCT and rv[-1] and rv[-4] and rv[-1]>rv[-4]: score+=35
+        # لا نهمل القواعد الهادئة التي تبني حجمًا وقيعانًا صاعدة قبل الاختراق.
+        if ACCUMULATION_ENABLED:
+            base = accumulation_base(c, min(16, len(c)-6))
+            if base and base["compressed"] and base["higher_lows"]:
+                score += 24
+                if base["building_volume"]: score += 14
+                if closes[-1] >= base["resistance"] * 0.995: score += 12
         if e20 and closes[-1]<e20*0.985: score-=20
         return symbol,score
     except Exception as exc:
@@ -461,6 +525,23 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
 
+        accumulation_info = accumulation_base(closed15, ACCUMULATION_LOOKBACK_15M) if ACCUMULATION_ENABLED else None
+        early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
+        early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
+        accumulation = bool(
+            ACCUMULATION_ENABLED and accumulation_info
+            and accumulation_info["compressed"] and accumulation_info["higher_lows"] and accumulation_info["building_volume"]
+            and early_break
+            and vr15 >= ACCUMULATION_MIN_VOLUME_15M and vr5 >= ACCUMULATION_MIN_VOLUME_5M
+            and ACCUMULATION_MIN_RSI_15M <= r15 <= ACCUMULATION_MAX_RSI_15M
+            and a15 >= ACCUMULATION_MIN_ADX_15M and h15 >= 0 and h5 >= 0
+            and e20_15 >= e20v[-4] and price > e20 and price > vw5
+            and rise15 <= ACCUMULATION_MAX_15M_RISE and rise1 <= ACCUMULATION_MAX_1H_RISE
+            and dist <= ACCUMULATION_MAX_EMA20_DISTANCE
+            and not s1["strongly_bearish"] and not s4["strongly_bearish"]
+            and not market.get("severe_drop", False) and not market.get("hard_block", False)
+        )
+
         rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
 
         if market.get("hard_block",False):
@@ -487,7 +568,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         overhead = nearest_overhead_resistance(c1h[:-1], price, 100)
         if overhead:
             overhead_pct = float(overhead["distance_pct"])
-            required_room = MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal) else MIN_NEXT_RESISTANCE_PCT
+            required_room = ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if accumulation else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal) else MIN_NEXT_RESISTANCE_PCT
             if overhead_pct < required_room:
                 log_rejection(symbol, "مقاومة قريبة مؤكدة", {
                     "distance_pct": round(overhead_pct, 2),
@@ -497,7 +578,28 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
-        if reversal:
+        if accumulation:
+            score = 20+16+14+12+10+8+6
+            reasons = [
+                f"قاعدة تجميع مضغوطة {accumulation_info['range_pct']:.1f}%",
+                f"قيعان صاعدة {accumulation_info['higher_low_pct']:+.2f}%",
+                f"بناء تدريجي للحجم ×{accumulation_info['volume_build']:.2f}",
+                "اختراق مبكر لقمة القاعدة",
+                f"حجم 15m ×{vr15:.1f} وتأكيد 5m ×{vr5:.1f}",
+                f"RSI مبكر غير متشبع {r15:.1f}",
+                "MACD وEMA20 يتحسنان قبل الانطلاقة",
+                "السعر فوق VWAP",
+            ]
+            if obv5[-1] > obv5[-5]: score += 6
+            if tr15 >= 1.2: score += 5
+            if rel >= 0.35: score += 6
+            if market.get("regime") in ("إيجابي", "محايد"): score += 4
+            if score < max(ACCUMULATION_MIN_SCORE, int(market.get("required_score", MIN_SCORE))): return None
+            base_low = float(accumulation_info["base_low"])
+            recent_low = min(c["low"] for c in closed5[-10:-1])
+            stop = min(base_low, recent_low, price-1.20*atr5)
+            mode,setup = "accumulation", "تجميع مبكر قبل الانطلاقة"
+        elif reversal:
             score=22+16+12+10+8+8+6
             reasons=[f"ارتداد بعد هبوط {drawdown15:.1f}%", "خروج RSI من الضعف", "تحول هيكل 5m إلى قاع أعلى", "استعادة EMA20 على 15m", f"حجم ارتداد 15m ×{vr15:.1f}", f"تأكيد حجم 5m ×{vr5:.1f}", "السعر فوق VWAP"]
             if obv5[-1]>obv5[-5]: score+=6
@@ -531,7 +633,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             recent=min(c["low"] for c in closed5[-12:-1]); stop=min(recent,support,price-1.25*atr5)
             mode="balanced"; setup="إعادة اختبار 15m" if retest else "انضغاط واختراق 15m" if squeeze_break else "اختراق 15m"
         risk=price-stop
-        max_risk = REVERSAL_MAX_RISK_PCT if mode=="reversal" else MAX_RISK_PCT
+        max_risk = ACCUMULATION_MAX_RISK_PCT if mode=="accumulation" else REVERSAL_MAX_RISK_PCT if mode=="reversal" else MAX_RISK_PCT
         if risk<=0 or risk/price*100>max_risk: return None
         return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel}
     except Exception as exc:
@@ -544,7 +646,7 @@ def fmt(v: float) -> str:
 
 
 def signal_message(r: Dict) -> str:
-    reasons="\n".join(f"• {x}" for x in r["reasons"]); kind="انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    reasons="\n".join(f"• {x}" for x in r["reasons"]); kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
     return f"🟢 إشارة شراء سبوت — {r['symbol']}\n\nالنموذج: {r['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {r['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {r['market_regime']} | BTC 15m: {r['btc_15m']:+.2f}% | RSI BTC: {r['btc_rsi15']:.1f}\nBTC ساعة: {r['btc_1h']:+.2f}% | القوة النسبية أمام BTC: {r['relative_strength']:+.2f}%\n\nسعر الشراء التقريبي: {fmt(r['entry'])}\nوقف الخسارة: {fmt(r['stop'])} ({r['risk_pct']:.2f}%)\nالهدف الأول: {fmt(r['tp1'])}\nالهدف الثاني: {fmt(r['tp2'])}\nالهدف الثالث: {fmt(r['tp3'])}\n\nRSI: {r['rsi']:.1f}\nADX: {r['adx']:.1f}\nالحجم: ×{r['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح."
 
 
@@ -589,7 +691,7 @@ def scan(state: Dict) -> None:
         for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
             x=f.result()
             if x and cooled(state,x): results.append(x)
-    results.sort(key=lambda x:(2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
+    results.sort(key=lambda x:(3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
         send_message(signal_message(r)); state.setdefault("alerts",{})[r["symbol"]]=r["candle_close"]
@@ -599,7 +701,7 @@ def scan(state: Dict) -> None:
 
 
 def main() -> None:
-    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.4.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.4.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     while True:
         started=time.time()
         try: scan(state)
