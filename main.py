@@ -43,6 +43,28 @@ RESISTANCE_MIN_TOUCHES = int(os.getenv("RESISTANCE_MIN_TOUCHES", "2"))
 REJECTION_LOG_ENABLED = os.getenv("REJECTION_LOG_ENABLED", "1") == "1"
 REJECTION_LOG_FILE = Path(os.getenv("REJECTION_LOG_FILE", "rejected_signals.jsonl"))
 
+# فلتر سوق ذكي متعدد الفريمات V2.4
+SMART_MARKET_FILTER = os.getenv("SMART_MARKET_FILTER", "1") == "1"
+BTC_5M_DROP_BLOCK_PCT = float(os.getenv("BTC_5M_DROP_BLOCK_PCT", "0.75"))
+BTC_15M_RSI_BLOCK = float(os.getenv("BTC_15M_RSI_BLOCK", "43"))
+BTC_1H_DROP_BLOCK_PCT = float(os.getenv("BTC_1H_DROP_BLOCK_PCT", "1.2"))
+BTC_WEAK_RSI_15M = float(os.getenv("BTC_WEAK_RSI_15M", "48"))
+BTC_WEAK_RSI_5M = float(os.getenv("BTC_WEAK_RSI_5M", "45"))
+BTC_WEAK_15M_DROP_PCT = float(os.getenv("BTC_WEAK_15M_DROP_PCT", "0.35"))
+BTC_WEAK_MIN_RELATIVE_STRENGTH = float(os.getenv("BTC_WEAK_MIN_RELATIVE_STRENGTH", "1.75"))
+
+# مسار الارتداد الذكي بعد الهبوط
+REVERSAL_ENABLED = os.getenv("REVERSAL_ENABLED", "1") == "1"
+REVERSAL_MIN_DRAWDOWN_PCT = float(os.getenv("REVERSAL_MIN_DRAWDOWN_PCT", "3.5"))
+REVERSAL_MIN_VOLUME_15M = float(os.getenv("REVERSAL_MIN_VOLUME_15M", "1.5"))
+REVERSAL_MIN_VOLUME_5M = float(os.getenv("REVERSAL_MIN_VOLUME_5M", "1.2"))
+REVERSAL_MIN_RSI_NOW = float(os.getenv("REVERSAL_MIN_RSI_NOW", "42"))
+REVERSAL_MAX_RSI_NOW = float(os.getenv("REVERSAL_MAX_RSI_NOW", "64"))
+REVERSAL_MAX_RSI_RECENT_LOW = float(os.getenv("REVERSAL_MAX_RSI_RECENT_LOW", "40"))
+REVERSAL_MIN_ADX_15M = float(os.getenv("REVERSAL_MIN_ADX_15M", "18"))
+REVERSAL_MIN_SCORE = int(os.getenv("REVERSAL_MIN_SCORE", "84"))
+REVERSAL_MAX_RISK_PCT = float(os.getenv("REVERSAL_MAX_RISK_PCT", "4.5"))
+
 # مسار الزخم القوي مثل SHIB
 MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
 MOMENTUM_MIN_VOLUME_15M = float(os.getenv("MOMENTUM_MIN_VOLUME_15M", "3.0"))
@@ -134,6 +156,31 @@ def nearest_overhead_resistance(candles: List[Dict], price: float, lookback: int
             valid.append({"level": level, "distance_pct": distance_pct, "touches": len(cluster)})
 
     return min(valid, key=lambda x: x["distance_pct"]) if valid else None
+
+
+
+def higher_low_structure(candles: List[Dict], lookback: int = 18) -> bool:
+    """تأكيد مبسط لتحول الهيكل: قاع حديث أعلى مع استعادة قمة قصيرة."""
+    if len(candles) < lookback + 4:
+        return False
+    w = candles[-lookback:]
+    first = w[: lookback // 2]
+    second = w[lookback // 2 : -1]
+    if not first or not second:
+        return False
+    low1 = min(float(c["low"]) for c in first)
+    low2 = min(float(c["low"]) for c in second)
+    short_high = max(float(c["high"]) for c in w[-7:-2])
+    return low2 > low1 and float(w[-1]["close"]) >= short_high * 0.997
+
+
+def recent_drawdown_pct(candles: List[Dict], lookback: int = 16) -> float:
+    if len(candles) < lookback:
+        return 0.0
+    w = candles[-lookback:]
+    peak = max(float(c["high"]) for c in w[:-1])
+    trough = min(float(c["low"]) for c in w)
+    return max(0.0, -pct_change(peak, trough))
 
 
 def close_location(candle: Dict) -> float:
@@ -277,20 +324,56 @@ def market_context() -> Dict:
     if MARKET_CACHE["data"] and now-float(MARKET_CACHE["updated_at"])<MARKET_CACHE_SECONDS: return dict(MARKET_CACHE["data"])
     try:
         def snap(symbol):
-            c15=get_klines(symbol,"15m",120)[:-1]; c1=get_klines(symbol,"1h",120)[:-1]
-            a=[c["close"] for c in c15]; b=[c["close"] for c in c1]
-            e20a,e50a=ema(a,20)[-1],ema(a,50)[-1]; e20b,e50b=ema(b,20)[-1],ema(b,50)[-1]
-            _,_,ha=macd(a); _,_,hb=macd(b)
-            return {"rise_1h":pct_change(a[-5],a[-1]),"rise_4h":pct_change(b[-5],b[-1]),"bull15":a[-1]>e20a>e50a and ha>=0,"bear15":a[-1]<e20a<e50a and ha<0,"bull1h":b[-1]>e20b>e50b and hb>=0,"bear1h":b[-1]<e20b<e50b and hb<0}
+            c5=get_klines(symbol,"5m",120)[:-1]; c15=get_klines(symbol,"15m",120)[:-1]
+            c1=get_klines(symbol,"1h",120)[:-1]; c4=get_klines(symbol,"4h",120)[:-1]
+            z=[c["close"] for c in c5]; a=[c["close"] for c in c15]
+            b=[c["close"] for c in c1]; d=[c["close"] for c in c4]
+            e20z,e50z=ema(z,20)[-1],ema(z,50)[-1]
+            e20a,e50a=ema(a,20)[-1],ema(a,50)[-1]
+            e20b,e50b=ema(b,20)[-1],ema(b,50)[-1]
+            e20d,e50d=ema(d,20)[-1],ema(d,50)[-1]
+            _,_,hz=macd(z); _,_,ha=macd(a); _,_,hb=macd(b); _,_,hd=macd(d)
+            rz,ra,rb,rd=rsi(z)[-1],rsi(a)[-1],rsi(b)[-1],rsi(d)[-1]
+            return {
+                "rise_5m":pct_change(z[-2],z[-1]),
+                "rise_15m":pct_change(z[-4],z[-1]),
+                "rise_1h":pct_change(a[-5],a[-1]),
+                "rise_4h":pct_change(b[-5],b[-1]),
+                "rsi5":rz,"rsi15":ra,"rsi1h":rb,"rsi4h":rd,
+                "bull5":z[-1]>e20z>e50z and hz>=0,"bear5":z[-1]<e20z and hz<0,
+                "bull15":a[-1]>e20a>e50a and ha>=0,"bear15":a[-1]<e20a and ha<0,
+                "bull1h":b[-1]>e20b>e50b and hb>=0,"bear1h":b[-1]<e20b and hb<0,
+                "bull4h":d[-1]>e20d>e50d and hd>=0,"bear4h":d[-1]<e20d<e50d and hd<0,
+            }
         btc,eth=snap("BTCUSDT"),snap("ETHUSDT")
-        points=(2 if btc["bull1h"] else -2 if btc["bear1h"] else 0)+(1 if btc["bull15"] else -1 if btc["bear15"] else 0)+(1 if eth["bull1h"] else -1 if eth["bear1h"] else 0)+(1 if eth["bull15"] else -1 if eth["bear15"] else 0)
-        severe=btc["rise_1h"]<=-1.4 or btc["rise_4h"]<=-3
-        regime="ضعيف جدًا" if severe or points<=-4 else "ضعيف" if points<=-2 else "إيجابي" if points>=3 else "محايد"
+        points=(2 if btc["bull4h"] else -2 if btc["bear4h"] else 0)+(2 if btc["bull1h"] else -2 if btc["bear1h"] else 0)+(1 if btc["bull15"] else -1 if btc["bear15"] else 0)+(1 if eth["bull1h"] else -1 if eth["bear1h"] else 0)+(1 if eth["bull15"] else -1 if eth["bear15"] else 0)
+        sudden_drop = btc["rise_5m"] <= -BTC_5M_DROP_BLOCK_PCT and btc["bear5"] and btc["rsi15"] < BTC_15M_RSI_BLOCK
+        trend_break = btc["rise_1h"] <= -BTC_1H_DROP_BLOCK_PCT and btc["bear15"] and btc["bear1h"]
+        weak_pressure = bool(
+            SMART_MARKET_FILTER
+            and btc["rsi15"] < BTC_WEAK_RSI_15M
+            and (
+                btc["rsi5"] < BTC_WEAK_RSI_5M
+                or btc["rise_15m"] <= -BTC_WEAK_15M_DROP_PCT
+            )
+            and (btc["bear5"] or btc["bear15"])
+        )
+        severe=btc["rise_1h"]<=-1.4 or btc["rise_4h"]<=-3 or sudden_drop or trend_break
+        hard_block=bool(SMART_MARKET_FILTER and (sudden_drop or trend_break or (btc["bear4h"] and btc["bear1h"] and btc["bear15"])))
+        regime="ضعيف جدًا" if severe or points<=-4 else "ضعيف" if points<=-2 or weak_pressure else "إيجابي" if points>=3 else "محايد"
         bonus=12 if regime=="ضعيف جدًا" else 7 if regime=="ضعيف" else 0 if regime=="إيجابي" else 3
-        data={"regime":regime,"btc":btc,"eth":eth,"required_score":MIN_SCORE+bonus,"severe_drop":severe}
+        data={
+            "regime":regime,
+            "btc":btc,
+            "eth":eth,
+            "required_score":MIN_SCORE+bonus,
+            "severe_drop":severe,
+            "hard_block":hard_block,
+            "weak_pressure":weak_pressure,
+        }
     except Exception as exc:
         print(f"Market filter error: {exc}", flush=True)
-        data={"regime":"غير متاح","btc":{"rise_1h":0,"rise_4h":0},"eth":{"rise_1h":0,"rise_4h":0},"required_score":MIN_SCORE+3,"severe_drop":False}
+        data={"regime":"غير متاح","btc":{"rise_1h":0,"rise_4h":0,"rise_15m":0,"rsi5":50,"rsi15":50},"eth":{"rise_1h":0,"rise_4h":0},"required_score":MIN_SCORE+3,"severe_drop":False,"hard_block":False,"weak_pressure":False}
     MARKET_CACHE["data"],MARKET_CACHE["updated_at"]=data,now
     return dict(data)
 
@@ -303,6 +386,10 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
         av=mean(vols[-21:-1]); vr=vols[-1]/av if av else 0; e20=ema(closes,20)[-1]
         resistance=max(x["high"] for x in c[-21:-1]); proximity=closes[-1]/resistance if resistance else 0
         score=vr*34+max(pct_change(closes[-7],closes[-1]),0)*5+max(proximity-0.965,0)*230
+        # لا نهمل العملات التي بدأت ارتدادًا من هبوط واضح.
+        dd=recent_drawdown_pct(c, 24)
+        rv=rsi(closes)
+        if REVERSAL_ENABLED and dd>=REVERSAL_MIN_DRAWDOWN_PCT and rv[-1] and rv[-4] and rv[-1]>rv[-4]: score+=35
         if e20 and closes[-1]<e20*0.985: score-=20
         return symbol,score
     except Exception as exc:
@@ -323,7 +410,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if not (price>e20 and price>vw5 and h5>=0): return None
 
         closes15=[c["close"] for c in closed15]; vols15=[c["volume"] for c in closed15]; trades15=[c["trades"] for c in closed15]; candle15,prev15=closed15[-1],closed15[-2]
-        e20v,e50v=ema(closes15,20),ema(closes15,50); e20_15,e50_15=e20v[-1],e50v[-1]; r15=rsi(closes15)[-1]; m15,s15,h15=macd(closes15); a15=adx(closed15)
+        e20v,e50v=ema(closes15,20),ema(closes15,50); e20_15,e50_15=e20v[-1],e50v[-1]; r15v=rsi(closes15); r15=r15v[-1]; m15,s15,h15=macd(closes15); a15=adx(closed15)
         if None in (e20_15,e50_15,r15,m15,s15,h15): return None
         av15=mean(vols15[-21:-1]); vr15=vols15[-1]/av15 if av15 else 0; at15=mean(trades15[-21:-1]); tr15=trades15[-1]/at15 if at15 else 0
         resistance=max(c["high"] for c in closed15[-22:-2]); support=min(c["low"] for c in closed15[-12:-1])
@@ -366,15 +453,41 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
-        momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
+        drawdown15=recent_drawdown_pct(closed15, 18)
+        recent_rsi_low=min(x for x in r15v[-10:] if x is not None)
+        structure_shift=higher_low_structure(closed5, 18)
+        reclaimed_15=candle15["close"]>candle15["open"] and candle15["close"]>=prev15["high"]*0.997 and candle15["close"]>e20_15
+        reversal = REVERSAL_ENABLED and drawdown15>=REVERSAL_MIN_DRAWDOWN_PCT and recent_rsi_low<=REVERSAL_MAX_RSI_RECENT_LOW and REVERSAL_MIN_RSI_NOW<=r15<=REVERSAL_MAX_RSI_NOW and r15>r15v[-3] and reclaimed_15 and structure_shift and vr15>=REVERSAL_MIN_VOLUME_15M and vr5>=REVERSAL_MIN_VOLUME_5M and a15>=REVERSAL_MIN_ADX_15M and h5>=0 and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("hard_block",False)
+
+        momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
 
         rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
+
+        if market.get("hard_block",False):
+            log_rejection(symbol, "إيقاف كامل بسبب هبوط BTC", {
+                "btc5": round(float(market.get("btc",{}).get("rise_5m",0)), 3),
+                "btc15": round(float(market.get("btc",{}).get("rise_15m",0)), 3),
+                "btc1h": round(float(market.get("btc",{}).get("rise_1h",0)), 3),
+                "btc_rsi15": round(float(market.get("btc",{}).get("rsi15",0)), 2),
+            })
+            return None
+
+        # في ضعف BTC المتوسط لا نسمح إلا بعملة تتفوق عليه بوضوح.
+        if market.get("weak_pressure",False) and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
+            log_rejection(symbol, "ضعف BTC والقوة النسبية غير كافية", {
+                "relative_strength": round(rel, 2),
+                "required_relative_strength": BTC_WEAK_MIN_RELATIVE_STRENGTH,
+                "btc15": round(float(market.get("btc",{}).get("rise_15m",0)), 3),
+                "btc_rsi5": round(float(market.get("btc",{}).get("rsi5",0)), 2),
+                "btc_rsi15": round(float(market.get("btc",{}).get("rsi15",0)), 2),
+            })
+            return None
 
         # مقاومة أعلى قريبة: لا نعتمد أي ذيل منفرد؛ نستخدم منطقة قمم محورية متكررة على الساعة.
         overhead = nearest_overhead_resistance(c1h[:-1], price, 100)
         if overhead:
             overhead_pct = float(overhead["distance_pct"])
-            required_room = MOMENTUM_MIN_NEXT_RESISTANCE_PCT if momentum else MIN_NEXT_RESISTANCE_PCT
+            required_room = MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal) else MIN_NEXT_RESISTANCE_PCT
             if overhead_pct < required_room:
                 log_rejection(symbol, "مقاومة قريبة مؤكدة", {
                     "distance_pct": round(overhead_pct, 2),
@@ -384,7 +497,16 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
-        if momentum:
+        if reversal:
+            score=22+16+12+10+8+8+6
+            reasons=[f"ارتداد بعد هبوط {drawdown15:.1f}%", "خروج RSI من الضعف", "تحول هيكل 5m إلى قاع أعلى", "استعادة EMA20 على 15m", f"حجم ارتداد 15m ×{vr15:.1f}", f"تأكيد حجم 5m ×{vr5:.1f}", "السعر فوق VWAP"]
+            if obv5[-1]>obv5[-5]: score+=6
+            if rel>=0.5: score+=6
+            if market.get("regime") in ("إيجابي","محايد"): score+=4
+            if score<max(REVERSAL_MIN_SCORE,int(market.get("required_score",MIN_SCORE))): return None
+            swing_low=min(c["low"] for c in closed15[-10:-1]); stop=min(swing_low,price-1.35*atr5)
+            mode,setup="reversal","ارتداد ذكي بعد هبوط"
+        elif momentum:
             score=20+18+10+10+10+7+7+4+4
             reasons=["اختراق قمة 15m بإغلاق واضح","تأكيد 5m حافظ على مستوى الاختراق",f"حجم انفجاري 15m ×{vr15:.1f}",f"تأكيد حجم 5m ×{vr5:.1f}",f"قوة اتجاه ADX {a15:.0f}",f"RSI زخم مناسب {r15:.1f}","MACD إيجابي على 15m و5m","السعر فوق VWAP","الساعة و4 ساعات لا يعاكسان الزخم"]
             if obv5[-1]>obv5[-5]: score+=6
@@ -409,8 +531,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             recent=min(c["low"] for c in closed5[-12:-1]); stop=min(recent,support,price-1.25*atr5)
             mode="balanced"; setup="إعادة اختبار 15m" if retest else "انضغاط واختراق 15m" if squeeze_break else "اختراق 15m"
         risk=price-stop
-        if risk<=0 or risk/price*100>MAX_RISK_PCT: return None
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"relative_strength":rel}
+        max_risk = REVERSAL_MAX_RISK_PCT if mode=="reversal" else MAX_RISK_PCT
+        if risk<=0 or risk/price*100>max_risk: return None
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel}
     except Exception as exc:
         print(f"Analyze {symbol}: {exc}", flush=True); return None
 
@@ -421,8 +544,8 @@ def fmt(v: float) -> str:
 
 
 def signal_message(r: Dict) -> str:
-    reasons="\n".join(f"• {x}" for x in r["reasons"]); kind="انطلاقة قوية" if r.get("mode")=="momentum" else "دخول متوازن"
-    return f"🟢 إشارة شراء سبوت — {r['symbol']}\n\nالنموذج: {r['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {r['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {r['market_regime']} | BTC ساعة: {r['btc_1h']:+.2f}%\nالقوة النسبية أمام BTC: {r['relative_strength']:+.2f}%\n\nسعر الشراء التقريبي: {fmt(r['entry'])}\nوقف الخسارة: {fmt(r['stop'])} ({r['risk_pct']:.2f}%)\nالهدف الأول: {fmt(r['tp1'])}\nالهدف الثاني: {fmt(r['tp2'])}\nالهدف الثالث: {fmt(r['tp3'])}\n\nRSI: {r['rsi']:.1f}\nADX: {r['adx']:.1f}\nالحجم: ×{r['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح."
+    reasons="\n".join(f"• {x}" for x in r["reasons"]); kind="انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    return f"🟢 إشارة شراء سبوت — {r['symbol']}\n\nالنموذج: {r['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {r['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {r['market_regime']} | BTC 15m: {r['btc_15m']:+.2f}% | RSI BTC: {r['btc_rsi15']:.1f}\nBTC ساعة: {r['btc_1h']:+.2f}% | القوة النسبية أمام BTC: {r['relative_strength']:+.2f}%\n\nسعر الشراء التقريبي: {fmt(r['entry'])}\nوقف الخسارة: {fmt(r['stop'])} ({r['risk_pct']:.2f}%)\nالهدف الأول: {fmt(r['tp1'])}\nالهدف الثاني: {fmt(r['tp2'])}\nالهدف الثالث: {fmt(r['tp3'])}\n\nRSI: {r['rsi']:.1f}\nADX: {r['adx']:.1f}\nالحجم: ×{r['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح."
 
 
 def load_state():
@@ -466,7 +589,7 @@ def scan(state: Dict) -> None:
         for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
             x=f.result()
             if x and cooled(state,x): results.append(x)
-    results.sort(key=lambda x:(1 if x.get("mode")=="momentum" else 0,x["score"],x["volume_ratio"]),reverse=True)
+    results.sort(key=lambda x:(2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
         send_message(signal_message(r)); state.setdefault("alerts",{})[r["symbol"]]=r["candle_close"]
@@ -476,7 +599,7 @@ def scan(state: Dict) -> None:
 
 
 def main() -> None:
-    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.2.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات المشابهة لـ SHIB.\nتم تفعيل تأكيد الاختراق 5m وفلتر المقاومة المحورية والاستنزاف.\nبدون شورت وبدون WATCH.")
+    state=load_state(); send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V2.4.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     while True:
         started=time.time()
         try: scan(state)
