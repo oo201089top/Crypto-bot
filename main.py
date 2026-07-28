@@ -1935,14 +1935,16 @@ def LIQUIDITY_apply(result: Dict, direction: str, futures: bool) -> Optional[Dic
         else:
             if bid_wall and bid_wall.get("qualified") and bid_wall["distance_pct"] <= LIQUIDITY_SHORT_HARD_BLOCK_DISTANCE_PCT and bid_wall_value >= max(1.5 * ask_wall_value, LIQUIDITY_MIN_FUTURES_WALL_USDT):
                 blocked, note = True, "جدار شراء قوي قريب قد يصد الهبوط"
+            elif ratio >= 2.50:
+                blocked, note = True, "اختلال طلب شديد؛ احتمال ارتداد/سكويز مرتفع"
             elif ratio <= 0.67:
                 bonus, note = LIQUIDITY_MAX_SCORE_BONUS, "ضغط عروض داعم للشورت"
             elif ratio <= 0.83:
                 bonus, note = 4, "أفضلية معتدلة للعروض"
-            elif ratio >= 1.55:
-                bonus, note = -6, "ضغط طلب قد يسبب ارتدادًا/سكويز"
-            elif ratio >= 1.20:
-                bonus, note = -3, "الطلبات أعلى قليلًا"
+            elif ratio >= 1.80:
+                bonus, note = -8, "ضغط طلب قوي قد يسبب ارتدادًا/سكويز"
+            elif ratio >= 1.30:
+                bonus, note = -4, "الطلبات أعلى من العروض"
         if blocked:
             log_fn = SHORT_log_rejection if futures and "SHORT_log_rejection" in globals() else log_rejection
             log_fn(result["symbol"], f"رفض بواسطة السيولة: {note}", {
@@ -2190,13 +2192,18 @@ def WHALE_FLOW_message_section(result: Dict) -> str:
         "buy_absorption": "امتصاص بيع عند الطلبات",
         "sell_absorption": "امتصاص شراء عند العروض",
     }
+    whale_line = (
+        f"صفقات الحيتان: {int(data.get('whale_count', 0))} | Whale Delta: {whale_delta_pct:+.1f}%\n"
+        if int(data.get('whale_count', 0)) > 0
+        else "لا توجد صفقات حيتان مؤثرة ضمن العينة الحالية.\n"
+    )
     return (
         "\n\n🐋 Whale & Order Flow من Binance\n"
         f"حجم الصفقات المحللة: {LIQUIDITY_money(data.get('total_notional', 0))}\n"
         f"Delta العدواني: {delta_pct:+.1f}% | شراء {data.get('buy_ratio', 0)*100:.1f}% / بيع {data.get('sell_ratio', 0)*100:.1f}%\n"
-        f"صفقات الحيتان: {int(data.get('whale_count', 0))} | Whale Delta: {whale_delta_pct:+.1f}%\n"
-        f"الامتصاص: {absorption_names.get(data.get('absorption'), 'غير واضح')}\n"
-        f"الحكم: {data.get('note', 'متوازن')} | تعديل التقييم: {int(data.get('bonus', 0)):+d}"
+        + whale_line
+        + f"الامتصاص: {absorption_names.get(data.get('absorption'), 'غير واضح')}\n"
+        + f"الحكم: {data.get('note', 'متوازن')} | تعديل التقييم: {int(data.get('bonus', 0)):+d}"
     )
 
 
@@ -2247,6 +2254,282 @@ def SHORT_signal_message(result: Dict) -> str:
 
 def STOCK_SHORT_signal_message(result: Dict) -> str:
     return _append_microstructure_sections(_ORIGINAL_STOCK_SHORT_MESSAGE(result), result)
+
+
+# ============================================================
+# CVD + Open Interest + Confidence Score 2.0
+# طبقة جودة نهائية تضاف دون حذف أي محرك سابق.
+# ============================================================
+CVD_OI_ENABLED = os.getenv("CVD_OI_ENABLED", "1") == "1"
+CVD_WINDOW_MINUTES = max(5, int(os.getenv("CVD_WINDOW_MINUTES", "30")))
+CVD_MIN_COVERAGE_MINUTES = float(os.getenv("CVD_MIN_COVERAGE_MINUTES", "2"))
+CVD_MAX_SCORE_BONUS = int(os.getenv("CVD_MAX_SCORE_BONUS", "8"))
+OI_ENABLED = os.getenv("OPEN_INTEREST_ENABLED", "1") == "1"
+OI_PERIOD = os.getenv("OPEN_INTEREST_PERIOD", "5m")
+OI_HISTORY_LIMIT = max(3, min(30, int(os.getenv("OPEN_INTEREST_HISTORY_LIMIT", "7"))))
+OI_MAX_SCORE_BONUS = int(os.getenv("OPEN_INTEREST_MAX_SCORE_BONUS", "8"))
+OI_HARD_BLOCK_CHANGE_PCT = float(os.getenv("OPEN_INTEREST_HARD_BLOCK_CHANGE_PCT", "3.0"))
+CONFIDENCE_2_ENABLED = os.getenv("CONFIDENCE_2_ENABLED", "1") == "1"
+CONFIDENCE_MIN_FINAL = int(os.getenv("CONFIDENCE_MIN_FINAL", "78"))
+
+
+def CVD_snapshot(symbol: str, futures: bool = False) -> Optional[Dict]:
+    """يحسب CVD من الصفقات العدوانية المتاحة ويبيّن مدة التغطية الفعلية للعينة."""
+    trades = WHALE_FLOW_get_trades(symbol, futures=futures)
+    if len(trades) < 20:
+        return None
+    trades = sorted(trades, key=lambda row: int(row.get("time", 0)))
+    newest = int(trades[-1].get("time", 0))
+    if newest <= 0:
+        return None
+    cutoff = newest - CVD_WINDOW_MINUTES * 60 * 1000
+    window = [row for row in trades if int(row.get("time", 0)) >= cutoff]
+    if len(window) < 20:
+        window = trades
+    buy = sum(float(row.get("notional", 0)) for row in window if row.get("side") == "buy")
+    sell = sum(float(row.get("notional", 0)) for row in window if row.get("side") == "sell")
+    total = buy + sell
+    if total <= 0:
+        return None
+    oldest = int(window[0].get("time", newest))
+    coverage_minutes = max(0.0, (newest - oldest) / 60000)
+    cvd = buy - sell
+    cvd_pct = cvd / total
+    half = max(10, len(window) // 2)
+    recent = window[-half:]
+    recent_buy = sum(float(row.get("notional", 0)) for row in recent if row.get("side") == "buy")
+    recent_sell = sum(float(row.get("notional", 0)) for row in recent if row.get("side") == "sell")
+    recent_total = recent_buy + recent_sell
+    recent_pct = (recent_buy - recent_sell) / recent_total if recent_total else 0.0
+    return {
+        "available": True,
+        "cvd": cvd,
+        "cvd_pct": cvd_pct,
+        "recent_cvd_pct": recent_pct,
+        "buy_notional": buy,
+        "sell_notional": sell,
+        "total_notional": total,
+        "trade_count": len(window),
+        "coverage_minutes": coverage_minutes,
+        "requested_minutes": CVD_WINDOW_MINUTES,
+        "partial_window": coverage_minutes < CVD_MIN_COVERAGE_MINUTES,
+    }
+
+
+def OPEN_INTEREST_snapshot(symbol: str, entry_price: float) -> Optional[Dict]:
+    """Open Interest حقيقي لعقود Binance Futures فقط؛ لا يختلق قيمة عند fallback."""
+    if not OI_ENABLED or SHORT_FUTURES_BLOCKED or not symbol.upper().endswith("USDT"):
+        return None
+    try:
+        current = SHORT_get_json("/fapi/v1/openInterest", {"symbol": symbol}, timeout=12)
+        history = SHORT_get_json(
+            "/futures/data/openInterestHist",
+            {"symbol": symbol, "period": OI_PERIOD, "limit": OI_HISTORY_LIMIT},
+            timeout=12,
+        )
+        current_oi = float(current.get("openInterest", 0) or 0)
+        rows = history if isinstance(history, list) else []
+        if current_oi <= 0 or not rows:
+            return None
+        first_value = float(rows[0].get("sumOpenInterest", 0) or 0)
+        last_value = float(rows[-1].get("sumOpenInterest", current_oi) or current_oi)
+        reference = first_value if first_value > 0 else last_value
+        change_pct = ((current_oi / reference) - 1) * 100 if reference > 0 else 0.0
+        current_usdt = current_oi * float(entry_price or 0)
+        return {
+            "available": True,
+            "open_interest": current_oi,
+            "open_interest_usdt": current_usdt,
+            "change_pct": change_pct,
+            "period": OI_PERIOD,
+            "samples": len(rows),
+        }
+    except Exception as exc:
+        print(f"Open interest {symbol}: {exc}", flush=True)
+        return None
+
+
+def CVD_OI_apply(result: Dict, direction: str, futures: bool) -> Optional[Dict]:
+    if not CVD_OI_ENABLED:
+        return result
+    enriched = dict(result)
+    bonus = 0
+    notes = []
+    try:
+        cvd = CVD_snapshot(result["symbol"], futures=futures)
+    except Exception as exc:
+        print(f"CVD {result.get('symbol')}: {exc}", flush=True)
+        cvd = None
+    if cvd:
+        cvd_pct = float(cvd.get("cvd_pct", 0))
+        recent_pct = float(cvd.get("recent_cvd_pct", 0))
+        if direction == "long":
+            if cvd_pct >= 0.18 and recent_pct >= 0.10: bonus += CVD_MAX_SCORE_BONUS; notes.append("CVD شرائي ومتسارع")
+            elif cvd_pct >= 0.08: bonus += 4; notes.append("CVD يميل للشراء")
+            elif cvd_pct <= -0.18: bonus -= 6; notes.append("CVD بيعي يعاكس الشراء")
+        else:
+            if cvd_pct <= -0.18 and recent_pct <= -0.10: bonus += CVD_MAX_SCORE_BONUS; notes.append("CVD بيعي ومتسارع")
+            elif cvd_pct <= -0.08: bonus += 4; notes.append("CVD يميل للبيع")
+            elif cvd_pct >= 0.18: bonus -= 6; notes.append("CVD شرائي يعاكس الشورت")
+        cvd["bonus"] = max(-CVD_MAX_SCORE_BONUS, min(CVD_MAX_SCORE_BONUS, bonus))
+    else:
+        cvd = {"available": False}
+
+    oi = OPEN_INTEREST_snapshot(result["symbol"], float(result.get("entry", 0))) if futures else None
+    oi_bonus = 0
+    if oi:
+        change = float(oi.get("change_pct", 0))
+        price_move = float(result.get("relative_strength", 0))
+        if direction == "short":
+            if change >= 1.0 and price_move < 0:
+                oi_bonus = min(OI_MAX_SCORE_BONUS, 6 if change < 3 else 8)
+                notes.append("OI يرتفع مع الضعف السعري: دخول شورت جديد")
+            elif change <= -1.5:
+                oi_bonus = -5
+                notes.append("OI ينخفض: الهبوط قد يكون تصفية لا بناء شورت")
+        else:
+            if change >= 1.0 and price_move > 0:
+                oi_bonus = min(OI_MAX_SCORE_BONUS, 6 if change < 3 else 8)
+                notes.append("OI يرتفع مع القوة السعرية: دخول مراكز جديدة")
+            elif change <= -1.5:
+                oi_bonus = -4
+                notes.append("OI ينخفض: الحركة قد تكون تغطية مراكز")
+        oi["bonus"] = oi_bonus
+    else:
+        oi = {"available": False, "reason": "غير متاح مع مصدر Spot/Yahoo أو عند حجب Futures"}
+
+    micro_bonus = max(-12, min(12, bonus + oi_bonus))
+    enriched["score"] = max(0, min(99, int(round(float(enriched.get("score", 0)) + micro_bonus))))
+    enriched["cvd"] = cvd
+    enriched["open_interest"] = oi
+    enriched["cvd_oi_bonus"] = micro_bonus
+    if notes:
+        reasons = list(enriched.get("reasons", []))
+        reasons.append(f"CVD/OI: {'، '.join(notes)} ({micro_bonus:+d} نقاط)")
+        enriched["reasons"] = reasons[:8]
+    return enriched
+
+
+def CONFIDENCE_2_apply(result: Dict, direction: str) -> Optional[Dict]:
+    if not CONFIDENCE_2_ENABLED:
+        return result
+    base = float(result.get("score", 0))
+    liquidity = result.get("liquidity", {})
+    flow = result.get("whale_flow", {})
+    cvd = result.get("cvd", {})
+    oi = result.get("open_interest", {})
+
+    technical = max(0.0, min(100.0, base))
+    trend = max(0.0, min(100.0, 50 + (float(result.get("adx", 0)) - 18) * 2.5))
+    volume = max(0.0, min(100.0, 45 + (float(result.get("volume_ratio", 1)) - 1) * 35))
+    market = 70.0 if result.get("market_regime") in ("إيجابي", "هابط") else 58.0
+
+    liq_bonus = float(liquidity.get("bonus", 0)) if liquidity.get("available") else 0.0
+    liquidity_score = max(0.0, min(100.0, 55 + liq_bonus * 5))
+    flow_bonus = float(flow.get("bonus", 0)) if flow.get("available") else 0.0
+    orderflow_score = max(0.0, min(100.0, 55 + flow_bonus * 4))
+    if cvd.get("available"):
+        cvd_alignment = float(cvd.get("cvd_pct", 0)) * (1 if direction == "long" else -1)
+        orderflow_score = max(0.0, min(100.0, orderflow_score + cvd_alignment * 55))
+    oi_score = 55.0 + float(oi.get("bonus", 0)) * 5 if oi.get("available") else 50.0
+
+    final = (
+        technical * 0.30 + trend * 0.18 + orderflow_score * 0.17 +
+        liquidity_score * 0.15 + volume * 0.10 + oi_score * 0.07 + market * 0.03
+    )
+    final = int(round(max(0.0, min(99.0, final))))
+    enriched = dict(result)
+    enriched["legacy_score"] = int(round(base))
+    enriched["score"] = final
+    enriched["confidence2"] = {
+        "technical": round(technical, 1), "trend": round(trend, 1),
+        "orderflow": round(orderflow_score, 1), "liquidity": round(liquidity_score, 1),
+        "volume": round(volume, 1), "open_interest": round(oi_score, 1),
+        "market": round(market, 1), "final": final,
+    }
+    if final < CONFIDENCE_MIN_FINAL:
+        log_fn = SHORT_log_rejection if direction == "short" and "SHORT_log_rejection" in globals() else log_rejection
+        log_fn(result.get("symbol", "?"), "Confidence Score 2.0 منخفض", {"score": final, "required": CONFIDENCE_MIN_FINAL})
+        return None
+    return enriched
+
+
+def CVD_OI_message_section(result: Dict) -> str:
+    cvd = result.get("cvd", {})
+    oi = result.get("open_interest", {})
+    conf = result.get("confidence2", {})
+    lines = ["\n\n📈 CVD + Open Interest"]
+    if cvd.get("available"):
+        coverage = float(cvd.get("coverage_minutes", 0))
+        partial = " (عينة جزئية)" if cvd.get("partial_window") else ""
+        lines.append(
+            f"CVD: {float(cvd.get('cvd_pct', 0))*100:+.1f}% | آخر جزء: "
+            f"{float(cvd.get('recent_cvd_pct', 0))*100:+.1f}% | تغطية {coverage:.1f}د{partial}"
+        )
+    else:
+        lines.append("CVD: غير متاح مؤقتًا")
+    if oi.get("available"):
+        lines.append(
+            f"Open Interest: {LIQUIDITY_money(oi.get('open_interest_usdt', 0))} | "
+            f"التغير: {float(oi.get('change_pct', 0)):+.2f}% ({oi.get('period', '5m')})"
+        )
+    else:
+        lines.append("Open Interest: غير متاح من مصدر البيانات الحالي")
+    if conf:
+        lines.append(
+            f"Confidence 2.0: {int(conf.get('final', result.get('score', 0)))}% "
+            f"| فني {conf.get('technical', 0):.0f} | تدفق {conf.get('orderflow', 0):.0f} "
+            f"| سيولة {conf.get('liquidity', 0):.0f}"
+        )
+    return "\n".join(lines)
+
+
+# إعادة تغليف الطبقة الحالية حتى تمر جميع الإشارات عبر CVD/OI والثقة الموزونة.
+_V2_LONG_ANALYZE = analyze_symbol
+_V2_SHORT_ANALYZE = SHORT_analyze_symbol
+_V2_STOCK_ANALYZE = STOCK_SHORT_analyze_symbol
+_V2_LONG_MESSAGE = signal_message
+_V2_SHORT_MESSAGE = SHORT_signal_message
+_V2_STOCK_MESSAGE = STOCK_SHORT_signal_message
+
+
+def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    result = _V2_LONG_ANALYZE(symbol, market)
+    if not result:
+        return None
+    result = CVD_OI_apply(result, "long", futures=False)
+    return CONFIDENCE_2_apply(result, "long") if result else None
+
+
+def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    result = _V2_SHORT_ANALYZE(symbol, market)
+    if not result:
+        return None
+    result = CVD_OI_apply(result, "short", futures=True)
+    return CONFIDENCE_2_apply(result, "short") if result else None
+
+
+def STOCK_SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    # الدالة الأصلية تستدعي SHORT_analyze_symbol ديناميكيًا؛ لذلك لا نكرر CVD/OI مرتين.
+    return _V2_STOCK_ANALYZE(symbol, market)
+
+
+def _append_cvd_oi_section(base: str, result: Dict) -> str:
+    section = CVD_OI_message_section(result)
+    marker = "\n\n⚠️"
+    return base.replace(marker, section + marker, 1) if marker in base else base + section
+
+
+def signal_message(result: Dict) -> str:
+    return _append_cvd_oi_section(_V2_LONG_MESSAGE(result), result)
+
+
+def SHORT_signal_message(result: Dict) -> str:
+    return _append_cvd_oi_section(_V2_SHORT_MESSAGE(result), result)
+
+
+def STOCK_SHORT_signal_message(result: Dict) -> str:
+    return _append_cvd_oi_section(_V2_STOCK_MESSAGE(result), result)
 
 # ============================================================
 # التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
