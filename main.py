@@ -1378,6 +1378,274 @@ def short_main() -> None:
             print(f'Scan error: {exc}', flush=True)
         time.sleep(max(5, SHORT_SCAN_MINUTES * 60 - (time.time() - started)))
 
+
+# ============================================================
+# محرك مستقل لشورت عقود الأسهم الدائمة على Binance Futures
+# أضيف دون حذف أو تعديل محركات الشراء والشورت السابقة.
+# يكتشف جميع عقود الأسهم تلقائيًا من بيانات Binance، مع دعم الإضافة والاستبعاد يدويًا.
+# ============================================================
+STOCK_SHORT_ENABLED = os.getenv("STOCK_SHORT_ENABLED", "1") == "1"
+STOCK_SHORT_AUTO_DISCOVER = os.getenv("STOCK_SHORT_AUTO_DISCOVER", "1") == "1"
+STOCK_SHORT_SYMBOLS = {
+    value.strip().upper()
+    for value in os.getenv("STOCK_SHORT_SYMBOLS", "").split(",")
+    if value.strip()
+}
+STOCK_SHORT_EXCLUDE_SYMBOLS = {
+    value.strip().upper()
+    for value in os.getenv("STOCK_SHORT_EXCLUDE_SYMBOLS", "").split(",")
+    if value.strip()
+}
+STOCK_SHORT_SYMBOL_CACHE = {"symbols": [], "updated_at": 0.0}
+STOCK_SHORT_SYMBOL_REFRESH_MINUTES = int(os.getenv("STOCK_SHORT_SYMBOL_REFRESH_MINUTES", "30"))
+STOCK_SHORT_SCAN_MINUTES = int(os.getenv("STOCK_SHORT_SCAN_MINUTES", "1"))
+STOCK_SHORT_COOLDOWN_MINUTES = int(os.getenv("STOCK_SHORT_COOLDOWN_MINUTES", "180"))
+STOCK_SHORT_MAX_ALERTS_PER_SCAN = int(os.getenv("STOCK_SHORT_MAX_ALERTS_PER_SCAN", "3"))
+STOCK_SHORT_MIN_SCORE = int(os.getenv("STOCK_SHORT_MIN_SCORE", "88"))
+STOCK_SHORT_MIN_VOLUME_RATIO = float(os.getenv("STOCK_SHORT_MIN_VOLUME_RATIO", "1.30"))
+STOCK_SHORT_MIN_ADX = float(os.getenv("STOCK_SHORT_MIN_ADX", "20"))
+STOCK_SHORT_MIN_RSI = float(os.getenv("STOCK_SHORT_MIN_RSI", "34"))
+STOCK_SHORT_MAX_RSI = float(os.getenv("STOCK_SHORT_MAX_RSI", "58"))
+STOCK_SHORT_MAX_RISK_PCT = float(os.getenv("STOCK_SHORT_MAX_RISK_PCT", "3.5"))
+STOCK_SHORT_REQUIRE_RETEST = os.getenv("STOCK_SHORT_REQUIRE_RETEST", "0") == "1"
+STOCK_SHORT_STATE_FILE = Path(os.getenv("STOCK_SHORT_STATE_FILE", "stock_short_signal_state.json"))
+
+
+def STOCK_SHORT_is_equity_contract(item: Dict) -> bool:
+    """يتعرف على عقود الأسهم/Equity Perps من تصنيف Binance بدل قائمة ثابتة."""
+    underlying_type = str(item.get("underlyingType", "")).upper()
+    subtypes = item.get("underlyingSubType", []) or []
+    if isinstance(subtypes, str):
+        subtypes = [subtypes]
+    subtype_text = " ".join(str(value).upper() for value in subtypes)
+    classification = " ".join((underlying_type, subtype_text))
+    equity_words = ("STOCK", "EQUITY", "SHARE", "ADR")
+    non_equity_words = ("ETF", "INDEX", "COMMODITY", "FOREX", "FX", "METAL")
+    return any(word in classification for word in equity_words) and not any(
+        word in classification for word in non_equity_words
+    )
+
+
+def STOCK_SHORT_available_symbols() -> List[str]:
+    """يعيد جميع عقود الأسهم المتاحة تلقائيًا، مع دعم رموز إضافية أو مستبعدة."""
+    now = time.time()
+    cached = STOCK_SHORT_SYMBOL_CACHE["symbols"]
+    if cached and now - float(STOCK_SHORT_SYMBOL_CACHE["updated_at"]) < STOCK_SHORT_SYMBOL_REFRESH_MINUTES * 60:
+        return list(cached)
+    try:
+        exchange = SHORT_get_json("/fapi/v1/exchangeInfo", timeout=30)
+        trading_items = [
+            item for item in exchange.get("symbols", [])
+            if item.get("status") == "TRADING"
+            and item.get("quoteAsset", "").upper() == "USDT"
+            and item.get("contractType", "") == "PERPETUAL"
+        ]
+        available = {item.get("symbol", "").upper() for item in trading_items}
+        detected = {
+            item.get("symbol", "").upper()
+            for item in trading_items
+            if STOCK_SHORT_is_equity_contract(item)
+        } if STOCK_SHORT_AUTO_DISCOVER else set()
+
+        # الرموز اليدوية تعتبر إضافات، وليست بديلًا عن الاكتشاف التلقائي.
+        symbols = (detected | (STOCK_SHORT_SYMBOLS & available)) - STOCK_SHORT_EXCLUDE_SYMBOLS
+        symbols.discard("")
+        result = sorted(symbols)
+        STOCK_SHORT_SYMBOL_CACHE["symbols"] = result
+        STOCK_SHORT_SYMBOL_CACHE["updated_at"] = now
+        print(
+            f"Stock contracts discovered | automatic={len(detected)} | manual={len(STOCK_SHORT_SYMBOLS & available)} | total={len(result)}",
+            flush=True,
+        )
+        return result
+    except Exception as exc:
+        print(f"Stock short symbols error: {exc}", flush=True)
+        return list(cached) if cached else sorted(STOCK_SHORT_SYMBOLS - STOCK_SHORT_EXCLUDE_SYMBOLS)
+
+
+def STOCK_SHORT_load_state() -> Dict:
+    try:
+        return json.loads(STOCK_SHORT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"alerts": {}, "open_signals": {}, "stats": {"tp1": 0, "tp2": 0, "tp3": 0, "stop": 0}}
+
+
+def STOCK_SHORT_save_state(state: Dict) -> None:
+    STOCK_SHORT_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def STOCK_SHORT_cooled(state: Dict, result: Dict) -> bool:
+    previous = int(state.get("alerts", {}).get(result["symbol"], 0))
+    return result["candle_close"] - previous >= STOCK_SHORT_COOLDOWN_MINUTES * 60 * 1000
+
+
+def STOCK_SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    """
+    يستخدم محرك الشورت الأصلي ثم يضيف فلاتر أكثر صرامة لعقود الأسهم:
+    درجة أعلى، مخاطرة أقل، RSI غير متأخر، ADX وحجم واضحان.
+    """
+    result = SHORT_analyze_symbol(symbol, market)
+    if not result:
+        return None
+
+    if float(result.get("score", 0)) < STOCK_SHORT_MIN_SCORE:
+        return None
+    if float(result.get("volume_ratio", 0)) < STOCK_SHORT_MIN_VOLUME_RATIO:
+        return None
+    if float(result.get("adx", 0)) < STOCK_SHORT_MIN_ADX:
+        return None
+    rsi_value = float(result.get("rsi", 0))
+    if not (STOCK_SHORT_MIN_RSI <= rsi_value <= STOCK_SHORT_MAX_RSI):
+        return None
+    if float(result.get("risk_pct", 999)) > STOCK_SHORT_MAX_RISK_PCT:
+        return None
+    if STOCK_SHORT_REQUIRE_RETEST and result.get("mode") != "rejection_short":
+        return None
+
+    result = dict(result)
+    result["mode"] = "stock_short"
+    result["setup"] = f"شورت عقد سهم — {result.get('setup', 'كسر هابط')}"
+    result["reasons"] = [
+        "العقد ضمن قائمة عقود الأسهم المحددة",
+        *list(result.get("reasons", [])),
+    ][:8]
+    return result
+
+
+def STOCK_SHORT_signal_message(result: Dict) -> str:
+    reasons = "\n".join(f"• {reason}" for reason in result["reasons"])
+    return (
+        f"🔻 إشارة شورت عقد سهم — {result['symbol']}\n\n"
+        f"النموذج: {result['setup']}\n"
+        f"قوة الإشارة: {result['score']}%\n"
+        "الفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\n"
+        f"حالة السوق: {result['market_regime']} | BTC 15m: {result['btc_15m']:+.2f}%\n\n"
+        f"سعر الدخول التقريبي: {SHORT_fmt(result['entry'])}\n"
+        f"وقف الخسارة: {SHORT_fmt(result['stop'])} ({result['risk_pct']:.2f}%)\n"
+        f"الهدف الأول: {SHORT_fmt(result['tp1'])}\n"
+        f"الهدف الثاني: {SHORT_fmt(result['tp2'])}\n"
+        f"الهدف الثالث: {SHORT_fmt(result['tp3'])}\n\n"
+        f"RSI: {result['rsi']:.1f}\n"
+        f"ADX: {result['adx']:.1f}\n"
+        f"الحجم: ×{result['volume_ratio']:.1f}\n\n"
+        f"أسباب الإشارة:\n{reasons}\n\n"
+        "⚠️ إشارة تحليلية فقط وليست تنفيذًا تلقائيًا أو ضمانًا للربح."
+    )
+
+
+def STOCK_SHORT_track_open_signals(state: Dict) -> None:
+    open_signals = state.setdefault("open_signals", {})
+    stats = state.setdefault("stats", {"tp1": 0, "tp2": 0, "tp3": 0, "stop": 0})
+    now = int(time.time() * 1000)
+
+    for symbol, signal in list(open_signals.items()):
+        try:
+            candles = SHORT_get_klines(symbol, "5m", 100)[:-1]
+            last_checked = int(signal.get("last_checked", signal["time"]))
+            relevant = [c for c in candles if c["close_time"] > last_checked]
+            if not relevant:
+                if now - int(signal["time"]) > 72 * 60 * 60 * 1000:
+                    del open_signals[symbol]
+                continue
+
+            reached = int(signal.get("reached", 0))
+            closed = False
+            for candle in relevant:
+                if candle["high"] >= float(signal["stop"]):
+                    stats["stop"] += 1
+                    del open_signals[symbol]
+                    closed = True
+                    break
+                if reached < 1 and candle["low"] <= float(signal["tp1"]):
+                    stats["tp1"] += 1
+                    reached = 1
+                if reached < 2 and candle["low"] <= float(signal["tp2"]):
+                    stats["tp2"] += 1
+                    reached = 2
+                if reached < 3 and candle["low"] <= float(signal["tp3"]):
+                    stats["tp3"] += 1
+                    del open_signals[symbol]
+                    closed = True
+                    break
+                signal["last_checked"] = candle["close_time"]
+
+            if not closed:
+                signal["reached"] = reached
+                signal["last_checked"] = relevant[-1]["close_time"]
+        except Exception as exc:
+            print(f"Stock short track {symbol}: {exc}", flush=True)
+
+
+def STOCK_SHORT_scan(state: Dict) -> None:
+    STOCK_SHORT_track_open_signals(state)
+    market = SHORT_market_context()
+    symbols = STOCK_SHORT_available_symbols()
+    results: List[Dict] = []
+
+    with ThreadPoolExecutor(max_workers=max(2, min(8, len(symbols) or 2))) as pool:
+        futures = [pool.submit(STOCK_SHORT_analyze_symbol, symbol, market) for symbol in symbols]
+        for future in as_completed(futures):
+            result = future.result()
+            if result and STOCK_SHORT_cooled(state, result):
+                results.append(result)
+
+    results.sort(
+        key=lambda result: (result["score"], result["volume_ratio"]),
+        reverse=True,
+    )
+
+    sent = 0
+    for result in results[:STOCK_SHORT_MAX_ALERTS_PER_SCAN]:
+        SHORT_send_message(STOCK_SHORT_signal_message(result))
+        state.setdefault("alerts", {})[result["symbol"]] = result["candle_close"]
+        state.setdefault("open_signals", {})[result["symbol"]] = {
+            "time": result["candle_close"],
+            "last_checked": result["candle_close"],
+            "entry": result["entry"],
+            "stop": result["stop"],
+            "tp1": result["tp1"],
+            "tp2": result["tp2"],
+            "tp3": result["tp3"],
+            "reached": 0,
+            "mode": "stock_short",
+        }
+        sent += 1
+        time.sleep(0.3)
+
+    STOCK_SHORT_save_state(state)
+    print(
+        f"Stock short scan | symbols={len(symbols)} | candidates={len(results)} | sent={sent}",
+        flush=True,
+    )
+
+
+def stock_short_main() -> None:
+    if not STOCK_SHORT_ENABLED:
+        print("Stock short engine disabled.", flush=True)
+        return
+
+    state = STOCK_SHORT_load_state()
+    extra_symbols = ", ".join(sorted(STOCK_SHORT_SYMBOLS)) or "لا توجد إضافات يدوية"
+    SHORT_send_message(
+        "✅ تم تشغيل محرك شورت جميع عقود الأسهم المتاحة على Binance Futures.\n"
+        f"الاكتشاف التلقائي: {'مفعّل' if STOCK_SHORT_AUTO_DISCOVER else 'متوقف'}\n"
+        f"إضافات يدوية: {extra_symbols}\n"
+        "تُحدّث قائمة الأسهم تلقائيًا عند إدراج أو حذف أي عقد.\n"
+        "فلترة مستقلة: اتجاه هابط، كسر/فشل ارتداد، حجم، ADX، RSI ومخاطرة منخفضة.\n"
+        "إشارات فقط — بدون تنفيذ تداول تلقائي."
+    )
+    while True:
+        started = time.time()
+        try:
+            STOCK_SHORT_scan(state)
+        except Exception as exc:
+            print(f"Stock short scan error: {exc}", flush=True)
+        time.sleep(max(5, STOCK_SHORT_SCAN_MINUTES * 60 - (time.time() - started)))
+
+
 # ============================================================
 # التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
 # إشارات تيليجرام فقط، ولا يوجد تنفيذ أوامر تداول.
@@ -1399,10 +1667,18 @@ def run_short_bot() -> None:
         print(f"Fatal SHORT bot error:\n{traceback.format_exc()}", flush=True)
         raise
 
+def run_stock_short_bot() -> None:
+    try:
+        stock_short_main()
+    except Exception:
+        print(f"Fatal STOCK SHORT bot error:\n{traceback.format_exc()}", flush=True)
+        raise
+
 def combined_main() -> None:
     threads = [
         threading.Thread(target=run_long_bot, name="long-spot-signals", daemon=False),
         threading.Thread(target=run_short_bot, name="short-futures-signals", daemon=False),
+        threading.Thread(target=run_stock_short_bot, name="stock-short-futures-signals", daemon=False),
     ]
     for thread in threads:
         thread.start()
