@@ -817,14 +817,102 @@ def SHORT_send_message(text: str) -> None:
     response = SHORT_SESSION.post(f'https://api.telegram.org/bot{SHORT_TOKEN}/sendMessage', json={'chat_id': SHORT_CHAT_ID, 'text': text, 'disable_web_page_preview': True}, timeout=20)
     response.raise_for_status()
 
+# معالجة حجب Binance Futures (HTTP 451) على بعض مزودي الاستضافة.
+SHORT_FALLBACK_TO_SPOT = os.getenv('SHORT_FALLBACK_TO_SPOT', '1') == '1'
+STOCK_SHORT_YAHOO_FALLBACK = os.getenv('STOCK_SHORT_YAHOO_FALLBACK', '1') == '1'
+SHORT_FUTURES_BLOCKED = False
+SHORT_FALLBACK_NOTICE_AT = 0.0
+
+def _SHORT_spot_path(path: str) -> Optional[str]:
+    return {
+        '/fapi/v1/klines': '/api/v3/klines',
+        '/fapi/v1/exchangeInfo': '/api/v3/exchangeInfo',
+        '/fapi/v1/ticker/24hr': '/api/v3/ticker/24hr',
+        '/fapi/v1/depth': '/api/v3/depth',
+        '/fapi/v1/aggTrades': '/api/v3/aggTrades',
+    }.get(path)
+
 def SHORT_get_json(path: str, params: Optional[Dict]=None, timeout: int=20):
-    response = SHORT_SESSION.get(f'{SHORT_BINANCE_BASE}{path}', params=params, timeout=timeout)
+    global SHORT_FUTURES_BLOCKED, SHORT_FALLBACK_NOTICE_AT
+    try:
+        response = SHORT_SESSION.get(f'{SHORT_BINANCE_BASE}{path}', params=params, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, 'status_code', None)
+        spot_path = _SHORT_spot_path(path)
+        if status == 451 and SHORT_FALLBACK_TO_SPOT and spot_path:
+            SHORT_FUTURES_BLOCKED = True
+            now = time.time()
+            if now - SHORT_FALLBACK_NOTICE_AT > 300:
+                print('Binance Futures HTTP 451: crypto short switched to Binance Spot market-data fallback.', flush=True)
+                SHORT_FALLBACK_NOTICE_AT = now
+            response = SHORT_SESSION.get(f'{BINANCE_BASE}{spot_path}', params=params, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            if path == '/fapi/v1/exchangeInfo':
+                for item in data.get('symbols', []):
+                    item.setdefault('contractType', 'PERPETUAL')
+            return data
+        raise
+
+def _STOCK_yahoo_symbol(symbol: str) -> str:
+    value = symbol.upper().strip()
+    return value[:-4] if value.endswith('USDT') else value
+
+def _STOCK_yahoo_chart(symbol: str, interval: str, limit: int) -> List[Dict]:
+    ticker = _STOCK_yahoo_symbol(symbol)
+    yahoo_interval = {'5m': '5m', '15m': '15m', '1h': '60m', '4h': '60m'}.get(interval)
+    if not ticker or not yahoo_interval:
+        return []
+    range_value = '60d' if yahoo_interval in ('5m', '15m') else '2y'
+    response = SHORT_SESSION.get(
+        f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}',
+        params={'interval': yahoo_interval, 'range': range_value, 'includePrePost': 'true', 'events': 'div,splits'},
+        timeout=20,
+    )
     response.raise_for_status()
-    return response.json()
+    payload = response.json().get('chart', {}).get('result') or []
+    if not payload:
+        return []
+    result = payload[0]
+    timestamps = result.get('timestamp') or []
+    quote = ((result.get('indicators') or {}).get('quote') or [{}])[0]
+    opens, highs = quote.get('open') or [], quote.get('high') or []
+    lows, closes = quote.get('low') or [], quote.get('close') or []
+    volumes = quote.get('volume') or []
+    rows = []
+    for i, ts in enumerate(timestamps):
+        try:
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            if None in (o, h, l, c):
+                continue
+            v = float(volumes[i] or 0) if i < len(volumes) else 0.0
+            rows.append({'open': float(o), 'high': float(h), 'low': float(l), 'close': float(c), 'volume': v, 'close_time': int(ts) * 1000, 'quote_volume': float(c) * v, 'trades': 0})
+        except (IndexError, TypeError, ValueError):
+            continue
+    if interval == '4h':
+        grouped = []
+        for pos in range(0, len(rows), 4):
+            chunk = rows[pos:pos+4]
+            if len(chunk) < 4:
+                continue
+            grouped.append({'open': chunk[0]['open'], 'high': max(x['high'] for x in chunk), 'low': min(x['low'] for x in chunk), 'close': chunk[-1]['close'], 'volume': sum(x['volume'] for x in chunk), 'close_time': chunk[-1]['close_time'], 'quote_volume': sum(x['quote_volume'] for x in chunk), 'trades': 0})
+        rows = grouped
+    return rows[-limit:]
 
 def SHORT_get_klines(symbol: str, interval: str, limit: int=260) -> List[Dict]:
-    raw = SHORT_get_json('/fapi/v1/klines', {'symbol': symbol, 'interval': interval, 'limit': limit})
-    return [{'open': float(row[1]), 'high': float(row[2]), 'low': float(row[3]), 'close': float(row[4]), 'volume': float(row[5]), 'close_time': int(row[6]), 'quote_volume': float(row[7]), 'trades': int(row[8])} for row in raw]
+    if STOCK_SHORT_YAHOO_FALLBACK and not symbol.upper().endswith('USDT'):
+        return _STOCK_yahoo_chart(symbol, interval, limit)
+    try:
+        raw = SHORT_get_json('/fapi/v1/klines', {'symbol': symbol, 'interval': interval, 'limit': limit})
+        return [{'open': float(row[1]), 'high': float(row[2]), 'low': float(row[3]), 'close': float(row[4]), 'volume': float(row[5]), 'close_time': int(row[6]), 'quote_volume': float(row[7]), 'trades': int(row[8])} for row in raw]
+    except requests.HTTPError as exc:
+        if STOCK_SHORT_YAHOO_FALLBACK and getattr(exc.response, 'status_code', None) in (400, 404, 451):
+            rows = _STOCK_yahoo_chart(symbol, interval, limit)
+            if rows:
+                return rows
+        raise
 
 def SHORT_get_symbols() -> List[str]:
     now = time.time()
@@ -1470,6 +1558,14 @@ STOCK_SHORT_SYMBOLS = {
     for value in os.getenv("STOCK_SHORT_SYMBOLS", "").split(",")
     if value.strip()
 }
+STOCK_SHORT_FALLBACK_SYMBOLS = {
+    value.strip().upper()
+    for value in os.getenv(
+        "STOCK_SHORT_FALLBACK_SYMBOLS",
+        "MSTR,AMZN,CRCL,COIN,PLTR,NVDA,AAPL,MSFT,META,TSLA,AVGO,TSM"
+    ).split(",")
+    if value.strip()
+}
 STOCK_SHORT_EXCLUDE_SYMBOLS = {
     value.strip().upper()
     for value in os.getenv("STOCK_SHORT_EXCLUDE_SYMBOLS", "").split(",")
@@ -1539,7 +1635,13 @@ def STOCK_SHORT_available_symbols() -> List[str]:
         return result
     except Exception as exc:
         print(f"Stock short symbols error: {exc}", flush=True)
-        return list(cached) if cached else sorted(STOCK_SHORT_SYMBOLS - STOCK_SHORT_EXCLUDE_SYMBOLS)
+        if cached:
+            return list(cached)
+        fallback = (STOCK_SHORT_SYMBOLS or STOCK_SHORT_FALLBACK_SYMBOLS) - STOCK_SHORT_EXCLUDE_SYMBOLS
+        if fallback and STOCK_SHORT_YAHOO_FALLBACK:
+            print(f"Stock short fallback active | provider=Yahoo underlying | symbols={len(fallback)}", flush=True)
+            return sorted(fallback)
+        return sorted(STOCK_SHORT_SYMBOLS - STOCK_SHORT_EXCLUDE_SYMBOLS)
 
 
 def STOCK_SHORT_load_state() -> Dict:
@@ -1709,10 +1811,10 @@ def stock_short_main() -> None:
     state = STOCK_SHORT_load_state()
     extra_symbols = ", ".join(sorted(STOCK_SHORT_SYMBOLS)) or "لا توجد إضافات يدوية"
     SHORT_send_message(
-        "✅ تم تشغيل محرك شورت جميع عقود الأسهم المتاحة على Binance Futures.\n"
+        "✅ تم تشغيل محرك شورت عقود الأسهم/الأصول الأساسية.\n"
         f"الاكتشاف التلقائي: {'مفعّل' if STOCK_SHORT_AUTO_DISCOVER else 'متوقف'}\n"
         f"إضافات يدوية: {extra_symbols}\n"
-        "تُحدّث قائمة الأسهم تلقائيًا عند إدراج أو حذف أي عقد.\n"
+        "يستخدم Binance Futures عند توفره، ويتحول تلقائيًا لبيانات الأصل عند حجب API.\n"
         "فلترة مستقلة: اتجاه هابط، كسر/فشل ارتداد، وانعكاس كبير من صعود إلى هبوط، مع حجم وADX وRSI ومخاطرة منخفضة.\n"
         "إشارات فقط — بدون تنفيذ تداول تلقائي."
     )
