@@ -607,4 +607,708 @@ def main() -> None:
         time.sleep(max(5,SCAN_MINUTES*60-(time.time()-started)))
 
 
-if __name__ == "__main__": main()
+
+# ============================================================
+# إضافة محرك الشورت Futures V1.0
+# تمت إضافة هذا القسم دون حذف منطق وإعدادات الشراء الأصلية.
+# تمت إضافة البادئة SHORT_ لأسماء محرك الشورت لمنع التعارض.
+# ============================================================
+import os
+import time
+import json
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Dict, List, Optional, Tuple
+import requests
+SHORT_BINANCE_BASE = os.getenv('BINANCE_FUTURES_BASE', 'https://fapi.binance.com')
+SHORT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+SHORT_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+SHORT_SCAN_MINUTES = int(os.getenv('SCAN_MINUTES', '1'))
+SHORT_COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '120'))
+SHORT_MAX_ALERTS_PER_SCAN = int(os.getenv('MAX_ALERTS_PER_SCAN', '5'))
+SHORT_MAX_WORKERS = int(os.getenv('MAX_WORKERS', '16'))
+SHORT_SYMBOL_REFRESH_MINUTES = int(os.getenv('SYMBOL_REFRESH_MINUTES', '30'))
+SHORT_MIN_DAILY_QUOTE_VOLUME = float(os.getenv('MIN_DAILY_QUOTE_VOLUME', '1000000'))
+SHORT_PREFILTER_LIMIT = int(os.getenv('PREFILTER_LIMIT', '80'))
+SHORT_MIN_SCORE = int(os.getenv('MIN_SCORE', '84'))
+SHORT_MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '4.0'))
+SHORT_MIN_15M_VOLUME_RATIO = float(os.getenv('MIN_15M_VOLUME_RATIO', '1.6'))
+SHORT_MAX_RSI_15M_FOR_ENTRY = float(os.getenv('MAX_RSI_15M_FOR_ENTRY', '52'))
+SHORT_MIN_RSI_15M_HARD = float(os.getenv('MIN_RSI_15M_HARD', '30'))
+SHORT_MIN_ADX_15M = float(os.getenv('MIN_ADX_15M', '22'))
+SHORT_MAX_15M_DROP_PCT = float(os.getenv('MAX_15M_DROP_PCT', '4.0'))
+SHORT_MAX_1H_DROP_PCT = float(os.getenv('MAX_1H_DROP_PCT', '9.0'))
+SHORT_MAX_4H_DROP_PCT = float(os.getenv('MAX_4H_DROP_PCT', '16.0'))
+SHORT_MAX_EMA20_DISTANCE_PCT = float(os.getenv('MAX_EMA20_DISTANCE_PCT', '2.2'))
+SHORT_MAX_CONSECUTIVE_RED = int(os.getenv('MAX_CONSECUTIVE_RED', '4'))
+SHORT_MAX_CANDLE_BODY_PCT = float(os.getenv('MAX_CANDLE_BODY_PCT', '3.5'))
+SHORT_BREAKDOWN_CONFIRM_5M = os.getenv('BREAKDOWN_CONFIRM_5M', '1') == '1'
+SHORT_CONFIRM_MAX_SPIKE_PCT = float(os.getenv('CONFIRM_MAX_SPIKE_PCT', '0.8'))
+SHORT_MIN_CONFIRM_CLOSE_LOCATION = float(os.getenv('MIN_CONFIRM_CLOSE_LOCATION', '0.45'))
+SHORT_MAX_BREAKDOWN_RANGE_ATR = float(os.getenv('MAX_BREAKDOWN_RANGE_ATR', '2.2'))
+SHORT_MAX_BREAKDOWN_BODY_ATR = float(os.getenv('MAX_BREAKDOWN_BODY_ATR', '1.8'))
+SHORT_MIN_NEXT_SUPPORT_PCT = float(os.getenv('MIN_NEXT_SUPPORT_PCT', '2.0'))
+SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT = float(os.getenv('MOMENTUM_MIN_NEXT_SUPPORT_PCT', '1.2'))
+SHORT_SUPPORT_MAX_DISTANCE_PCT = float(os.getenv('SUPPORT_MAX_DISTANCE_PCT', '18'))
+SHORT_SUPPORT_SWING_WINDOW = int(os.getenv('SUPPORT_SWING_WINDOW', '2'))
+SHORT_SUPPORT_CLUSTER_TOLERANCE_PCT = float(os.getenv('SUPPORT_CLUSTER_TOLERANCE_PCT', '0.45'))
+SHORT_SUPPORT_MIN_TOUCHES = int(os.getenv('SUPPORT_MIN_TOUCHES', '2'))
+SHORT_MOMENTUM_SHORT_ENABLED = os.getenv('MOMENTUM_SHORT_ENABLED', '1') == '1'
+SHORT_MOMENTUM_MIN_VOLUME_15M = float(os.getenv('MOMENTUM_MIN_VOLUME_15M', '2.8'))
+SHORT_MOMENTUM_MIN_VOLUME_5M = float(os.getenv('MOMENTUM_MIN_VOLUME_5M', '1.8'))
+SHORT_MOMENTUM_MIN_ADX_15M = float(os.getenv('MOMENTUM_MIN_ADX_15M', '27'))
+SHORT_MOMENTUM_MIN_RSI_15M = float(os.getenv('MOMENTUM_MIN_RSI_15M', '32'))
+SHORT_MOMENTUM_MAX_RSI_15M = float(os.getenv('MOMENTUM_MAX_RSI_15M', '49'))
+SHORT_MOMENTUM_MIN_SCORE = int(os.getenv('MOMENTUM_MIN_SCORE', '88'))
+SHORT_REJECTION_SHORT_ENABLED = os.getenv('REJECTION_SHORT_ENABLED', '1') == '1'
+SHORT_REJECTION_MIN_BOUNCE_PCT = float(os.getenv('REJECTION_MIN_BOUNCE_PCT', '2.0'))
+SHORT_REJECTION_MIN_VOLUME_15M = float(os.getenv('REJECTION_MIN_VOLUME_15M', '1.25'))
+SHORT_REJECTION_MIN_ADX_15M = float(os.getenv('REJECTION_MIN_ADX_15M', '18'))
+SHORT_REJECTION_MIN_RSI_15M = float(os.getenv('REJECTION_MIN_RSI_15M', '42'))
+SHORT_REJECTION_MAX_RSI_15M = float(os.getenv('REJECTION_MAX_RSI_15M', '60'))
+SHORT_REJECTION_MIN_SCORE = int(os.getenv('REJECTION_MIN_SCORE', '84'))
+SHORT_SMART_MARKET_FILTER = os.getenv('SMART_MARKET_FILTER', '1') == '1'
+SHORT_BTC_5M_RISE_BLOCK_PCT = float(os.getenv('BTC_5M_RISE_BLOCK_PCT', '0.75'))
+SHORT_BTC_1H_RISE_BLOCK_PCT = float(os.getenv('BTC_1H_RISE_BLOCK_PCT', '1.25'))
+SHORT_BTC_15M_RSI_BLOCK = float(os.getenv('BTC_15M_RSI_BLOCK', '60'))
+SHORT_BTC_BULLISH_RSI_15M = float(os.getenv('BTC_BULLISH_RSI_15M', '55'))
+SHORT_BTC_BULLISH_MIN_RELATIVE_WEAKNESS = float(os.getenv('BTC_BULLISH_MIN_RELATIVE_WEAKNESS', '-1.25'))
+SHORT_MARKET_CACHE_SECONDS = int(os.getenv('MARKET_CACHE_SECONDS', '55'))
+SHORT_TRACK_RESULTS = os.getenv('TRACK_RESULTS', '1') == '1'
+SHORT_REJECTION_LOG_ENABLED = os.getenv('REJECTION_LOG_ENABLED', '1') == '1'
+SHORT_REJECTION_LOG_FILE = Path(os.getenv('REJECTION_LOG_FILE', 'rejected_short_signals.jsonl'))
+SHORT_STATE_FILE = Path(os.getenv('STATE_FILE', 'short_signal_state.json'))
+SHORT_SESSION = requests.Session()
+SHORT_SYMBOL_CACHE = {'symbols': [], 'updated_at': 0.0}
+SHORT_MARKET_CACHE = {'data': None, 'updated_at': 0.0}
+SHORT_REJECTION_LOCK = Lock()
+SHORT_STABLE_BASES = {'USDC', 'FDUSD', 'TUSD', 'USDP', 'DAI', 'USD1', 'BUSD', 'USDS', 'EUR', 'AEUR', 'EURT', 'TRY', 'BRL', 'GBP', 'AUD', 'BIDR', 'IDRT', 'UAH', 'RUB', 'NGN', 'VAI', 'PAX', 'UST', 'USTC'}
+SHORT_EXCLUDED_MAJORS = {value.strip().upper() for value in os.getenv('EXCLUDED_MAJORS', '').split(',') if value.strip()}
+SHORT_LEVERAGED_SUFFIXES = ('UP', 'DOWN', 'BULL', 'BEAR')
+
+def SHORT_log_rejection(symbol: str, reason: str, details: Optional[Dict]=None) -> None:
+    if not SHORT_REJECTION_LOG_ENABLED:
+        return
+    row = {'time': int(time.time() * 1000), 'symbol': symbol, 'reason': reason, 'details': details or {}}
+    print(f"Rejected {symbol}: {reason} | {row['details']}", flush=True)
+    try:
+        with SHORT_REJECTION_LOCK:
+            with SHORT_REJECTION_LOG_FILE.open('a', encoding='utf-8') as file:
+                file.write(json.dumps(row, ensure_ascii=False) + '\n')
+    except Exception as exc:
+        print(f'Rejection log error: {exc}', flush=True)
+
+def SHORT_send_message(text: str) -> None:
+    response = SHORT_SESSION.post(f'https://api.telegram.org/bot{SHORT_TOKEN}/sendMessage', json={'chat_id': SHORT_CHAT_ID, 'text': text, 'disable_web_page_preview': True}, timeout=20)
+    response.raise_for_status()
+
+def SHORT_get_json(path: str, params: Optional[Dict]=None, timeout: int=20):
+    response = SHORT_SESSION.get(f'{SHORT_BINANCE_BASE}{path}', params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+def SHORT_get_klines(symbol: str, interval: str, limit: int=260) -> List[Dict]:
+    raw = SHORT_get_json('/fapi/v1/klines', {'symbol': symbol, 'interval': interval, 'limit': limit})
+    return [{'open': float(row[1]), 'high': float(row[2]), 'low': float(row[3]), 'close': float(row[4]), 'volume': float(row[5]), 'close_time': int(row[6]), 'quote_volume': float(row[7]), 'trades': int(row[8])} for row in raw]
+
+def SHORT_get_symbols() -> List[str]:
+    now = time.time()
+    if SHORT_SYMBOL_CACHE['symbols'] and now - float(SHORT_SYMBOL_CACHE['updated_at']) < SHORT_SYMBOL_REFRESH_MINUTES * 60:
+        return list(SHORT_SYMBOL_CACHE['symbols'])
+    exchange = SHORT_get_json('/fapi/v1/exchangeInfo', timeout=30)
+    tickers = SHORT_get_json('/fapi/v1/ticker/24hr', timeout=30)
+    volume_map = {ticker.get('symbol', ''): float(ticker.get('quoteVolume', 0) or 0) for ticker in tickers}
+    rows: List[Tuple[str, float]] = []
+    for item in exchange.get('symbols', []):
+        symbol = item.get('symbol', '')
+        base = item.get('baseAsset', '').upper()
+        quote = item.get('quoteAsset', '').upper()
+        contract_type = item.get('contractType', '')
+        if item.get('status') != 'TRADING' or quote != 'USDT' or contract_type != 'PERPETUAL':
+            continue
+        if base in SHORT_STABLE_BASES or base in SHORT_EXCLUDED_MAJORS or base.endswith(SHORT_LEVERAGED_SUFFIXES):
+            continue
+        quote_volume = volume_map.get(symbol, 0.0)
+        if quote_volume >= SHORT_MIN_DAILY_QUOTE_VOLUME:
+            rows.append((symbol, quote_volume))
+    rows.sort(key=lambda item: item[1], reverse=True)
+    SHORT_SYMBOL_CACHE['symbols'] = [symbol for symbol, _ in rows]
+    SHORT_SYMBOL_CACHE['updated_at'] = now
+    return list(SHORT_SYMBOL_CACHE['symbols'])
+
+def SHORT_ema(values: List[float], period: int) -> List[Optional[float]]:
+    if len(values) < period:
+        return [None] * len(values)
+    output: List[Optional[float]] = [None] * (period - 1)
+    current = mean(values[:period])
+    output.append(current)
+    multiplier = 2 / (period + 1)
+    for value in values[period:]:
+        current = (value - current) * multiplier + current
+        output.append(current)
+    return output
+
+def SHORT_rsi(values: List[float], period: int=14) -> List[Optional[float]]:
+    if len(values) <= period:
+        return [None] * len(values)
+    gains: List[float] = []
+    losses: List[float] = []
+    for index in range(1, len(values)):
+        change = values[index] - values[index - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    average_gain = mean(gains[:period])
+    average_loss = mean(losses[:period])
+    output: List[Optional[float]] = [None] * period
+
+    def calculate(gain: float, loss: float) -> float:
+        return 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+    output.append(calculate(average_gain, average_loss))
+    for index in range(period, len(gains)):
+        average_gain = (average_gain * (period - 1) + gains[index]) / period
+        average_loss = (average_loss * (period - 1) + losses[index]) / period
+        output.append(calculate(average_gain, average_loss))
+    return output
+
+def SHORT_macd(values: List[float]):
+    if len(values) < 35:
+        return (None, None, None)
+    fast = SHORT_ema(values, 12)
+    slow = SHORT_ema(values, 26)
+    series = [a - b for a, b in zip(fast, slow) if a is not None and b is not None]
+    if len(series) < 9:
+        return (None, None, None)
+    signal = SHORT_ema(series, 9)[-1]
+    if signal is None:
+        return (None, None, None)
+    return (series[-1], signal, series[-1] - signal)
+
+def SHORT_atr(candles: List[Dict], period: int=14) -> float:
+    true_ranges: List[float] = []
+    for index, candle in enumerate(candles):
+        if index == 0:
+            true_ranges.append(candle['high'] - candle['low'])
+        else:
+            previous_close = candles[index - 1]['close']
+            true_ranges.append(max(candle['high'] - candle['low'], abs(candle['high'] - previous_close), abs(candle['low'] - previous_close)))
+    return mean(true_ranges[-period:]) if true_ranges else 0.0
+
+def SHORT_adx(candles: List[Dict], period: int=14) -> float:
+    if len(candles) < period + 2:
+        return 0.0
+    true_ranges: List[float] = []
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
+    for index in range(1, len(candles)):
+        candle = candles[index]
+        previous = candles[index - 1]
+        up = candle['high'] - previous['high']
+        down = previous['low'] - candle['low']
+        plus_dm.append(up if up > down and up > 0 else 0)
+        minus_dm.append(down if down > up and down > 0 else 0)
+        true_ranges.append(max(candle['high'] - candle['low'], abs(candle['high'] - previous['close']), abs(candle['low'] - previous['close'])))
+    dx_values: List[float] = []
+    for end in range(period, len(true_ranges) + 1):
+        true_sum = sum(true_ranges[end - period:end])
+        if true_sum <= 0:
+            continue
+        plus_di = 100 * sum(plus_dm[end - period:end]) / true_sum
+        minus_di = 100 * sum(minus_dm[end - period:end]) / true_sum
+        if plus_di + minus_di > 0:
+            dx_values.append(100 * abs(plus_di - minus_di) / (plus_di + minus_di))
+    return mean(dx_values[-period:]) if dx_values else 0.0
+
+def SHORT_vwap(candles: List[Dict], period: int=20) -> float:
+    window = candles[-period:]
+    total_volume = sum((candle['volume'] for candle in window))
+    if total_volume <= 0:
+        return window[-1]['close']
+    return sum(((candle['high'] + candle['low'] + candle['close']) / 3 * candle['volume'] for candle in window)) / total_volume
+
+def SHORT_obv(candles: List[Dict]) -> List[float]:
+    output = [0.0]
+    for index in range(1, len(candles)):
+        if candles[index]['close'] > candles[index - 1]['close']:
+            output.append(output[-1] + candles[index]['volume'])
+        elif candles[index]['close'] < candles[index - 1]['close']:
+            output.append(output[-1] - candles[index]['volume'])
+        else:
+            output.append(output[-1])
+    return output
+
+def SHORT_bollinger(values: List[float], period: int=20, multiplier: float=2.0):
+    window = values[-period:]
+    middle = mean(window)
+    deviation = pstdev(window)
+    upper = middle + multiplier * deviation
+    lower = middle - multiplier * deviation
+    width = (upper - lower) / middle * 100 if middle else 0.0
+    return (middle, upper, lower, width)
+
+def SHORT_pct_change(old: float, new: float) -> float:
+    return (new / old - 1) * 100 if old else 0.0
+
+def SHORT_close_location(candle: Dict) -> float:
+    span = candle['high'] - candle['low']
+    return (candle['close'] - candle['low']) / span if span > 0 else 0.5
+
+def SHORT_consecutive_red(candles: List[Dict], lookback: int=7) -> int:
+    count = 0
+    for candle in reversed(candles[-lookback:]):
+        if candle['close'] < candle['open']:
+            count += 1
+        else:
+            break
+    return count
+
+def SHORT_recent_bounce_pct(candles: List[Dict], lookback: int=18) -> float:
+    if len(candles) < lookback:
+        return 0.0
+    window = candles[-lookback:]
+    trough = min((candle['low'] for candle in window[:-1]))
+    peak = max((candle['high'] for candle in window))
+    return max(0.0, SHORT_pct_change(trough, peak))
+
+def SHORT_lower_high_structure(candles: List[Dict], lookback: int=18) -> bool:
+    if len(candles) < lookback + 4:
+        return False
+    window = candles[-lookback:]
+    first = window[:lookback // 2]
+    second = window[lookback // 2:-1]
+    if not first or not second:
+        return False
+    high1 = max((candle['high'] for candle in first))
+    high2 = max((candle['high'] for candle in second))
+    short_low = min((candle['low'] for candle in window[-7:-2]))
+    return high2 < high1 and window[-1]['close'] <= short_low * 1.003
+
+def SHORT_nearest_below_support(candles: List[Dict], price: float, lookback: int=100) -> Optional[Dict]:
+    if price <= 0 or len(candles) < SHORT_SUPPORT_SWING_WINDOW * 2 + 5:
+        return None
+    sample = candles[-lookback:]
+    swing_levels: List[float] = []
+    window = max(1, SHORT_SUPPORT_SWING_WINDOW)
+    for index in range(window, len(sample) - window):
+        low = float(sample[index]['low'])
+        neighbors = sample[index - window:index] + sample[index + 1:index + window + 1]
+        if low <= min((float(candle['low']) for candle in neighbors)):
+            distance_pct = -SHORT_pct_change(price, low)
+            if 0 < distance_pct <= SHORT_SUPPORT_MAX_DISTANCE_PCT:
+                swing_levels.append(low)
+    if not swing_levels:
+        return None
+    swing_levels.sort()
+    clusters: List[List[float]] = []
+    for level in swing_levels:
+        placed = False
+        for cluster in clusters:
+            center = mean(cluster)
+            if abs(level / center - 1) * 100 <= SHORT_SUPPORT_CLUSTER_TOLERANCE_PCT:
+                cluster.append(level)
+                placed = True
+                break
+        if not placed:
+            clusters.append([level])
+    valid: List[Dict] = []
+    for cluster in clusters:
+        if len(cluster) < SHORT_SUPPORT_MIN_TOUCHES:
+            continue
+        level = mean(cluster)
+        distance_pct = -SHORT_pct_change(price, level)
+        if 0 < distance_pct <= SHORT_SUPPORT_MAX_DISTANCE_PCT:
+            valid.append({'level': level, 'distance_pct': distance_pct, 'touches': len(cluster)})
+    return min(valid, key=lambda item: item['distance_pct']) if valid else None
+
+def SHORT_frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
+    closed = candles[:-1]
+    if len(closed) < 210:
+        return None
+    closes = [candle['close'] for candle in closed]
+    ema20_values = SHORT_ema(closes, 20)
+    ema50_values = SHORT_ema(closes, 50)
+    ema200_values = SHORT_ema(closes, 200)
+    ema20 = ema20_values[-1]
+    ema50 = ema50_values[-1]
+    ema200 = ema200_values[-1]
+    rsi_value = SHORT_rsi(closes)[-1]
+    _, _, histogram = SHORT_macd(closes)
+    if None in (ema20, ema50, ema200, rsi_value, histogram):
+        return None
+    price = closes[-1]
+    strongly_bullish = price > ema20 > ema50 and price > ema200 and (histogram > 0) and (ema20 >= ema20_values[-4])
+    strongly_bearish = price < ema20 < ema50 and price < ema200 and (histogram < 0) and (ema20 <= ema20_values[-4])
+    return {'price': price, 'e20': ema20, 'e50': ema50, 'e200': ema200, 'rsi': rsi_value, 'macd_hist': histogram, 'adx': SHORT_adx(closed), 'strongly_bullish': strongly_bullish, 'strongly_bearish': strongly_bearish, 'not_bullish': not strongly_bullish}
+
+def SHORT_market_context() -> Dict:
+    now = time.time()
+    if SHORT_MARKET_CACHE['data'] and now - float(SHORT_MARKET_CACHE['updated_at']) < SHORT_MARKET_CACHE_SECONDS:
+        return dict(SHORT_MARKET_CACHE['data'])
+    try:
+
+        def snapshot(symbol: str) -> Dict:
+            c5 = SHORT_get_klines(symbol, '5m', 120)[:-1]
+            c15 = SHORT_get_klines(symbol, '15m', 120)[:-1]
+            c1h = SHORT_get_klines(symbol, '1h', 120)[:-1]
+            c4h = SHORT_get_klines(symbol, '4h', 120)[:-1]
+            z = [candle['close'] for candle in c5]
+            a = [candle['close'] for candle in c15]
+            b = [candle['close'] for candle in c1h]
+            d = [candle['close'] for candle in c4h]
+            e20z, e50z = (SHORT_ema(z, 20)[-1], SHORT_ema(z, 50)[-1])
+            e20a, e50a = (SHORT_ema(a, 20)[-1], SHORT_ema(a, 50)[-1])
+            e20b, e50b = (SHORT_ema(b, 20)[-1], SHORT_ema(b, 50)[-1])
+            e20d, e50d = (SHORT_ema(d, 20)[-1], SHORT_ema(d, 50)[-1])
+            _, _, hz = SHORT_macd(z)
+            _, _, ha = SHORT_macd(a)
+            _, _, hb = SHORT_macd(b)
+            _, _, hd = SHORT_macd(d)
+            rz, ra, rb, rd = (SHORT_rsi(z)[-1], SHORT_rsi(a)[-1], SHORT_rsi(b)[-1], SHORT_rsi(d)[-1])
+            return {'rise_5m': SHORT_pct_change(z[-2], z[-1]), 'rise_15m': SHORT_pct_change(z[-4], z[-1]), 'rise_1h': SHORT_pct_change(a[-5], a[-1]), 'rise_4h': SHORT_pct_change(b[-5], b[-1]), 'rsi5': rz, 'rsi15': ra, 'rsi1h': rb, 'rsi4h': rd, 'bull5': z[-1] > e20z > e50z and hz >= 0, 'bear5': z[-1] < e20z and hz < 0, 'bull15': a[-1] > e20a > e50a and ha >= 0, 'bear15': a[-1] < e20a and ha < 0, 'bull1h': b[-1] > e20b > e50b and hb >= 0, 'bear1h': b[-1] < e20b and hb < 0, 'bull4h': d[-1] > e20d > e50d and hd >= 0, 'bear4h': d[-1] < e20d < e50d and hd < 0}
+        btc = snapshot('BTCUSDT')
+        eth = snapshot('ETHUSDT')
+        points = (-2 if btc['bull4h'] else 2 if btc['bear4h'] else 0) + (-2 if btc['bull1h'] else 2 if btc['bear1h'] else 0) + (-1 if btc['bull15'] else 1 if btc['bear15'] else 0) + (-1 if eth['bull1h'] else 1 if eth['bear1h'] else 0) + (-1 if eth['bull15'] else 1 if eth['bear15'] else 0)
+        sudden_rise = btc['rise_5m'] >= SHORT_BTC_5M_RISE_BLOCK_PCT and btc['bull5'] and (btc['rsi15'] > SHORT_BTC_15M_RSI_BLOCK)
+        trend_break_up = btc['rise_1h'] >= SHORT_BTC_1H_RISE_BLOCK_PCT and btc['bull15'] and btc['bull1h']
+        bullish_pressure = bool(SHORT_SMART_MARKET_FILTER and btc['rsi15'] >= SHORT_BTC_BULLISH_RSI_15M and (btc['bull5'] or btc['bull15']))
+        hard_block = bool(SHORT_SMART_MARKET_FILTER and (sudden_rise or trend_break_up or (btc['bull4h'] and btc['bull1h'] and btc['bull15'])))
+        regime = 'هابط قوي' if points >= 4 else 'هابط' if points >= 2 else 'صاعد قوي' if hard_block or points <= -4 else 'صاعد' if points <= -2 or bullish_pressure else 'محايد'
+        bonus = 0 if regime in ('هابط قوي', 'هابط') else 4 if regime == 'محايد' else 8
+        data = {'regime': regime, 'btc': btc, 'eth': eth, 'required_score': SHORT_MIN_SCORE + bonus, 'hard_block': hard_block, 'bullish_pressure': bullish_pressure}
+    except Exception as exc:
+        print(f'Market filter error: {exc}', flush=True)
+        data = {'regime': 'غير متاح', 'btc': {'rise_1h': 0, 'rise_15m': 0, 'rise_5m': 0, 'rsi15': 50}, 'eth': {}, 'required_score': SHORT_MIN_SCORE + 4, 'hard_block': False, 'bullish_pressure': False}
+    SHORT_MARKET_CACHE['data'] = data
+    SHORT_MARKET_CACHE['updated_at'] = now
+    return dict(data)
+
+def SHORT_prefilter_symbol(symbol: str) -> Optional[Tuple[str, float]]:
+    try:
+        candles = SHORT_get_klines(symbol, '5m', 90)[:-1]
+        if len(candles) < 60:
+            return None
+        closes = [candle['close'] for candle in candles]
+        volumes = [candle['volume'] for candle in candles]
+        average_volume = mean(volumes[-21:-1])
+        volume_ratio = volumes[-1] / average_volume if average_volume else 0.0
+        ema20 = SHORT_ema(closes, 20)[-1]
+        support = min((candle['low'] for candle in candles[-21:-1]))
+        proximity = support / closes[-1] if closes[-1] else 0.0
+        negative_move = max(-SHORT_pct_change(closes[-7], closes[-1]), 0)
+        score = volume_ratio * 34 + negative_move * 7 + max(proximity - 0.965, 0) * 230
+        if ema20 and closes[-1] > ema20 * 1.015:
+            score -= 20
+        return (symbol, score)
+    except Exception as exc:
+        print(f'Prefilter {symbol}: {exc}', flush=True)
+        return None
+
+def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    try:
+        c5, c15, c1h, c4h = [SHORT_get_klines(symbol, interval, 260) for interval in ('5m', '15m', '1h', '4h')]
+        closed5 = c5[:-1]
+        closed15 = c15[:-1]
+        if min(len(closed5), len(closed15), len(c1h) - 1, len(c4h) - 1) < 210:
+            return None
+        closes5 = [candle['close'] for candle in closed5]
+        volumes5 = [candle['volume'] for candle in closed5]
+        price = closes5[-1]
+        candle5 = closed5[-1]
+        e20_5 = SHORT_ema(closes5, 20)[-1]
+        rsi5_values = SHORT_rsi(closes5)
+        rsi5_now, rsi5_previous = (rsi5_values[-1], rsi5_values[-2])
+        macd5, signal5, hist5 = SHORT_macd(closes5)
+        if None in (e20_5, rsi5_now, rsi5_previous, macd5, signal5, hist5):
+            return None
+        atr5 = SHORT_atr(closed5)
+        vwap5 = SHORT_vwap(closed5)
+        obv5 = SHORT_obv(closed5)
+        average_volume5 = mean(volumes5[-21:-1])
+        volume_ratio5 = volumes5[-1] / average_volume5 if average_volume5 else 0.0
+        distance_ema20 = abs(price / e20_5 - 1) * 100 if e20_5 else 999
+        drop15 = -SHORT_pct_change(closed5[-4]['close'], price)
+        drop1h = -SHORT_pct_change(closed5[-13]['close'], price)
+        drop4h = -SHORT_pct_change(closed5[-49]['close'], price)
+        candle_body_pct = abs(candle5['close'] - candle5['open']) / candle5['open'] * 100 if candle5['open'] else 0
+        red_count = SHORT_consecutive_red(closed5)
+        if not (price < e20_5 and price < vwap5 and (hist5 <= 0)):
+            return None
+        closes15 = [candle['close'] for candle in closed15]
+        volumes15 = [candle['volume'] for candle in closed15]
+        trades15 = [candle['trades'] for candle in closed15]
+        candle15 = closed15[-1]
+        previous15 = closed15[-2]
+        e20_values15 = SHORT_ema(closes15, 20)
+        e50_values15 = SHORT_ema(closes15, 50)
+        e20_15 = e20_values15[-1]
+        e50_15 = e50_values15[-1]
+        rsi15_values = SHORT_rsi(closes15)
+        rsi15_now = rsi15_values[-1]
+        macd15, signal15, hist15 = SHORT_macd(closes15)
+        adx15 = SHORT_adx(closed15)
+        if None in (e20_15, e50_15, rsi15_now, macd15, signal15, hist15):
+            return None
+        average_volume15 = mean(volumes15[-21:-1])
+        volume_ratio15 = volumes15[-1] / average_volume15 if average_volume15 else 0.0
+        average_trades15 = mean(trades15[-21:-1])
+        trades_ratio15 = trades15[-1] / average_trades15 if average_trades15 else 0.0
+        support = min((candle['low'] for candle in closed15[-22:-2]))
+        resistance = max((candle['high'] for candle in closed15[-12:-1]))
+        atr15 = SHORT_atr(closed15)
+        breakdown_range = candle15['high'] - candle15['low']
+        breakdown_body = abs(candle15['close'] - candle15['open'])
+        breakdown = candle15['close'] < support and candle15['close'] < candle15['open'] and (volume_ratio15 >= SHORT_MIN_15M_VOLUME_RATIO)
+        retest = previous15['close'] < support and candle15['high'] >= support * 0.996 and (candle15['high'] <= support * 1.01) and (candle15['close'] < support) and (candle15['close'] < candle15['open'])
+        widths = [SHORT_bollinger(closes15[:-offset])[3] for offset in range(40, 0, -1) if len(closes15[:-offset]) >= 20]
+        _, _, lower_band, current_width = SHORT_bollinger(closes15)
+        squeeze = bool(widths) and current_width <= sorted(widths)[max(0, int(len(widths) * 0.3) - 1)]
+        squeeze_break = squeeze and candle15['close'] <= lower_band * 1.005 and (volume_ratio15 >= SHORT_MIN_15M_VOLUME_RATIO)
+        snapshot1h = SHORT_frame_snapshot(c1h)
+        snapshot4h = SHORT_frame_snapshot(c4h)
+        if not snapshot1h or not snapshot4h:
+            return None
+        if rsi15_now < SHORT_MIN_RSI_15M_HARD:
+            SHORT_log_rejection(symbol, 'RSI منخفض جدًا للشورت', {'rsi15': round(rsi15_now, 2), 'limit': SHORT_MIN_RSI_15M_HARD})
+            return None
+        if breakdown and atr15 > 0 and (breakdown_range > SHORT_MAX_BREAKDOWN_RANGE_ATR * atr15 or breakdown_body > SHORT_MAX_BREAKDOWN_BODY_ATR * atr15):
+            SHORT_log_rejection(symbol, 'شمعة انهيار استنزافية', {'range_atr': round(breakdown_range / atr15, 2), 'body_atr': round(breakdown_body / atr15, 2)})
+            return None
+        if SHORT_BREAKDOWN_CONFIRM_5M and breakdown:
+            after_breakdown = candle5['close_time'] > candle15['close_time']
+            held_below = candle5['close'] < support and candle5['high'] <= support * (1 + SHORT_CONFIRM_MAX_SPIKE_PCT / 100)
+            healthy_close = candle5['close'] <= candle5['open'] and SHORT_close_location(candle5) <= SHORT_MIN_CONFIRM_CLOSE_LOCATION
+            if not (after_breakdown and held_below and healthy_close and (hist5 <= 0)):
+                SHORT_log_rejection(symbol, 'فشل تأكيد الكسر 5m', {'after_breakdown': after_breakdown, 'held_below': held_below, 'healthy_close': healthy_close, 'confirm_close': candle5['close'], 'support': support})
+                return None
+        bounce15 = SHORT_recent_bounce_pct(closed15, 18)
+        lower_high = SHORT_lower_high_structure(closed5, 18)
+        touched_resistance = candle15['high'] >= min(e20_15, e50_15) * 0.995
+        rejection_candle = candle15['close'] < candle15['open'] and SHORT_close_location(candle15) <= 0.45
+        rejection_short = SHORT_REJECTION_SHORT_ENABLED and bounce15 >= SHORT_REJECTION_MIN_BOUNCE_PCT and (SHORT_REJECTION_MIN_RSI_15M <= rsi15_now <= SHORT_REJECTION_MAX_RSI_15M) and touched_resistance and rejection_candle and lower_high and (volume_ratio15 >= SHORT_REJECTION_MIN_VOLUME_15M) and (adx15 >= SHORT_REJECTION_MIN_ADX_15M) and (hist5 <= 0) and (not snapshot1h['strongly_bullish']) and (not snapshot4h['strongly_bullish'])
+        momentum_short = SHORT_MOMENTUM_SHORT_ENABLED and candle15['close'] < support and (candle15['close'] < candle15['open']) and (volume_ratio15 >= SHORT_MOMENTUM_MIN_VOLUME_15M) and (volume_ratio5 >= SHORT_MOMENTUM_MIN_VOLUME_5M) and (adx15 >= SHORT_MOMENTUM_MIN_ADX_15M) and (SHORT_MOMENTUM_MIN_RSI_15M <= rsi15_now <= SHORT_MOMENTUM_MAX_RSI_15M) and (hist15 < 0) and (hist5 <= 0) and (e20_15 < e20_values15[-4]) and (not snapshot1h['strongly_bullish']) and (not snapshot4h['strongly_bullish']) and (drop15 <= SHORT_MAX_15M_DROP_PCT) and (drop1h <= SHORT_MAX_1H_DROP_PCT) and (distance_ema20 <= SHORT_MAX_EMA20_DISTANCE_PCT) and (red_count <= SHORT_MAX_CONSECUTIVE_RED) and (candle_body_pct <= SHORT_MAX_CANDLE_BODY_PCT)
+        relative_weakness = SHORT_pct_change(closed5[-13]['close'], price) - float(market.get('btc', {}).get('rise_1h', 0))
+        if market.get('hard_block', False):
+            SHORT_log_rejection(symbol, 'إيقاف الشورت بسبب صعود BTC', {'btc5': round(float(market.get('btc', {}).get('rise_5m', 0)), 3), 'btc15': round(float(market.get('btc', {}).get('rise_15m', 0)), 3), 'btc1h': round(float(market.get('btc', {}).get('rise_1h', 0)), 3)})
+            return None
+        if market.get('bullish_pressure', False) and relative_weakness > SHORT_BTC_BULLISH_MIN_RELATIVE_WEAKNESS:
+            SHORT_log_rejection(symbol, 'BTC صاعد والعملة ليست أضعف بما يكفي', {'relative_weakness': round(relative_weakness, 2), 'required': SHORT_BTC_BULLISH_MIN_RELATIVE_WEAKNESS})
+            return None
+        below_support = SHORT_nearest_below_support(c1h[:-1], price, 100)
+        if below_support:
+            room = float(below_support['distance_pct'])
+            required_room = SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT if momentum_short or rejection_short else SHORT_MIN_NEXT_SUPPORT_PCT
+            if room < required_room:
+                SHORT_log_rejection(symbol, 'دعم قريب أسفل الشورت', {'distance_pct': round(room, 2), 'required_pct': required_room, 'support': round(float(below_support['level']), 10), 'touches': int(below_support['touches'])})
+                return None
+        if rejection_short:
+            score = 22 + 16 + 12 + 10 + 8 + 8 + 6
+            reasons = [f'فشل ارتداد بعد صعود {bounce15:.1f}%', 'رفض من EMA20/EMA50 على 15m', 'تحول هيكل 5m إلى قمة أدنى', f'حجم رفض 15m ×{volume_ratio15:.1f}', f'ADX 15m {adx15:.0f}', f'RSI مناسب للشورت {rsi15_now:.1f}', 'السعر أسفل VWAP على 5m']
+            if obv5[-1] < obv5[-5]:
+                score += 6
+            if relative_weakness <= -0.5:
+                score += 6
+            if market.get('regime') in ('هابط', 'هابط قوي'):
+                score += 5
+            if score < max(SHORT_REJECTION_MIN_SCORE, int(market.get('required_score', SHORT_MIN_SCORE))):
+                return None
+            recent_high = max((candle['high'] for candle in closed5[-12:-1]))
+            stop = max(recent_high, resistance, price + 1.25 * atr5)
+            mode = 'rejection_short'
+            setup = 'فشل ارتداد إلى مقاومة'
+        elif momentum_short:
+            score = 22 + 18 + 12 + 10 + 10 + 8 + 7 + 5
+            reasons = ['كسر دعم 15m بإغلاق واضح', 'تأكيد 5m حافظ أسفل مستوى الكسر', f'حجم انهيار 15m ×{volume_ratio15:.1f}', f'تأكيد حجم 5m ×{volume_ratio5:.1f}', f'قوة اتجاه ADX {adx15:.0f}', f'RSI مناسب للشورت {rsi15_now:.1f}', 'MACD سلبي على 15m و5m', 'السعر أسفل VWAP']
+            if obv5[-1] < obv5[-5]:
+                score += 6
+            if trades_ratio15 >= 1.4:
+                score += 6
+            if relative_weakness <= -0.25:
+                score += 5
+            if market.get('regime') in ('هابط', 'هابط قوي'):
+                score += 4
+            if score < max(SHORT_MOMENTUM_MIN_SCORE, int(market.get('required_score', SHORT_MIN_SCORE))):
+                return None
+            recent_high = max((candle['high'] for candle in closed5[-10:-1]))
+            stop = max(recent_high, support * 1.008, price + 1.1 * atr5)
+            mode = 'momentum_short'
+            setup = 'انهيار قوي وكسر دعم 15m'
+        else:
+            if drop15 > SHORT_MAX_15M_DROP_PCT or drop1h > SHORT_MAX_1H_DROP_PCT or drop4h > SHORT_MAX_4H_DROP_PCT or (candle_body_pct > SHORT_MAX_CANDLE_BODY_PCT) or (distance_ema20 > SHORT_MAX_EMA20_DISTANCE_PCT) or (red_count > SHORT_MAX_CONSECUTIVE_RED):
+                return None
+            if not (breakdown or retest or squeeze_break):
+                return None
+            if not SHORT_MIN_RSI_15M_HARD <= rsi15_now <= SHORT_MAX_RSI_15M_FOR_ENTRY:
+                return None
+            if adx15 < SHORT_MIN_ADX_15M or volume_ratio15 < SHORT_MIN_15M_VOLUME_RATIO:
+                return None
+            if not (e20_15 < e50_15 and e20_15 < e20_values15[-4] and (e50_15 <= e50_values15[-4])):
+                return None
+            if not (snapshot1h['e20'] < snapshot1h['e50'] and snapshot1h['macd_hist'] < 0 and (32 <= snapshot1h['rsi'] <= 52) and (snapshot1h['adx'] >= 18)):
+                return None
+            if snapshot4h['strongly_bullish']:
+                return None
+            score = (20 if breakdown else 0) + (22 if retest else 0) + (14 if squeeze_break else 0) + (12 if volume_ratio15 >= 2 else 0) + (6 if trades_ratio15 >= 1.4 else 0) + (8 if 35 <= rsi15_now <= 48 else 0) + (8 if adx15 >= 25 else 0) + 10 + 10 + (8 if distance_ema20 <= 0.7 else 0) + (6 if macd5 < signal5 and rsi5_now <= rsi5_previous else 0) + (5 if obv5[-1] < obv5[-5] else 0) + (7 if relative_weakness <= -0.8 else 0) + (4 if market.get('regime') in ('هابط', 'هابط قوي') else 0)
+            if score < max(SHORT_MIN_SCORE, int(market.get('required_score', SHORT_MIN_SCORE))):
+                return None
+            reasons: List[str] = []
+            if breakdown:
+                reasons += ['كسر دعم مؤكد على 15 دقيقة', 'تأكيد 5m حافظ أسفل مستوى الكسر']
+            if retest:
+                reasons.append('إعادة اختبار فاشلة للدعم المكسور')
+            if squeeze_break:
+                reasons.append('كسر هابط بعد انضغاط Bollinger')
+            reasons += [f'حجم 15 دقيقة ×{volume_ratio15:.1f}', f'RSI 15m مناسب {rsi15_now:.1f}', f'ADX 15m {adx15:.0f}', 'تأكيد هابط على الساعة', '4 ساعات لا يعاكس الشورت بقوة']
+            recent_high = max((candle['high'] for candle in closed5[-12:-1]))
+            stop = max(recent_high, resistance, price + 1.25 * atr5)
+            mode = 'balanced_short'
+            setup = 'إعادة اختبار هابطة 15m' if retest else 'انضغاط وكسر هابط 15m' if squeeze_break else 'كسر دعم 15m'
+        risk = stop - price
+        if risk <= 0 or risk / price * 100 > SHORT_MAX_RISK_PCT:
+            return None
+        return {'symbol': symbol, 'entry': price, 'stop': stop, 'tp1': price - 1.5 * risk, 'tp2': price - 2.2 * risk, 'tp3': price - 3.0 * risk, 'risk_pct': risk / price * 100, 'score': min(score, 99), 'volume_ratio': volume_ratio15, 'rsi': rsi15_now, 'adx': adx15, 'setup': setup, 'mode': mode, 'reasons': reasons[:8], 'candle_close': candle5['close_time'], 'market_regime': market.get('regime', 'غير متاح'), 'btc_1h': float(market.get('btc', {}).get('rise_1h', 0)), 'btc_15m': float(market.get('btc', {}).get('rise_15m', 0)), 'btc_rsi15': float(market.get('btc', {}).get('rsi15', 0)), 'relative_weakness': relative_weakness}
+    except Exception as exc:
+        print(f'Analyze {symbol}: {exc}', flush=True)
+        return None
+
+def SHORT_fmt(value: float) -> str:
+    decimals = 2 if value >= 1000 else 4 if value >= 1 else 5 if value >= 0.01 else 8
+    return f'{value:.{decimals}f}'
+
+def SHORT_signal_message(result: Dict) -> str:
+    reasons = '\n'.join((f'• {reason}' for reason in result['reasons']))
+    kind = 'انهيار قوي' if result.get('mode') == 'momentum_short' else 'فشل ارتداد' if result.get('mode') == 'rejection_short' else 'دخول شورت متوازن'
+    return f"🔴 إشارة شورت — {result['symbol']}\n\nالنموذج: {result['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {result['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {result['market_regime']} | BTC 15m: {result['btc_15m']:+.2f}% | RSI BTC: {result['btc_rsi15']:.1f}\nBTC ساعة: {result['btc_1h']:+.2f}% | الضعف النسبي أمام BTC: {result['relative_weakness']:+.2f}%\n\nسعر الدخول التقريبي: {SHORT_fmt(result['entry'])}\nوقف الخسارة: {SHORT_fmt(result['stop'])} ({result['risk_pct']:.2f}%)\nالهدف الأول: {SHORT_fmt(result['tp1'])}\nالهدف الثاني: {SHORT_fmt(result['tp2'])}\nالهدف الثالث: {SHORT_fmt(result['tp3'])}\n\nRSI: {result['rsi']:.1f}\nADX: {result['adx']:.1f}\nالحجم: ×{result['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ إشارة تحليلية فقط وليست ضمانًا للربح. لا يوجد تنفيذ تداول تلقائي."
+
+def SHORT_load_state() -> Dict:
+    try:
+        return json.loads(SHORT_STATE_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {'alerts': {}}
+
+def SHORT_save_state(state: Dict) -> None:
+    SHORT_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def SHORT_cooled(state: Dict, result: Dict) -> bool:
+    previous = int(state.get('alerts', {}).get(result['symbol'], 0))
+    return result['candle_close'] - previous >= SHORT_COOLDOWN_MINUTES * 60 * 1000
+
+def SHORT_track_open_signals(state: Dict) -> None:
+    if not SHORT_TRACK_RESULTS:
+        return
+    open_signals = state.setdefault('open_signals', {})
+    stats = state.setdefault('stats', {'tp1': 0, 'tp2': 0, 'tp3': 0, 'stop': 0})
+    now = int(time.time() * 1000)
+    for symbol, signal in list(open_signals.items()):
+        try:
+            candles = SHORT_get_klines(symbol, '5m', 100)[:-1]
+            last_checked = int(signal.get('last_checked', signal['time']))
+            relevant = [candle for candle in candles if candle['close_time'] > last_checked]
+            if not relevant:
+                if now - int(signal['time']) > 48 * 60 * 60 * 1000:
+                    del open_signals[symbol]
+                continue
+            reached = int(signal.get('reached', 0))
+            closed = False
+            for candle in relevant:
+                if candle['high'] >= float(signal['stop']):
+                    stats['stop'] += 1
+                    del open_signals[symbol]
+                    closed = True
+                    break
+                if reached < 1 and candle['low'] <= float(signal['tp1']):
+                    stats['tp1'] += 1
+                    reached = 1
+                if reached < 2 and candle['low'] <= float(signal['tp2']):
+                    stats['tp2'] += 1
+                    reached = 2
+                if reached < 3 and candle['low'] <= float(signal['tp3']):
+                    stats['tp3'] += 1
+                    del open_signals[symbol]
+                    closed = True
+                    break
+                signal['last_checked'] = candle['close_time']
+            if not closed:
+                signal['reached'] = reached
+                signal['last_checked'] = relevant[-1]['close_time']
+        except Exception as exc:
+            print(f'Track {symbol}: {exc}', flush=True)
+
+def SHORT_scan(state: Dict) -> None:
+    SHORT_track_open_signals(state)
+    market = SHORT_market_context()
+    symbols = SHORT_get_symbols()
+    ranked: List[Tuple[str, float]] = []
+    with ThreadPoolExecutor(max_workers=SHORT_MAX_WORKERS) as pool:
+        futures = [pool.submit(SHORT_prefilter_symbol, symbol) for symbol in symbols]
+        for future in as_completed(futures):
+            item = future.result()
+            if item:
+                ranked.append(item)
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    shortlist = [symbol for symbol, _ in ranked[:SHORT_PREFILTER_LIMIT]]
+    results: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=max(4, SHORT_MAX_WORKERS // 2)) as pool:
+        futures = [pool.submit(SHORT_analyze_symbol, symbol, market) for symbol in shortlist]
+        for future in as_completed(futures):
+            result = future.result()
+            if result and SHORT_cooled(state, result):
+                results.append(result)
+    results.sort(key=lambda result: (2 if result.get('mode') == 'momentum_short' else 1 if result.get('mode') == 'rejection_short' else 0, result['score'], result['volume_ratio']), reverse=True)
+    sent = 0
+    for result in results[:SHORT_MAX_ALERTS_PER_SCAN]:
+        SHORT_send_message(SHORT_signal_message(result))
+        state.setdefault('alerts', {})[result['symbol']] = result['candle_close']
+        state.setdefault('open_signals', {})[result['symbol']] = {'time': result['candle_close'], 'last_checked': result['candle_close'], 'entry': result['entry'], 'stop': result['stop'], 'tp1': result['tp1'], 'tp2': result['tp2'], 'tp3': result['tp3'], 'reached': 0, 'mode': result.get('mode', 'balanced_short')}
+        sent += 1
+        time.sleep(0.3)
+    SHORT_save_state(state)
+    print(f"Scan finished | market={market.get('regime')} | universe={len(symbols)} | shortlist={len(shortlist)} | candidates={len(results)} | sent={sent}", flush=True)
+
+def short_main() -> None:
+    state = SHORT_load_state()
+    SHORT_send_message('✅ تم تشغيل بوت إشارات الشورت فقط V1.0.\nالمسار الأول: كسر دعم وإعادة اختبار هابطة.\nالمسار الثاني: انهيار قوي مع حجم وزخم.\nالمسار الثالث: فشل ارتداد إلى مقاومة.\nفلتر BTC يمنع الشورت وقت الصعود القوي.\nإشارات فقط — بدون تنفيذ تداول تلقائي وبدون إشارات شراء.')
+    while True:
+        started = time.time()
+        try:
+            SHORT_scan(state)
+        except Exception as exc:
+            print(f'Scan error: {exc}', flush=True)
+        time.sleep(max(5, SHORT_SCAN_MINUTES * 60 - (time.time() - started)))
+
+# ============================================================
+# التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
+# إشارات تيليجرام فقط، ولا يوجد تنفيذ أوامر تداول.
+# ============================================================
+import threading
+import traceback
+
+def run_long_bot() -> None:
+    try:
+        main()
+    except Exception:
+        print(f"Fatal LONG bot error:\n{traceback.format_exc()}", flush=True)
+        raise
+
+def run_short_bot() -> None:
+    try:
+        short_main()
+    except Exception:
+        print(f"Fatal SHORT bot error:\n{traceback.format_exc()}", flush=True)
+        raise
+
+def combined_main() -> None:
+    threads = [
+        threading.Thread(target=run_long_bot, name="long-spot-signals", daemon=False),
+        threading.Thread(target=run_short_bot, name="short-futures-signals", daemon=False),
+    ]
+    for thread in threads:
+        thread.start()
+    while True:
+        for thread in threads:
+            if not thread.is_alive():
+                raise RuntimeError(f"Bot thread stopped unexpectedly: {thread.name}")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    combined_main()
