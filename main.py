@@ -771,6 +771,17 @@ SHORT_REJECTION_MIN_ADX_15M = float(os.getenv('REJECTION_MIN_ADX_15M', '18'))
 SHORT_REJECTION_MIN_RSI_15M = float(os.getenv('REJECTION_MIN_RSI_15M', '42'))
 SHORT_REJECTION_MAX_RSI_15M = float(os.getenv('REJECTION_MAX_RSI_15M', '60'))
 SHORT_REJECTION_MIN_SCORE = int(os.getenv('REJECTION_MIN_SCORE', '84'))
+# المحرك الخامس: انعكاس كبير من صعود إلى هبوط — شورت فقط
+SHORT_TREND_REVERSAL_ENABLED = os.getenv('TREND_REVERSAL_SHORT_ENABLED', '1') == '1'
+SHORT_TREND_REVERSAL_MIN_PRIOR_RISE_PCT = float(os.getenv('TREND_REVERSAL_MIN_PRIOR_RISE_PCT', '3.0'))
+SHORT_TREND_REVERSAL_MIN_VOLUME_15M = float(os.getenv('TREND_REVERSAL_MIN_VOLUME_15M', '1.35'))
+SHORT_TREND_REVERSAL_MIN_VOLUME_5M = float(os.getenv('TREND_REVERSAL_MIN_VOLUME_5M', '1.15'))
+SHORT_TREND_REVERSAL_MIN_ADX_15M = float(os.getenv('TREND_REVERSAL_MIN_ADX_15M', '18'))
+SHORT_TREND_REVERSAL_MIN_RSI_PEAK = float(os.getenv('TREND_REVERSAL_MIN_RSI_PEAK', '58'))
+SHORT_TREND_REVERSAL_MIN_RSI_NOW = float(os.getenv('TREND_REVERSAL_MIN_RSI_NOW', '38'))
+SHORT_TREND_REVERSAL_MAX_RSI_NOW = float(os.getenv('TREND_REVERSAL_MAX_RSI_NOW', '54'))
+SHORT_TREND_REVERSAL_MIN_SCORE = int(os.getenv('TREND_REVERSAL_MIN_SCORE', '88'))
+SHORT_TREND_REVERSAL_MAX_RISK_PCT = float(os.getenv('TREND_REVERSAL_MAX_RISK_PCT', '4.0'))
 SHORT_SMART_MARKET_FILTER = os.getenv('SMART_MARKET_FILTER', '1') == '1'
 SHORT_BTC_5M_RISE_BLOCK_PCT = float(os.getenv('BTC_5M_RISE_BLOCK_PCT', '0.75'))
 SHORT_BTC_1H_RISE_BLOCK_PCT = float(os.getenv('BTC_1H_RISE_BLOCK_PCT', '1.25'))
@@ -1101,6 +1112,17 @@ def SHORT_prefilter_symbol(symbol: str) -> Optional[Tuple[str, float]]:
         score = volume_ratio * 34 + negative_move * 7 + max(proximity - 0.965, 0) * 230
         if ema20 and closes[-1] > ema20 * 1.015:
             score -= 20
+        # لا نهمل الانعكاسات المبكرة بعد موجة صعود: ضعف تحت EMA20 مع RSI وMACD هابطين.
+        if SHORT_TREND_REVERSAL_ENABLED and ema20:
+            rsi_values = SHORT_rsi(closes)
+            _, _, histogram = SHORT_macd(closes)
+            prior_low = min(closes[-36:-12]) if len(closes) >= 36 else min(closes[:-12])
+            prior_high = max(closes[-18:-3])
+            prior_rise = SHORT_pct_change(prior_low, prior_high) if prior_low > 0 else 0.0
+            if prior_rise >= SHORT_TREND_REVERSAL_MIN_PRIOR_RISE_PCT and closes[-1] < ema20 and histogram is not None and histogram < 0:
+                score += 34
+                if rsi_values[-1] is not None and rsi_values[-4] is not None and rsi_values[-1] < rsi_values[-4]:
+                    score += 16
         return (symbol, score)
     except Exception as exc:
         print(f'Prefilter {symbol}: {exc}', flush=True)
@@ -1188,6 +1210,33 @@ def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         touched_resistance = candle15['high'] >= min(e20_15, e50_15) * 0.995
         rejection_candle = candle15['close'] < candle15['open'] and SHORT_close_location(candle15) <= 0.45
         rejection_short = SHORT_REJECTION_SHORT_ENABLED and bounce15 >= SHORT_REJECTION_MIN_BOUNCE_PCT and (SHORT_REJECTION_MIN_RSI_15M <= rsi15_now <= SHORT_REJECTION_MAX_RSI_15M) and touched_resistance and rejection_candle and lower_high and (volume_ratio15 >= SHORT_REJECTION_MIN_VOLUME_15M) and (adx15 >= SHORT_REJECTION_MIN_ADX_15M) and (hist5 <= 0) and (not snapshot1h['strongly_bullish']) and (not snapshot4h['strongly_bullish'])
+
+        # المحرك الخامس: يلتقط تحوّل موجة صاعدة إلى هبوط قبل اكتمال الترند الهابط.
+        reversal_window = closed15[-28:-2]
+        reversal_first = reversal_window[:12]
+        reversal_second = reversal_window[12:]
+        prior_swing_low = min(candle['low'] for candle in reversal_first) if reversal_first else price
+        prior_swing_high = max(candle['high'] for candle in reversal_second) if reversal_second else price
+        prior_rise_pct = SHORT_pct_change(prior_swing_low, prior_swing_high) if prior_swing_low > 0 else 0.0
+        recent_break_level = min(candle['low'] for candle in closed15[-8:-2])
+        broke_recent_low = candle15['close'] < recent_break_level and candle15['close'] < candle15['open']
+        rsi_recent_peak = max(value for value in rsi15_values[-14:-2] if value is not None)
+        rsi_rolling_over = rsi15_now < rsi15_values[-3] and rsi15_values[-3] < rsi15_values[-5]
+        macd_turn_down = hist15 < 0 and hist15 < SHORT_macd(closes15[:-2])[2] and hist5 <= 0
+        reversal_confirm_5m = candle5['close_time'] > candle15['close_time'] and candle5['close'] < recent_break_level and candle5['close'] <= candle5['open'] and SHORT_close_location(candle5) <= 0.48
+        trend_reversal_short = bool(
+            SHORT_TREND_REVERSAL_ENABLED
+            and prior_rise_pct >= SHORT_TREND_REVERSAL_MIN_PRIOR_RISE_PCT
+            and lower_high and broke_recent_low and reversal_confirm_5m
+            and rsi_recent_peak >= SHORT_TREND_REVERSAL_MIN_RSI_PEAK
+            and SHORT_TREND_REVERSAL_MIN_RSI_NOW <= rsi15_now <= SHORT_TREND_REVERSAL_MAX_RSI_NOW
+            and rsi_rolling_over and macd_turn_down
+            and volume_ratio15 >= SHORT_TREND_REVERSAL_MIN_VOLUME_15M
+            and volume_ratio5 >= SHORT_TREND_REVERSAL_MIN_VOLUME_5M
+            and adx15 >= SHORT_TREND_REVERSAL_MIN_ADX_15M
+            and price < e20_5 and price < vwap5
+            and not snapshot1h['strongly_bullish']
+        )
         momentum_short = SHORT_MOMENTUM_SHORT_ENABLED and candle15['close'] < support and (candle15['close'] < candle15['open']) and (volume_ratio15 >= SHORT_MOMENTUM_MIN_VOLUME_15M) and (volume_ratio5 >= SHORT_MOMENTUM_MIN_VOLUME_5M) and (adx15 >= SHORT_MOMENTUM_MIN_ADX_15M) and (SHORT_MOMENTUM_MIN_RSI_15M <= rsi15_now <= SHORT_MOMENTUM_MAX_RSI_15M) and (hist15 < 0) and (hist5 <= 0) and (e20_15 < e20_values15[-4]) and (not snapshot1h['strongly_bullish']) and (not snapshot4h['strongly_bullish']) and (drop15 <= SHORT_MAX_15M_DROP_PCT) and (drop1h <= SHORT_MAX_1H_DROP_PCT) and (distance_ema20 <= SHORT_MAX_EMA20_DISTANCE_PCT) and (red_count <= SHORT_MAX_CONSECUTIVE_RED) and (candle_body_pct <= SHORT_MAX_CANDLE_BODY_PCT)
         relative_weakness = SHORT_pct_change(closed5[-13]['close'], price) - float(market.get('btc', {}).get('rise_1h', 0))
         if market.get('hard_block', False):
@@ -1199,11 +1248,40 @@ def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         below_support = SHORT_nearest_below_support(c1h[:-1], price, 100)
         if below_support:
             room = float(below_support['distance_pct'])
-            required_room = SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT if momentum_short or rejection_short else SHORT_MIN_NEXT_SUPPORT_PCT
+            required_room = SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT if momentum_short or rejection_short or trend_reversal_short else SHORT_MIN_NEXT_SUPPORT_PCT
             if room < required_room:
                 SHORT_log_rejection(symbol, 'دعم قريب أسفل الشورت', {'distance_pct': round(room, 2), 'required_pct': required_room, 'support': round(float(below_support['level']), 10), 'touches': int(below_support['touches'])})
                 return None
-        if rejection_short:
+        if trend_reversal_short:
+            score = 22 + 16 + 14 + 12 + 10 + 8 + 7
+            reasons = [
+                f'انعكاس بعد موجة صعود {prior_rise_pct:.1f}%',
+                'تكوّنت قمة أدنى على 5m',
+                'كسر القاع القصير على 15m',
+                'تأكيد 5m حافظ أسفل مستوى الكسر',
+                f'RSI هبط من قمة {rsi_recent_peak:.1f} إلى {rsi15_now:.1f}',
+                'MACD تحوّل سلبي على 15m و5m',
+                f'حجم بيع 15m ×{volume_ratio15:.1f}',
+                'السعر أسفل EMA20 وVWAP على 5m',
+            ]
+            if obv5[-1] < obv5[-5]:
+                score += 6
+            if trades_ratio15 >= 1.25:
+                score += 5
+            if relative_weakness <= -0.35:
+                score += 5
+            if market.get('regime') in ('هابط', 'هابط قوي'):
+                score += 4
+            if snapshot4h['strongly_bullish']:
+                score -= 8
+            if score < max(SHORT_TREND_REVERSAL_MIN_SCORE, int(market.get('required_score', SHORT_MIN_SCORE))):
+                return None
+            reversal_high = max(candle['high'] for candle in closed15[-10:-1])
+            recent_high = max(candle['high'] for candle in closed5[-12:-1])
+            stop = max(recent_high, reversal_high, price + 1.20 * atr5)
+            mode = 'trend_reversal_short'
+            setup = 'انعكاس كبير من صعود إلى هبوط'
+        elif rejection_short:
             score = 22 + 16 + 12 + 10 + 8 + 8 + 6
             reasons = [f'فشل ارتداد بعد صعود {bounce15:.1f}%', 'رفض من EMA20/EMA50 على 15m', 'تحول هيكل 5m إلى قمة أدنى', f'حجم رفض 15m ×{volume_ratio15:.1f}', f'ADX 15m {adx15:.0f}', f'RSI مناسب للشورت {rsi15_now:.1f}', 'السعر أسفل VWAP على 5m']
             if obv5[-1] < obv5[-5]:
@@ -1266,7 +1344,8 @@ def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             mode = 'balanced_short'
             setup = 'إعادة اختبار هابطة 15m' if retest else 'انضغاط وكسر هابط 15m' if squeeze_break else 'كسر دعم 15m'
         risk = stop - price
-        if risk <= 0 or risk / price * 100 > SHORT_MAX_RISK_PCT:
+        max_risk_pct = SHORT_TREND_REVERSAL_MAX_RISK_PCT if mode == 'trend_reversal_short' else SHORT_MAX_RISK_PCT
+        if risk <= 0 or risk / price * 100 > max_risk_pct:
             return None
         return {'symbol': symbol, 'entry': price, 'stop': stop, 'tp1': price - 1.5 * risk, 'tp2': price - 2.2 * risk, 'tp3': price - 3.0 * risk, 'risk_pct': risk / price * 100, 'score': min(score, 99), 'volume_ratio': volume_ratio15, 'rsi': rsi15_now, 'adx': adx15, 'setup': setup, 'mode': mode, 'reasons': reasons[:8], 'candle_close': candle5['close_time'], 'market_regime': market.get('regime', 'غير متاح'), 'btc_1h': float(market.get('btc', {}).get('rise_1h', 0)), 'btc_15m': float(market.get('btc', {}).get('rise_15m', 0)), 'btc_rsi15': float(market.get('btc', {}).get('rsi15', 0)), 'relative_weakness': relative_weakness}
     except Exception as exc:
@@ -1279,7 +1358,7 @@ def SHORT_fmt(value: float) -> str:
 
 def SHORT_signal_message(result: Dict) -> str:
     reasons = '\n'.join((f'• {reason}' for reason in result['reasons']))
-    kind = 'انهيار قوي' if result.get('mode') == 'momentum_short' else 'فشل ارتداد' if result.get('mode') == 'rejection_short' else 'دخول شورت متوازن'
+    kind = 'انعكاس ترند هابط مبكر' if result.get('mode') == 'trend_reversal_short' else 'انهيار قوي' if result.get('mode') == 'momentum_short' else 'فشل ارتداد' if result.get('mode') == 'rejection_short' else 'دخول شورت متوازن'
     return f"🔴 إشارة شورت — {result['symbol']}\n\nالنموذج: {result['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {result['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {result['market_regime']} | BTC 15m: {result['btc_15m']:+.2f}% | RSI BTC: {result['btc_rsi15']:.1f}\nBTC ساعة: {result['btc_1h']:+.2f}% | الضعف النسبي أمام BTC: {result['relative_weakness']:+.2f}%\n\nسعر الدخول التقريبي: {SHORT_fmt(result['entry'])}\nوقف الخسارة: {SHORT_fmt(result['stop'])} ({result['risk_pct']:.2f}%)\nالهدف الأول: {SHORT_fmt(result['tp1'])}\nالهدف الثاني: {SHORT_fmt(result['tp2'])}\nالهدف الثالث: {SHORT_fmt(result['tp3'])}\n\nRSI: {result['rsi']:.1f}\nADX: {result['adx']:.1f}\nالحجم: ×{result['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ إشارة تحليلية فقط وليست ضمانًا للربح. لا يوجد تنفيذ تداول تلقائي."
 
 def SHORT_load_state() -> Dict:
@@ -1356,7 +1435,7 @@ def SHORT_scan(state: Dict) -> None:
             result = future.result()
             if result and SHORT_cooled(state, result):
                 results.append(result)
-    results.sort(key=lambda result: (2 if result.get('mode') == 'momentum_short' else 1 if result.get('mode') == 'rejection_short' else 0, result['score'], result['volume_ratio']), reverse=True)
+    results.sort(key=lambda result: (3 if result.get('mode') == 'trend_reversal_short' else 2 if result.get('mode') == 'momentum_short' else 1 if result.get('mode') == 'rejection_short' else 0, result['score'], result['volume_ratio']), reverse=True)
     sent = 0
     for result in results[:SHORT_MAX_ALERTS_PER_SCAN]:
         SHORT_send_message(SHORT_signal_message(result))
@@ -1369,7 +1448,7 @@ def SHORT_scan(state: Dict) -> None:
 
 def short_main() -> None:
     state = SHORT_load_state()
-    SHORT_send_message('✅ تم تشغيل بوت إشارات الشورت فقط V1.0.\nالمسار الأول: كسر دعم وإعادة اختبار هابطة.\nالمسار الثاني: انهيار قوي مع حجم وزخم.\nالمسار الثالث: فشل ارتداد إلى مقاومة.\nفلتر BTC يمنع الشورت وقت الصعود القوي.\nإشارات فقط — بدون تنفيذ تداول تلقائي وبدون إشارات شراء.')
+    SHORT_send_message('✅ تم تشغيل بوت إشارات الشورت فقط V1.0.\nالمسار الأول: كسر دعم وإعادة اختبار هابطة.\nالمسار الثاني: انهيار قوي مع حجم وزخم.\nالمسار الثالث: فشل ارتداد إلى مقاومة.\nالمسار الرابع للشورت: انعكاس كبير من صعود إلى هبوط قبل اكتمال الترند.\nفلتر BTC يمنع الشورت وقت الصعود القوي.\nإشارات فقط — بدون تنفيذ تداول تلقائي وبدون إشارات شراء.')
     while True:
         started = time.time()
         try:
@@ -1634,7 +1713,7 @@ def stock_short_main() -> None:
         f"الاكتشاف التلقائي: {'مفعّل' if STOCK_SHORT_AUTO_DISCOVER else 'متوقف'}\n"
         f"إضافات يدوية: {extra_symbols}\n"
         "تُحدّث قائمة الأسهم تلقائيًا عند إدراج أو حذف أي عقد.\n"
-        "فلترة مستقلة: اتجاه هابط، كسر/فشل ارتداد، حجم، ADX، RSI ومخاطرة منخفضة.\n"
+        "فلترة مستقلة: اتجاه هابط، كسر/فشل ارتداد، وانعكاس كبير من صعود إلى هبوط، مع حجم وADX وRSI ومخاطرة منخفضة.\n"
         "إشارات فقط — بدون تنفيذ تداول تلقائي."
     )
     while True:
@@ -1645,6 +1724,427 @@ def stock_short_main() -> None:
             print(f"Stock short scan error: {exc}", flush=True)
         time.sleep(max(5, STOCK_SHORT_SCAN_MINUTES * 60 - (time.time() - started)))
 
+
+# ============================================================
+# محرك السيولة الذكي المجاني V1.0 — Binance Order Book
+# يضاف كطبقة جودة أخيرة فقط بعد نجاح التحليل الفني لتقليل استهلاك API.
+# يعمل مع: سبوت LONG + شورت العملات + شورت عقود الأسهم/TradFi.
+# لا ينفذ أوامر تداول؛ إشارات تيليجرام فقط.
+# ============================================================
+LIQUIDITY_ENABLED = os.getenv("LIQUIDITY_ENABLED", "1") == "1"
+LIQUIDITY_SAMPLES = max(1, int(os.getenv("LIQUIDITY_SAMPLES", "2")))
+LIQUIDITY_SAMPLE_DELAY = max(0.0, float(os.getenv("LIQUIDITY_SAMPLE_DELAY", "0.30")))
+LIQUIDITY_DEPTH_LIMIT = int(os.getenv("LIQUIDITY_DEPTH_LIMIT", "100"))
+LIQUIDITY_RANGE_PCT = float(os.getenv("LIQUIDITY_RANGE_PCT", "2.0"))
+LIQUIDITY_WALL_MULTIPLIER = float(os.getenv("LIQUIDITY_WALL_MULTIPLIER", "4.0"))
+LIQUIDITY_MIN_SPOT_WALL_USDT = float(os.getenv("LIQUIDITY_MIN_SPOT_WALL_USDT", "25000"))
+LIQUIDITY_MIN_FUTURES_WALL_USDT = float(os.getenv("LIQUIDITY_MIN_FUTURES_WALL_USDT", "50000"))
+LIQUIDITY_LONG_HARD_BLOCK_DISTANCE_PCT = float(os.getenv("LIQUIDITY_LONG_HARD_BLOCK_DISTANCE_PCT", "0.45"))
+LIQUIDITY_SHORT_HARD_BLOCK_DISTANCE_PCT = float(os.getenv("LIQUIDITY_SHORT_HARD_BLOCK_DISTANCE_PCT", "0.55"))
+LIQUIDITY_MAX_SCORE_BONUS = int(os.getenv("LIQUIDITY_MAX_SCORE_BONUS", "8"))
+
+
+def LIQUIDITY_depth(symbol: str, futures: bool = False) -> Dict:
+    path = "/fapi/v1/depth" if futures else "/api/v3/depth"
+    params = {"symbol": symbol, "limit": LIQUIDITY_DEPTH_LIMIT}
+    return SHORT_get_json(path, params=params, timeout=12) if futures else get_json(path, params=params, timeout=12)
+
+
+def LIQUIDITY_side_stats(levels, mid: float, side: str, min_wall_usdt: float) -> Dict:
+    rows = []
+    for raw_price, raw_qty in levels:
+        price, qty = float(raw_price), float(raw_qty)
+        if price <= 0 or qty <= 0:
+            continue
+        distance = ((price / mid) - 1) * 100 if side == "ask" else (1 - price / mid) * 100
+        if 0 <= distance <= LIQUIDITY_RANGE_PCT:
+            rows.append({"price": price, "qty": qty, "notional": price * qty, "distance_pct": distance})
+    if not rows:
+        return {"total": 0.0, "wall": None, "median": 0.0}
+    notionals = sorted(row["notional"] for row in rows)
+    n = len(notionals)
+    median_notional = notionals[n // 2] if n % 2 else (notionals[n // 2 - 1] + notionals[n // 2]) / 2
+    threshold = max(min_wall_usdt, median_notional * LIQUIDITY_WALL_MULTIPLIER)
+    walls = [row for row in rows if row["notional"] >= threshold]
+    wall = max(walls, key=lambda row: row["notional"]) if walls else max(rows, key=lambda row: row["notional"])
+    wall = dict(wall)
+    wall["qualified"] = bool(walls and wall["notional"] >= threshold)
+    return {"total": sum(row["notional"] for row in rows), "wall": wall, "median": median_notional}
+
+
+def LIQUIDITY_snapshot(symbol: str, futures: bool = False) -> Optional[Dict]:
+    snapshots = []
+    min_wall = LIQUIDITY_MIN_FUTURES_WALL_USDT if futures else LIQUIDITY_MIN_SPOT_WALL_USDT
+    for index in range(LIQUIDITY_SAMPLES):
+        book = LIQUIDITY_depth(symbol, futures=futures)
+        bids, asks = book.get("bids", []), book.get("asks", [])
+        if not bids or not asks:
+            continue
+        best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+        mid = (best_bid + best_ask) / 2
+        bid_stats = LIQUIDITY_side_stats(bids, mid, "bid", min_wall)
+        ask_stats = LIQUIDITY_side_stats(asks, mid, "ask", min_wall)
+        snapshots.append({"mid": mid, "bid": bid_stats, "ask": ask_stats})
+        if index + 1 < LIQUIDITY_SAMPLES and LIQUIDITY_SAMPLE_DELAY:
+            time.sleep(LIQUIDITY_SAMPLE_DELAY)
+    if not snapshots:
+        return None
+    bid_total = mean(item["bid"]["total"] for item in snapshots)
+    ask_total = mean(item["ask"]["total"] for item in snapshots)
+    bid_walls = [item["bid"]["wall"] for item in snapshots if item["bid"]["wall"]]
+    ask_walls = [item["ask"]["wall"] for item in snapshots if item["ask"]["wall"]]
+    bid_wall = max(bid_walls, key=lambda row: row["notional"]) if bid_walls else None
+    ask_wall = max(ask_walls, key=lambda row: row["notional"]) if ask_walls else None
+    ratio = bid_total / ask_total if ask_total > 0 else 99.0
+    persistence = min(1.0, len(snapshots) / max(1, LIQUIDITY_SAMPLES))
+    return {
+        "bid_total": bid_total, "ask_total": ask_total, "bid_ask_ratio": ratio,
+        "bid_wall": bid_wall, "ask_wall": ask_wall,
+        "samples": len(snapshots), "persistence": persistence,
+        "range_pct": LIQUIDITY_RANGE_PCT,
+    }
+
+
+def LIQUIDITY_apply(result: Dict, direction: str, futures: bool) -> Optional[Dict]:
+    if not LIQUIDITY_ENABLED:
+        return result
+    try:
+        data = LIQUIDITY_snapshot(result["symbol"], futures=futures)
+        if not data:
+            result = dict(result)
+            result["liquidity"] = {"available": False}
+            return result
+        bid_wall, ask_wall = data.get("bid_wall"), data.get("ask_wall")
+        bid_wall_value = float(bid_wall.get("notional", 0)) if bid_wall else 0.0
+        ask_wall_value = float(ask_wall.get("notional", 0)) if ask_wall else 0.0
+        ratio = float(data.get("bid_ask_ratio", 1.0))
+        bonus, blocked, note = 0, False, "سيولة متوازنة"
+        if direction == "long":
+            if ask_wall and ask_wall.get("qualified") and ask_wall["distance_pct"] <= LIQUIDITY_LONG_HARD_BLOCK_DISTANCE_PCT and ask_wall_value >= max(1.5 * bid_wall_value, LIQUIDITY_MIN_SPOT_WALL_USDT):
+                blocked, note = True, "جدار بيع قوي قريب جدًا"
+            elif ratio >= 1.50:
+                bonus, note = LIQUIDITY_MAX_SCORE_BONUS, "ضغط طلب داعم للشراء"
+            elif ratio >= 1.20:
+                bonus, note = 4, "أفضلية معتدلة للطلبات"
+            elif ratio <= 0.65:
+                bonus, note = -6, "ضغط عروض مرتفع"
+            elif ratio <= 0.85:
+                bonus, note = -3, "العروض أعلى قليلًا"
+        else:
+            if bid_wall and bid_wall.get("qualified") and bid_wall["distance_pct"] <= LIQUIDITY_SHORT_HARD_BLOCK_DISTANCE_PCT and bid_wall_value >= max(1.5 * ask_wall_value, LIQUIDITY_MIN_FUTURES_WALL_USDT):
+                blocked, note = True, "جدار شراء قوي قريب قد يصد الهبوط"
+            elif ratio <= 0.67:
+                bonus, note = LIQUIDITY_MAX_SCORE_BONUS, "ضغط عروض داعم للشورت"
+            elif ratio <= 0.83:
+                bonus, note = 4, "أفضلية معتدلة للعروض"
+            elif ratio >= 1.55:
+                bonus, note = -6, "ضغط طلب قد يسبب ارتدادًا/سكويز"
+            elif ratio >= 1.20:
+                bonus, note = -3, "الطلبات أعلى قليلًا"
+        if blocked:
+            log_fn = SHORT_log_rejection if futures and "SHORT_log_rejection" in globals() else log_rejection
+            log_fn(result["symbol"], f"رفض بواسطة السيولة: {note}", {
+                "ratio": round(ratio, 2), "bid_wall": round(bid_wall_value, 2), "ask_wall": round(ask_wall_value, 2)
+            })
+            return None
+        enriched = dict(result)
+        enriched["score"] = max(0, min(99, int(round(float(result.get("score", 0)) + bonus))))
+        enriched["liquidity"] = {
+            "available": True, "direction": direction, "bonus": bonus, "note": note,
+            **data,
+        }
+        reasons = list(enriched.get("reasons", []))
+        reasons.append(f"السيولة: {note} ({bonus:+d} نقاط)")
+        enriched["reasons"] = reasons[:8]
+        return enriched
+    except Exception as exc:
+        print(f"Liquidity {result.get('symbol')}: {exc}", flush=True)
+        enriched = dict(result)
+        enriched["liquidity"] = {"available": False, "error": str(exc)}
+        return enriched
+
+
+def LIQUIDITY_money(value: float) -> str:
+    value = float(value or 0)
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B USDT"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M USDT"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K USDT"
+    return f"{value:.0f} USDT"
+
+
+def LIQUIDITY_message_section(result: Dict) -> str:
+    data = result.get("liquidity", {})
+    if not data.get("available"):
+        return "\n\n💧 السيولة: غير متاحة مؤقتًا — لم تُلغَ الإشارة."
+    bid_wall, ask_wall = data.get("bid_wall"), data.get("ask_wall")
+    bid_text = LIQUIDITY_money(bid_wall.get("notional", 0)) if bid_wall else "غير واضح"
+    ask_text = LIQUIDITY_money(ask_wall.get("notional", 0)) if ask_wall else "غير واضح"
+    bid_dist = f" ({bid_wall['distance_pct']:.2f}% أسفل السعر)" if bid_wall else ""
+    ask_dist = f" ({ask_wall['distance_pct']:.2f}% أعلى السعر)" if ask_wall else ""
+    return (
+        "\n\n💧 تحليل السيولة من Binance Order Book\n"
+        f"أقوى جدار شراء: {bid_text}{bid_dist}\n"
+        f"أقوى جدار بيع: {ask_text}{ask_dist}\n"
+        f"نسبة الطلب/العرض: ×{data.get('bid_ask_ratio', 1):.2f}\n"
+        f"الحكم: {data.get('note', 'متوازن')} | تعديل التقييم: {int(data.get('bonus', 0)):+d}"
+    )
+
+
+# ============================================================
+# Whale + Order Flow Engine V9 داخل ملف V8
+# يعمل بعد نجاح التحليل الفني لتقليل استهلاك API.
+# بيانات مجانية من Binance AggTrades فقط، ولا ينفذ صفقات.
+# ============================================================
+WHALE_FLOW_ENABLED = os.getenv("WHALE_FLOW_ENABLED", "1") == "1"
+WHALE_FLOW_TRADE_LIMIT = int(os.getenv("WHALE_FLOW_TRADE_LIMIT", "500"))
+WHALE_FLOW_MIN_SPOT_NOTIONAL = float(os.getenv("WHALE_FLOW_MIN_SPOT_NOTIONAL", "25000"))
+WHALE_FLOW_MIN_FUTURES_NOTIONAL = float(os.getenv("WHALE_FLOW_MIN_FUTURES_NOTIONAL", "75000"))
+WHALE_FLOW_WHALE_MULTIPLIER = float(os.getenv("WHALE_FLOW_WHALE_MULTIPLIER", "8"))
+WHALE_FLOW_MAX_SCORE_BONUS = int(os.getenv("WHALE_FLOW_MAX_SCORE_BONUS", "10"))
+WHALE_FLOW_HARD_BLOCK_RATIO = float(os.getenv("WHALE_FLOW_HARD_BLOCK_RATIO", "0.24"))
+WHALE_FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("WHALE_FLOW_MIN_TOTAL_NOTIONAL", "100000"))
+WHALE_FLOW_ABSORPTION_MOVE_PCT = float(os.getenv("WHALE_FLOW_ABSORPTION_MOVE_PCT", "0.18"))
+
+
+def WHALE_FLOW_get_trades(symbol: str, futures: bool = False) -> List[Dict]:
+    """يجلب أحدث الصفقات المجمعة. m=True يعني أن المشتري Maker، أي التنفيذ العدواني كان بيعًا."""
+    path = "/fapi/v1/aggTrades" if futures else "/api/v3/aggTrades"
+    params = {"symbol": symbol, "limit": max(50, min(1000, WHALE_FLOW_TRADE_LIMIT))}
+    if futures:
+        raw = SHORT_get_json(path, params=params, timeout=12)
+    else:
+        response = SESSION.get(f"{BINANCE_BASE}{path}", params=params, timeout=12)
+        response.raise_for_status()
+        raw = response.json()
+    rows = []
+    for item in raw:
+        try:
+            price = float(item["p"])
+            qty = float(item["q"])
+            rows.append({
+                "price": price,
+                "qty": qty,
+                "notional": price * qty,
+                "time": int(item.get("T", 0)),
+                "side": "sell" if bool(item.get("m")) else "buy",
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
+
+
+def WHALE_FLOW_percentile(values: List[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * fraction))))
+    return float(ordered[index])
+
+
+def WHALE_FLOW_snapshot(symbol: str, futures: bool = False) -> Optional[Dict]:
+    trades = WHALE_FLOW_get_trades(symbol, futures=futures)
+    if len(trades) < 20:
+        return None
+
+    buy_notional = sum(t["notional"] for t in trades if t["side"] == "buy")
+    sell_notional = sum(t["notional"] for t in trades if t["side"] == "sell")
+    total = buy_notional + sell_notional
+    if total <= 0:
+        return None
+
+    delta = buy_notional - sell_notional
+    delta_pct = delta / total
+    buy_ratio = buy_notional / total
+    sell_ratio = sell_notional / total
+
+    notionals = [t["notional"] for t in trades]
+    median_trade = WHALE_FLOW_percentile(notionals, 0.50)
+    p90_trade = WHALE_FLOW_percentile(notionals, 0.90)
+    fixed_floor = WHALE_FLOW_MIN_FUTURES_NOTIONAL if futures else WHALE_FLOW_MIN_SPOT_NOTIONAL
+    whale_threshold = max(fixed_floor, median_trade * WHALE_FLOW_WHALE_MULTIPLIER, p90_trade * 1.75)
+    whales = [t for t in trades if t["notional"] >= whale_threshold]
+    whale_buy = sum(t["notional"] for t in whales if t["side"] == "buy")
+    whale_sell = sum(t["notional"] for t in whales if t["side"] == "sell")
+    whale_total = whale_buy + whale_sell
+    whale_delta_pct = (whale_buy - whale_sell) / whale_total if whale_total else 0.0
+
+    first_price = trades[0]["price"]
+    last_price = trades[-1]["price"]
+    move_pct = ((last_price / first_price) - 1) * 100 if first_price else 0.0
+
+    # امتصاص تقريبي: تدفق عدواني قوي لكن السعر لا يتحرك معه بما يكفي.
+    absorption = "none"
+    if total >= WHALE_FLOW_MIN_TOTAL_NOTIONAL and abs(move_pct) <= WHALE_FLOW_ABSORPTION_MOVE_PCT:
+        if buy_ratio >= 0.68:
+            absorption = "sell_absorption"  # شراء عدواني يتم امتصاصه بعروض ثابتة
+        elif sell_ratio >= 0.68:
+            absorption = "buy_absorption"   # بيع عدواني يتم امتصاصه بطلبات ثابتة
+
+    largest = sorted(whales, key=lambda x: x["notional"], reverse=True)[:3]
+    return {
+        "available": True,
+        "count": len(trades),
+        "total_notional": total,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "delta": delta,
+        "delta_pct": delta_pct,
+        "buy_ratio": buy_ratio,
+        "sell_ratio": sell_ratio,
+        "whale_threshold": whale_threshold,
+        "whale_count": len(whales),
+        "whale_buy": whale_buy,
+        "whale_sell": whale_sell,
+        "whale_delta_pct": whale_delta_pct,
+        "price_move_pct": move_pct,
+        "absorption": absorption,
+        "largest": largest,
+    }
+
+
+def WHALE_FLOW_apply(result: Dict, direction: str, futures: bool) -> Optional[Dict]:
+    if not WHALE_FLOW_ENABLED:
+        return result
+    try:
+        data = WHALE_FLOW_snapshot(result["symbol"], futures=futures)
+        if not data:
+            enriched = dict(result)
+            enriched["whale_flow"] = {"available": False}
+            return enriched
+
+        delta_pct = float(data["delta_pct"])
+        whale_delta_pct = float(data["whale_delta_pct"])
+        total = float(data["total_notional"])
+        absorption = data.get("absorption", "none")
+        bonus = 0
+        blocked = False
+        notes = []
+
+        if direction == "long":
+            if total >= WHALE_FLOW_MIN_TOTAL_NOTIONAL and delta_pct <= -WHALE_FLOW_HARD_BLOCK_RATIO and whale_delta_pct <= -0.20:
+                blocked = True
+                notes.append("بيع عدواني وحيتان بائعة يعاكسان الشراء")
+            else:
+                if delta_pct >= 0.22: bonus += 5
+                elif delta_pct >= 0.10: bonus += 3
+                elif delta_pct <= -0.18: bonus -= 4
+                if whale_delta_pct >= 0.25: bonus += 5; notes.append("حيتان مشترية")
+                elif whale_delta_pct <= -0.25: bonus -= 4; notes.append("حيتان بائعة")
+                if absorption == "buy_absorption": bonus += 2; notes.append("امتصاص بيع بواسطة الطلبات")
+                elif absorption == "sell_absorption": bonus -= 2; notes.append("امتصاص شراء بواسطة العروض")
+        else:
+            if total >= WHALE_FLOW_MIN_TOTAL_NOTIONAL and delta_pct >= WHALE_FLOW_HARD_BLOCK_RATIO and whale_delta_pct >= 0.20:
+                blocked = True
+                notes.append("شراء عدواني وحيتان مشترية قد تسبب سكويز")
+            else:
+                if delta_pct <= -0.22: bonus += 5
+                elif delta_pct <= -0.10: bonus += 3
+                elif delta_pct >= 0.18: bonus -= 4
+                if whale_delta_pct <= -0.25: bonus += 5; notes.append("حيتان بائعة")
+                elif whale_delta_pct >= 0.25: bonus -= 4; notes.append("حيتان مشترية")
+                if absorption == "sell_absorption": bonus += 2; notes.append("امتصاص شراء بواسطة العروض")
+                elif absorption == "buy_absorption": bonus -= 2; notes.append("امتصاص بيع بواسطة الطلبات")
+
+        bonus = max(-WHALE_FLOW_MAX_SCORE_BONUS, min(WHALE_FLOW_MAX_SCORE_BONUS, bonus))
+        if not notes:
+            notes.append("تدفق أوامر متوازن")
+
+        if blocked:
+            log_fn = SHORT_log_rejection if futures and "SHORT_log_rejection" in globals() else log_rejection
+            log_fn(result["symbol"], f"رفض بواسطة Whale/Order Flow: {'، '.join(notes)}", {
+                "delta_pct": round(delta_pct, 4),
+                "whale_delta_pct": round(whale_delta_pct, 4),
+                "total": round(total, 2),
+            })
+            return None
+
+        enriched = dict(result)
+        enriched["score"] = max(0, min(99, int(round(float(result.get("score", 0)) + bonus))))
+        data["bonus"] = bonus
+        data["note"] = "، ".join(notes)
+        enriched["whale_flow"] = data
+        reasons = list(enriched.get("reasons", []))
+        reasons.append(f"الحيتان وتدفق الأوامر: {data['note']} ({bonus:+d} نقاط)")
+        enriched["reasons"] = reasons[:8]
+        return enriched
+    except Exception as exc:
+        print(f"Whale flow {result.get('symbol')}: {exc}", flush=True)
+        enriched = dict(result)
+        enriched["whale_flow"] = {"available": False, "error": str(exc)}
+        return enriched
+
+
+def WHALE_FLOW_message_section(result: Dict) -> str:
+    data = result.get("whale_flow", {})
+    if not data.get("available"):
+        return "\n\n🐋 الحيتان وتدفق الأوامر: غير متاح مؤقتًا — لم تُلغَ الإشارة."
+    delta_pct = float(data.get("delta_pct", 0)) * 100
+    whale_delta_pct = float(data.get("whale_delta_pct", 0)) * 100
+    absorption_names = {
+        "none": "لا يوجد امتصاص واضح",
+        "buy_absorption": "امتصاص بيع عند الطلبات",
+        "sell_absorption": "امتصاص شراء عند العروض",
+    }
+    return (
+        "\n\n🐋 Whale & Order Flow من Binance\n"
+        f"حجم الصفقات المحللة: {LIQUIDITY_money(data.get('total_notional', 0))}\n"
+        f"Delta العدواني: {delta_pct:+.1f}% | شراء {data.get('buy_ratio', 0)*100:.1f}% / بيع {data.get('sell_ratio', 0)*100:.1f}%\n"
+        f"صفقات الحيتان: {int(data.get('whale_count', 0))} | Whale Delta: {whale_delta_pct:+.1f}%\n"
+        f"الامتصاص: {absorption_names.get(data.get('absorption'), 'غير واضح')}\n"
+        f"الحكم: {data.get('note', 'متوازن')} | تعديل التقييم: {int(data.get('bonus', 0)):+d}"
+    )
+
+
+# تغليف المحركات الأصلية بدل إعادة كتابتها، لضمان عدم حذف أي ميزة سابقة.
+_ORIGINAL_LONG_ANALYZE = analyze_symbol
+_ORIGINAL_SHORT_ANALYZE = SHORT_analyze_symbol
+_ORIGINAL_STOCK_SHORT_ANALYZE = STOCK_SHORT_analyze_symbol
+_ORIGINAL_LONG_MESSAGE = signal_message
+_ORIGINAL_SHORT_MESSAGE = SHORT_signal_message
+_ORIGINAL_STOCK_SHORT_MESSAGE = STOCK_SHORT_signal_message
+
+
+def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    result = _ORIGINAL_LONG_ANALYZE(symbol, market)
+    if not result:
+        return None
+    result = LIQUIDITY_apply(result, "long", futures=False)
+    return WHALE_FLOW_apply(result, "long", futures=False) if result else None
+
+
+def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    result = _ORIGINAL_SHORT_ANALYZE(symbol, market)
+    if not result:
+        return None
+    result = LIQUIDITY_apply(result, "short", futures=True)
+    return WHALE_FLOW_apply(result, "short", futures=True) if result else None
+
+
+def STOCK_SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    # المحرك الأصلي يستدعي SHORT_analyze_symbol ديناميكيًا، لذلك يحصل تلقائيًا
+    # على السيولة والحيتان ثم يطبق فلاتر عقود الأسهم الأكثر صرامة.
+    return _ORIGINAL_STOCK_SHORT_ANALYZE(symbol, market)
+
+
+def _append_microstructure_sections(base: str, result: Dict) -> str:
+    sections = LIQUIDITY_message_section(result) + WHALE_FLOW_message_section(result)
+    marker = "\n\n⚠️"
+    return base.replace(marker, sections + marker, 1) if marker in base else base + sections
+
+
+def signal_message(result: Dict) -> str:
+    return _append_microstructure_sections(_ORIGINAL_LONG_MESSAGE(result), result)
+
+
+def SHORT_signal_message(result: Dict) -> str:
+    return _append_microstructure_sections(_ORIGINAL_SHORT_MESSAGE(result), result)
+
+
+def STOCK_SHORT_signal_message(result: Dict) -> str:
+    return _append_microstructure_sections(_ORIGINAL_STOCK_SHORT_MESSAGE(result), result)
 
 # ============================================================
 # التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
