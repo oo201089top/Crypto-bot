@@ -2531,6 +2531,291 @@ def SHORT_signal_message(result: Dict) -> str:
 def STOCK_SHORT_signal_message(result: Dict) -> str:
     return _append_cvd_oi_section(_V2_STOCK_MESSAGE(result), result)
 
+
+
+# ============================================================
+# V11 — ربط فعلي للثقة الموزونة + فلتر ارتداد BTC للشورت
+# يطبق بعد جميع طبقات الفني والسيولة والحيتان وCVD وOpen Interest.
+# ============================================================
+BTC_REBOUND_FILTER_ENABLED = os.getenv("BTC_REBOUND_FILTER_ENABLED", "1") == "1"
+BTC_REBOUND_CACHE_SECONDS = int(os.getenv("BTC_REBOUND_CACHE_SECONDS", "35"))
+BTC_REBOUND_5M_MIN_PCT = float(os.getenv("BTC_REBOUND_5M_MIN_PCT", "0.22"))
+BTC_REBOUND_15M_MIN_PCT = float(os.getenv("BTC_REBOUND_15M_MIN_PCT", "0.35"))
+BTC_REBOUND_RSI_MIN = float(os.getenv("BTC_REBOUND_RSI_MIN", "45"))
+BTC_REBOUND_REQUIRED_REL_WEAKNESS = float(os.getenv("BTC_REBOUND_REQUIRED_REL_WEAKNESS", "-1.00"))
+BTC_REBOUND_HARD_REQUIRED_REL_WEAKNESS = float(os.getenv("BTC_REBOUND_HARD_REQUIRED_REL_WEAKNESS", "-1.60"))
+WEIGHTED_CONFIDENCE_MIN_SHORT = int(os.getenv("WEIGHTED_CONFIDENCE_MIN_SHORT", "80"))
+WEIGHTED_CONFIDENCE_MIN_LONG = int(os.getenv("WEIGHTED_CONFIDENCE_MIN_LONG", "78"))
+WEIGHTED_HARD_BLOCK_CONTRADICTIONS = int(os.getenv("WEIGHTED_HARD_BLOCK_CONTRADICTIONS", "2"))
+
+_BTC_REBOUND_CACHE = {"data": None, "updated_at": 0.0}
+
+
+def _V11_btc_rebound_snapshot() -> Dict:
+    now = time.time()
+    cached = _BTC_REBOUND_CACHE.get("data")
+    if cached and now - float(_BTC_REBOUND_CACHE.get("updated_at", 0)) < BTC_REBOUND_CACHE_SECONDS:
+        return dict(cached)
+    try:
+        c5 = get_klines("BTCUSDT", "5m", 80)[:-1]
+        c15 = get_klines("BTCUSDT", "15m", 80)[:-1]
+        z5 = [float(c["close"]) for c in c5]
+        z15 = [float(c["close"]) for c in c15]
+        r5 = float(rsi(z5)[-1] or 50)
+        r15 = float(rsi(z15)[-1] or 50)
+        e7 = float(ema(z5, 7)[-1] or z5[-1])
+        e25 = float(ema(z5, 25)[-1] or z5[-1])
+        rise5 = pct_change(z5[-2], z5[-1])
+        rise15 = pct_change(z5[-4], z5[-1])
+        recovery = pct_change(min(z5[-6:]), z5[-1])
+        bullish_candle = c5[-1]["close"] > c5[-1]["open"] and c5[-1]["close"] >= c5[-2]["high"] * 0.998
+        soft = bool(
+            (rise5 >= BTC_REBOUND_5M_MIN_PCT or recovery >= BTC_REBOUND_15M_MIN_PCT)
+            and r5 >= BTC_REBOUND_RSI_MIN
+            and z5[-1] >= e7
+        )
+        hard = bool(
+            soft and rise15 >= BTC_REBOUND_15M_MIN_PCT
+            and z5[-1] > e7 >= e25
+            and r5 >= max(BTC_REBOUND_RSI_MIN + 3, 48)
+            and bullish_candle
+        )
+        data = {
+            "available": True, "soft": soft, "hard": hard,
+            "rise_5m": rise5, "rise_15m": rise15, "recovery": recovery,
+            "rsi5": r5, "rsi15": r15, "above_ema7": z5[-1] >= e7,
+            "ema7_above_ema25": e7 >= e25,
+        }
+    except Exception as exc:
+        print(f"BTC rebound filter error: {exc}", flush=True)
+        data = {"available": False, "soft": False, "hard": False}
+    _BTC_REBOUND_CACHE["data"] = data
+    _BTC_REBOUND_CACHE["updated_at"] = now
+    return dict(data)
+
+
+def _V11_component_scores(result: Dict, direction: str) -> Dict:
+    legacy = float(result.get("legacy_score", result.get("score", 0)))
+    adx_value = float(result.get("adx", 0))
+    volume_ratio = float(result.get("volume_ratio", 1))
+    technical = max(0.0, min(100.0, legacy))
+    trend = max(0.0, min(100.0, 48 + (adx_value - 18) * 2.2))
+    volume = max(0.0, min(100.0, 42 + (volume_ratio - 1) * 30))
+
+    flow = result.get("whale_flow", {})
+    cvd = result.get("cvd", {})
+    delta = float(flow.get("delta_pct", 0)) if flow.get("available") else 0.0
+    whale_delta = float(flow.get("whale_delta_pct", 0)) if flow.get("available") else 0.0
+    cvd_all = float(cvd.get("cvd_pct", 0)) if cvd.get("available") else delta
+    cvd_recent = float(cvd.get("recent_cvd_pct", 0)) if cvd.get("available") else delta
+    sign = 1.0 if direction == "long" else -1.0
+    aligned = sign * (0.42 * delta + 0.18 * whale_delta + 0.25 * cvd_all + 0.15 * cvd_recent)
+    orderflow = max(0.0, min(100.0, 50 + aligned * 150))
+
+    liq = result.get("liquidity", {})
+    ratio = float(liq.get("bid_ask_ratio", 1.0)) if liq.get("available") else 1.0
+    if direction == "short":
+        liquidity = max(0.0, min(100.0, 55 + (1.0 - ratio) * 75))
+    else:
+        liquidity = max(0.0, min(100.0, 55 + (ratio - 1.0) * 55))
+
+    oi = result.get("open_interest", {})
+    oi_change = float(oi.get("change_pct", 0)) if oi.get("available") else 0.0
+    oi_score = 55.0
+    if oi.get("available"):
+        if direction == "short":
+            oi_score = 55 + oi_change * 10
+        else:
+            oi_score = 55 + oi_change * 10
+        oi_score = max(0.0, min(100.0, oi_score))
+
+    regime = str(result.get("market_regime", ""))
+    if direction == "short":
+        market = 90.0 if "هابط قوي" in regime else 80.0 if "هابط" in regime else 55.0
+    else:
+        market = 85.0 if regime in ("إيجابي", "محايد") else 45.0
+
+    final = (
+        technical * 0.50 + orderflow * 0.20 + liquidity * 0.15 +
+        oi_score * 0.10 + market * 0.05
+    )
+    return {
+        "technical": technical, "trend": trend, "volume": volume,
+        "orderflow": orderflow, "liquidity": liquidity,
+        "open_interest": oi_score, "market": market,
+        "final_raw": final, "delta": delta, "cvd": cvd_all,
+        "cvd_recent": cvd_recent, "oi_change": oi_change, "ratio": ratio,
+    }
+
+
+def _V11_classify_move(direction: str, scores: Dict) -> Dict:
+    delta, cvd_all = scores["delta"], scores["cvd"]
+    recent, oi_change = scores["cvd_recent"], scores["oi_change"]
+    if direction == "short":
+        if delta <= -0.12 and cvd_all <= -0.10 and oi_change >= 0.35:
+            return {"name": "دخول بائعين جدد", "quality": "قوي", "adjustment": 5}
+        if delta <= -0.12 and cvd_all <= -0.10 and oi_change <= -0.35:
+            return {"name": "تصفية لونغ/خروج مراكز", "quality": "حذر", "adjustment": -4}
+        if cvd_all <= -0.08 and recent >= 0.08:
+            return {"name": "ضغط بيعي مع ارتداد شراء حديث", "quality": "حذر", "adjustment": -4}
+        if cvd_all >= 0.12:
+            return {"name": "شراء يعاكس الشورت", "quality": "ضعيف", "adjustment": -8}
+        return {"name": "ضغط هابط غير محسوم", "quality": "متوسط", "adjustment": 0}
+    if delta >= 0.12 and cvd_all >= 0.10 and oi_change >= 0.35:
+        return {"name": "دخول مشترين جدد", "quality": "قوي", "adjustment": 5}
+    if delta >= 0.12 and cvd_all >= 0.10 and oi_change <= -0.35:
+        return {"name": "تغطية شورت/خروج مراكز", "quality": "حذر", "adjustment": -4}
+    if cvd_all >= 0.08 and recent <= -0.08:
+        return {"name": "ضغط شرائي مع بيع حديث", "quality": "حذر", "adjustment": -4}
+    if cvd_all <= -0.12:
+        return {"name": "بيع يعاكس الشراء", "quality": "ضعيف", "adjustment": -8}
+    return {"name": "ضغط صاعد غير محسوم", "quality": "متوسط", "adjustment": 0}
+
+
+def _V11_weighted_apply(result: Dict, direction: str) -> Optional[Dict]:
+    if not result:
+        return None
+    scores = _V11_component_scores(result, direction)
+    movement = _V11_classify_move(direction, scores)
+    final = float(scores["final_raw"]) + float(movement["adjustment"])
+    contradictions = 0
+    contradiction_notes = []
+
+    if direction == "short":
+        if scores["cvd"] >= 0.15:
+            contradictions += 1; contradiction_notes.append("CVD شرائي")
+            final -= 6
+        if scores["delta"] >= 0.15:
+            contradictions += 1; contradiction_notes.append("Delta شرائي")
+            final -= 5
+        if scores["oi_change"] <= -0.50:
+            contradiction_notes.append("OI ينخفض مع الهبوط")
+            final -= 4
+        if scores["ratio"] >= 1.80:
+            contradictions += 1; contradiction_notes.append("طلبات قوية في دفتر الأوامر")
+            final -= 7
+    else:
+        if scores["cvd"] <= -0.15:
+            contradictions += 1; contradiction_notes.append("CVD بيعي")
+            final -= 6
+        if scores["delta"] <= -0.15:
+            contradictions += 1; contradiction_notes.append("Delta بيعي")
+            final -= 5
+        if scores["oi_change"] <= -0.50:
+            contradiction_notes.append("OI ينخفض مع الصعود")
+            final -= 4
+        if scores["ratio"] <= 0.60:
+            contradictions += 1; contradiction_notes.append("عروض قوية في دفتر الأوامر")
+            final -= 7
+
+    btc = {"available": False, "soft": False, "hard": False}
+    if direction == "short" and BTC_REBOUND_FILTER_ENABLED:
+        btc = _V11_btc_rebound_snapshot()
+        relative_weakness = float(result.get("relative_strength", 0))
+        if btc.get("hard") and relative_weakness > BTC_REBOUND_HARD_REQUIRED_REL_WEAKNESS:
+            SHORT_log_rejection(result.get("symbol", "?"), "رفض شورت: ارتداد BTC قوي والعملة ليست أضعف بما يكفي", {
+                "relative_weakness": round(relative_weakness, 2),
+                "required": BTC_REBOUND_HARD_REQUIRED_REL_WEAKNESS,
+                "btc5": round(float(btc.get("rise_5m", 0)), 3),
+                "btc15": round(float(btc.get("rise_15m", 0)), 3),
+                "btc_rsi5": round(float(btc.get("rsi5", 0)), 1),
+            })
+            return None
+        if btc.get("soft") and relative_weakness > BTC_REBOUND_REQUIRED_REL_WEAKNESS:
+            final -= 7
+            contradiction_notes.append("BTC يرتد والضعف النسبي غير كافٍ")
+
+    final = int(round(max(0.0, min(99.0, final))))
+    min_required = WEIGHTED_CONFIDENCE_MIN_SHORT if direction == "short" else WEIGHTED_CONFIDENCE_MIN_LONG
+    if contradictions >= WEIGHTED_HARD_BLOCK_CONTRADICTIONS:
+        log_fn = SHORT_log_rejection if direction == "short" else log_rejection
+        log_fn(result.get("symbol", "?"), "رفض بسبب تعارضات ميكروستركشر متعددة", {
+            "contradictions": contradictions, "notes": contradiction_notes, "score": final,
+        })
+        return None
+    if final < min_required:
+        log_fn = SHORT_log_rejection if direction == "short" else log_rejection
+        log_fn(result.get("symbol", "?"), "الثقة الموزونة النهائية منخفضة", {
+            "score": final, "required": min_required, "notes": contradiction_notes,
+        })
+        return None
+
+    enriched = dict(result)
+    enriched["score"] = final
+    enriched["weighted_confidence"] = {
+        **{k: round(v, 1) if isinstance(v, (int, float)) else v for k, v in scores.items()},
+        "final": final, "movement": movement, "contradictions": contradiction_notes,
+        "btc_rebound": btc,
+    }
+    return enriched
+
+
+def _V11_weighted_message_section(result: Dict) -> str:
+    data = result.get("weighted_confidence", {})
+    if not data:
+        return ""
+    movement = data.get("movement", {})
+    btc = data.get("btc_rebound", {})
+    lines = [
+        "\n\n🔥 قراءة استمرار الحركة",
+        f"النوع: {movement.get('name', 'غير محسوم')} | الجودة: {movement.get('quality', 'متوسط')}",
+        f"الثقة الموزونة: {int(data.get('final', result.get('score', 0)))}% "
+        f"| فني {float(data.get('technical', 0)):.0f} "
+        f"| تدفق {float(data.get('orderflow', 0)):.0f} "
+        f"| سيولة {float(data.get('liquidity', 0)):.0f} "
+        f"| OI {float(data.get('open_interest', 0)):.0f}",
+    ]
+    notes = data.get("contradictions", [])
+    if notes:
+        lines.append("تنبيهات: " + "، ".join(notes))
+    if btc.get("available"):
+        state = "ارتداد قوي" if btc.get("hard") else "ارتداد" if btc.get("soft") else "لا يوجد ارتداد مؤثر"
+        lines.append(
+            f"BTC: {state} | 5m {float(btc.get('rise_5m', 0)):+.2f}% "
+            f"| 15m {float(btc.get('rise_15m', 0)):+.2f}% | RSI5 {float(btc.get('rsi5', 0)):.1f}"
+        )
+    return "\n".join(lines)
+
+
+# تغليف نهائي: جميع إشارات الشورت والشراء تمر عبر الربط الموزون الحقيقي.
+_V11_PREV_LONG_ANALYZE = analyze_symbol
+_V11_PREV_SHORT_ANALYZE = SHORT_analyze_symbol
+_V11_PREV_STOCK_ANALYZE = STOCK_SHORT_analyze_symbol
+_V11_PREV_LONG_MESSAGE = signal_message
+_V11_PREV_SHORT_MESSAGE = SHORT_signal_message
+_V11_PREV_STOCK_MESSAGE = STOCK_SHORT_signal_message
+
+
+def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    return _V11_weighted_apply(_V11_PREV_LONG_ANALYZE(symbol, market), "long")
+
+
+def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    return _V11_weighted_apply(_V11_PREV_SHORT_ANALYZE(symbol, market), "short")
+
+
+def STOCK_SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    # محرك الأسهم الأصلي يستدعي SHORT_analyze_symbol الحالي، فلا نكرر الوزن مرتين.
+    return _V11_PREV_STOCK_ANALYZE(symbol, market)
+
+
+def _V11_append_weighted(base: str, result: Dict) -> str:
+    section = _V11_weighted_message_section(result)
+    marker = "\n\n⚠️"
+    return base.replace(marker, section + marker, 1) if marker in base else base + section
+
+
+def signal_message(result: Dict) -> str:
+    return _V11_append_weighted(_V11_PREV_LONG_MESSAGE(result), result)
+
+
+def SHORT_signal_message(result: Dict) -> str:
+    return _V11_append_weighted(_V11_PREV_SHORT_MESSAGE(result), result)
+
+
+def STOCK_SHORT_signal_message(result: Dict) -> str:
+    return _V11_append_weighted(_V11_PREV_STOCK_MESSAGE(result), result)
+
 # ============================================================
 # التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
 # إشارات تيليجرام فقط، ولا يوجد تنفيذ أوامر تداول.
