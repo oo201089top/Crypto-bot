@@ -1,3 +1,5 @@
+# V12: engine-scoped environment variables, shared aggTrades cache, active OI hard block,
+# thread-safe caches, safer stock-contract discovery, and self-healing thread supervisor.
 import os, time, json
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,103 +8,112 @@ from statistics import mean, pstdev
 from typing import Dict, List, Optional, Tuple
 import requests
 
+def ENGINE_ENV(prefix: str, name: str, default=None):
+    """Read PREFIX_NAME first, then the legacy NAME for backward compatibility."""
+    prefixed = f"{prefix}_{name}"
+    if prefixed in os.environ:
+        return os.environ[prefixed]
+    return os.getenv(name, default)
+
 BINANCE_BASE = "https://data-api.binance.vision"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "1"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "120"))
-MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
-SYMBOL_REFRESH_MINUTES = int(os.getenv("SYMBOL_REFRESH_MINUTES", "30"))
-MIN_DAILY_QUOTE_VOLUME = float(os.getenv("MIN_DAILY_QUOTE_VOLUME", "500000"))
-PREFILTER_LIMIT = int(os.getenv("PREFILTER_LIMIT", "60"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "76"))
-MIN_15M_VOLUME_RATIO = float(os.getenv("MIN_15M_VOLUME_RATIO", "1.6"))
-MAX_1H_RISE_PCT = float(os.getenv("MAX_1H_RISE_PCT", "8"))
-MAX_4H_RISE_PCT = float(os.getenv("MAX_4H_RISE_PCT", "14"))
-MAX_15M_RISE_PCT = float(os.getenv("MAX_15M_RISE_PCT", "3"))
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "4"))
-MAX_CANDLE_BODY_PCT = float(os.getenv("MAX_CANDLE_BODY_PCT", "2.8"))
-MAX_EMA20_DISTANCE_PCT = float(os.getenv("MAX_EMA20_DISTANCE_PCT", "1.5"))
-MAX_CONSECUTIVE_GREEN = int(os.getenv("MAX_CONSECUTIVE_GREEN", "2"))
+SCAN_MINUTES = int(ENGINE_ENV("SPOT", "SCAN_MINUTES", "1"))
+COOLDOWN_MINUTES = int(ENGINE_ENV("SPOT", "COOLDOWN_MINUTES", "120"))
+MAX_ALERTS_PER_SCAN = int(ENGINE_ENV("SPOT", "MAX_ALERTS_PER_SCAN", "5"))
+MAX_WORKERS = int(ENGINE_ENV("SPOT", "MAX_WORKERS", "16"))
+SYMBOL_REFRESH_MINUTES = int(ENGINE_ENV("SPOT", "SYMBOL_REFRESH_MINUTES", "30"))
+MIN_DAILY_QUOTE_VOLUME = float(ENGINE_ENV("SPOT", "MIN_DAILY_QUOTE_VOLUME", "500000"))
+PREFILTER_LIMIT = int(ENGINE_ENV("SPOT", "PREFILTER_LIMIT", "60"))
+MIN_SCORE = int(ENGINE_ENV("SPOT", "MIN_SCORE", "76"))
+MIN_15M_VOLUME_RATIO = float(ENGINE_ENV("SPOT", "MIN_15M_VOLUME_RATIO", "1.6"))
+MAX_1H_RISE_PCT = float(ENGINE_ENV("SPOT", "MAX_1H_RISE_PCT", "8"))
+MAX_4H_RISE_PCT = float(ENGINE_ENV("SPOT", "MAX_4H_RISE_PCT", "14"))
+MAX_15M_RISE_PCT = float(ENGINE_ENV("SPOT", "MAX_15M_RISE_PCT", "3"))
+MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "MAX_RISK_PCT", "4"))
+MAX_CANDLE_BODY_PCT = float(ENGINE_ENV("SPOT", "MAX_CANDLE_BODY_PCT", "2.8"))
+MAX_EMA20_DISTANCE_PCT = float(ENGINE_ENV("SPOT", "MAX_EMA20_DISTANCE_PCT", "1.5"))
+MAX_CONSECUTIVE_GREEN = int(ENGINE_ENV("SPOT", "MAX_CONSECUTIVE_GREEN", "2"))
 
 # فلاتر جودة الاختراق V2.2
-BREAKOUT_CONFIRM_5M = os.getenv("BREAKOUT_CONFIRM_5M", "1") == "1"
-CONFIRM_MAX_DIP_PCT = float(os.getenv("CONFIRM_MAX_DIP_PCT", "0.8"))
-MIN_CONFIRM_CLOSE_LOCATION = float(os.getenv("MIN_CONFIRM_CLOSE_LOCATION", "0.55"))
-MAX_RSI_HARD = float(os.getenv("MAX_RSI_HARD", "70"))
-MAX_BREAKOUT_RANGE_ATR = float(os.getenv("MAX_BREAKOUT_RANGE_ATR", "2.0"))
-MAX_BREAKOUT_BODY_ATR = float(os.getenv("MAX_BREAKOUT_BODY_ATR", "1.6"))
-MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MIN_NEXT_RESISTANCE_PCT", "2.5"))
-MOMENTUM_MIN_NEXT_RESISTANCE_PCT = float(os.getenv("MOMENTUM_MIN_NEXT_RESISTANCE_PCT", "1.5"))
-RESISTANCE_MAX_DISTANCE_PCT = float(os.getenv("RESISTANCE_MAX_DISTANCE_PCT", "15"))
-RESISTANCE_SWING_WINDOW = int(os.getenv("RESISTANCE_SWING_WINDOW", "2"))
-RESISTANCE_CLUSTER_TOLERANCE_PCT = float(os.getenv("RESISTANCE_CLUSTER_TOLERANCE_PCT", "0.45"))
-RESISTANCE_MIN_TOUCHES = int(os.getenv("RESISTANCE_MIN_TOUCHES", "2"))
-REJECTION_LOG_ENABLED = os.getenv("REJECTION_LOG_ENABLED", "1") == "1"
-REJECTION_LOG_FILE = Path(os.getenv("REJECTION_LOG_FILE", "rejected_signals.jsonl"))
+BREAKOUT_CONFIRM_5M = ENGINE_ENV("SPOT", "BREAKOUT_CONFIRM_5M", "1") == "1"
+CONFIRM_MAX_DIP_PCT = float(ENGINE_ENV("SPOT", "CONFIRM_MAX_DIP_PCT", "0.8"))
+MIN_CONFIRM_CLOSE_LOCATION = float(ENGINE_ENV("SPOT", "MIN_CONFIRM_CLOSE_LOCATION", "0.55"))
+MAX_RSI_HARD = float(ENGINE_ENV("SPOT", "MAX_RSI_HARD", "70"))
+MAX_BREAKOUT_RANGE_ATR = float(ENGINE_ENV("SPOT", "MAX_BREAKOUT_RANGE_ATR", "2.0"))
+MAX_BREAKOUT_BODY_ATR = float(ENGINE_ENV("SPOT", "MAX_BREAKOUT_BODY_ATR", "1.6"))
+MIN_NEXT_RESISTANCE_PCT = float(ENGINE_ENV("SPOT", "MIN_NEXT_RESISTANCE_PCT", "2.5"))
+MOMENTUM_MIN_NEXT_RESISTANCE_PCT = float(ENGINE_ENV("SPOT", "MOMENTUM_MIN_NEXT_RESISTANCE_PCT", "1.5"))
+RESISTANCE_MAX_DISTANCE_PCT = float(ENGINE_ENV("SPOT", "RESISTANCE_MAX_DISTANCE_PCT", "15"))
+RESISTANCE_SWING_WINDOW = int(ENGINE_ENV("SPOT", "RESISTANCE_SWING_WINDOW", "2"))
+RESISTANCE_CLUSTER_TOLERANCE_PCT = float(ENGINE_ENV("SPOT", "RESISTANCE_CLUSTER_TOLERANCE_PCT", "0.45"))
+RESISTANCE_MIN_TOUCHES = int(ENGINE_ENV("SPOT", "RESISTANCE_MIN_TOUCHES", "2"))
+REJECTION_LOG_ENABLED = ENGINE_ENV("SPOT", "REJECTION_LOG_ENABLED", "1") == "1"
+REJECTION_LOG_FILE = Path(ENGINE_ENV("SPOT", "REJECTION_LOG_FILE", "rejected_signals.jsonl"))
 
 # فلتر سوق ذكي متعدد الفريمات V2.4
-SMART_MARKET_FILTER = os.getenv("SMART_MARKET_FILTER", "1") == "1"
-BTC_5M_DROP_BLOCK_PCT = float(os.getenv("BTC_5M_DROP_BLOCK_PCT", "0.75"))
-BTC_15M_RSI_BLOCK = float(os.getenv("BTC_15M_RSI_BLOCK", "43"))
-BTC_1H_DROP_BLOCK_PCT = float(os.getenv("BTC_1H_DROP_BLOCK_PCT", "1.2"))
-BTC_WEAK_RSI_15M = float(os.getenv("BTC_WEAK_RSI_15M", "48"))
-BTC_WEAK_RSI_5M = float(os.getenv("BTC_WEAK_RSI_5M", "45"))
-BTC_WEAK_15M_DROP_PCT = float(os.getenv("BTC_WEAK_15M_DROP_PCT", "0.35"))
-BTC_WEAK_MIN_RELATIVE_STRENGTH = float(os.getenv("BTC_WEAK_MIN_RELATIVE_STRENGTH", "1.75"))
+SMART_MARKET_FILTER = ENGINE_ENV("SPOT", "SMART_MARKET_FILTER", "1") == "1"
+BTC_5M_DROP_BLOCK_PCT = float(ENGINE_ENV("SPOT", "BTC_5M_DROP_BLOCK_PCT", "0.75"))
+BTC_15M_RSI_BLOCK = float(ENGINE_ENV("SPOT", "BTC_15M_RSI_BLOCK", "43"))
+BTC_1H_DROP_BLOCK_PCT = float(ENGINE_ENV("SPOT", "BTC_1H_DROP_BLOCK_PCT", "1.2"))
+BTC_WEAK_RSI_15M = float(ENGINE_ENV("SPOT", "BTC_WEAK_RSI_15M", "48"))
+BTC_WEAK_RSI_5M = float(ENGINE_ENV("SPOT", "BTC_WEAK_RSI_5M", "45"))
+BTC_WEAK_15M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_WEAK_15M_DROP_PCT", "0.35"))
+BTC_WEAK_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "BTC_WEAK_MIN_RELATIVE_STRENGTH", "1.75"))
 
 # مسار الارتداد الذكي بعد الهبوط
-REVERSAL_ENABLED = os.getenv("REVERSAL_ENABLED", "1") == "1"
-REVERSAL_MIN_DRAWDOWN_PCT = float(os.getenv("REVERSAL_MIN_DRAWDOWN_PCT", "3.5"))
-REVERSAL_MIN_VOLUME_15M = float(os.getenv("REVERSAL_MIN_VOLUME_15M", "1.5"))
-REVERSAL_MIN_VOLUME_5M = float(os.getenv("REVERSAL_MIN_VOLUME_5M", "1.2"))
-REVERSAL_MIN_RSI_NOW = float(os.getenv("REVERSAL_MIN_RSI_NOW", "42"))
-REVERSAL_MAX_RSI_NOW = float(os.getenv("REVERSAL_MAX_RSI_NOW", "64"))
-REVERSAL_MAX_RSI_RECENT_LOW = float(os.getenv("REVERSAL_MAX_RSI_RECENT_LOW", "40"))
-REVERSAL_MIN_ADX_15M = float(os.getenv("REVERSAL_MIN_ADX_15M", "18"))
-REVERSAL_MIN_SCORE = int(os.getenv("REVERSAL_MIN_SCORE", "84"))
-REVERSAL_MAX_RISK_PCT = float(os.getenv("REVERSAL_MAX_RISK_PCT", "4.5"))
+REVERSAL_ENABLED = ENGINE_ENV("SPOT", "REVERSAL_ENABLED", "1") == "1"
+REVERSAL_MIN_DRAWDOWN_PCT = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_DRAWDOWN_PCT", "3.5"))
+REVERSAL_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_VOLUME_15M", "1.5"))
+REVERSAL_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_VOLUME_5M", "1.2"))
+REVERSAL_MIN_RSI_NOW = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_RSI_NOW", "42"))
+REVERSAL_MAX_RSI_NOW = float(ENGINE_ENV("SPOT", "REVERSAL_MAX_RSI_NOW", "64"))
+REVERSAL_MAX_RSI_RECENT_LOW = float(ENGINE_ENV("SPOT", "REVERSAL_MAX_RSI_RECENT_LOW", "40"))
+REVERSAL_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_ADX_15M", "18"))
+REVERSAL_MIN_SCORE = int(ENGINE_ENV("SPOT", "REVERSAL_MIN_SCORE", "84"))
+REVERSAL_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "REVERSAL_MAX_RISK_PCT", "4.5"))
 
 # مسار الزخم القوي مثل SHIB
-MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
-MOMENTUM_MIN_VOLUME_15M = float(os.getenv("MOMENTUM_MIN_VOLUME_15M", "3.0"))
-MOMENTUM_MIN_VOLUME_5M = float(os.getenv("MOMENTUM_MIN_VOLUME_5M", "2.0"))
-MOMENTUM_MIN_ADX_15M = float(os.getenv("MOMENTUM_MIN_ADX_15M", "25"))
-MOMENTUM_MIN_RSI_15M = float(os.getenv("MOMENTUM_MIN_RSI_15M", "54"))
-MOMENTUM_MAX_RSI_15M = float(os.getenv("MOMENTUM_MAX_RSI_15M", "68"))
-MOMENTUM_MAX_15M_RISE = float(os.getenv("MOMENTUM_MAX_15M_RISE", "5.5"))
-MOMENTUM_MAX_1H_RISE = float(os.getenv("MOMENTUM_MAX_1H_RISE", "12"))
-MOMENTUM_MAX_EMA20_DISTANCE = float(os.getenv("MOMENTUM_MAX_EMA20_DISTANCE", "2.6"))
-MOMENTUM_MAX_GREEN = int(os.getenv("MOMENTUM_MAX_GREEN", "4"))
-MOMENTUM_MIN_SCORE = int(os.getenv("MOMENTUM_MIN_SCORE", "84"))
+MOMENTUM_ENABLED = ENGINE_ENV("SPOT", "MOMENTUM_ENABLED", "1") == "1"
+MOMENTUM_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "MOMENTUM_MIN_VOLUME_15M", "3.0"))
+MOMENTUM_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "MOMENTUM_MIN_VOLUME_5M", "2.0"))
+MOMENTUM_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "MOMENTUM_MIN_ADX_15M", "25"))
+MOMENTUM_MIN_RSI_15M = float(ENGINE_ENV("SPOT", "MOMENTUM_MIN_RSI_15M", "54"))
+MOMENTUM_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "MOMENTUM_MAX_RSI_15M", "68"))
+MOMENTUM_MAX_15M_RISE = float(ENGINE_ENV("SPOT", "MOMENTUM_MAX_15M_RISE", "5.5"))
+MOMENTUM_MAX_1H_RISE = float(ENGINE_ENV("SPOT", "MOMENTUM_MAX_1H_RISE", "12"))
+MOMENTUM_MAX_EMA20_DISTANCE = float(ENGINE_ENV("SPOT", "MOMENTUM_MAX_EMA20_DISTANCE", "2.6"))
+MOMENTUM_MAX_GREEN = int(ENGINE_ENV("SPOT", "MOMENTUM_MAX_GREEN", "4"))
+MOMENTUM_MIN_SCORE = int(ENGINE_ENV("SPOT", "MOMENTUM_MIN_SCORE", "84"))
 
 # المسار الرابع: تجميع مبكر قبل الانطلاقة
-ACCUMULATION_ENABLED = os.getenv("ACCUMULATION_ENABLED", "1") == "1"
-ACCUMULATION_LOOKBACK_15M = int(os.getenv("ACCUMULATION_LOOKBACK_15M", "16"))
-ACCUMULATION_MAX_BASE_RANGE_PCT = float(os.getenv("ACCUMULATION_MAX_BASE_RANGE_PCT", "4.2"))
-ACCUMULATION_MAX_AVG_BODY_ATR = float(os.getenv("ACCUMULATION_MAX_AVG_BODY_ATR", "0.75"))
-ACCUMULATION_MIN_HIGHER_LOW_PCT = float(os.getenv("ACCUMULATION_MIN_HIGHER_LOW_PCT", "0.10"))
-ACCUMULATION_MIN_VOLUME_BUILD = float(os.getenv("ACCUMULATION_MIN_VOLUME_BUILD", "1.12"))
-ACCUMULATION_MIN_VOLUME_15M = float(os.getenv("ACCUMULATION_MIN_VOLUME_15M", "1.25"))
-ACCUMULATION_MIN_VOLUME_5M = float(os.getenv("ACCUMULATION_MIN_VOLUME_5M", "1.10"))
-ACCUMULATION_MIN_RSI_15M = float(os.getenv("ACCUMULATION_MIN_RSI_15M", "48"))
-ACCUMULATION_MAX_RSI_15M = float(os.getenv("ACCUMULATION_MAX_RSI_15M", "67"))
-ACCUMULATION_MIN_ADX_15M = float(os.getenv("ACCUMULATION_MIN_ADX_15M", "16"))
-ACCUMULATION_MAX_15M_RISE = float(os.getenv("ACCUMULATION_MAX_15M_RISE", "2.8"))
-ACCUMULATION_MAX_1H_RISE = float(os.getenv("ACCUMULATION_MAX_1H_RISE", "6.0"))
-ACCUMULATION_MAX_EMA20_DISTANCE = float(os.getenv("ACCUMULATION_MAX_EMA20_DISTANCE", "1.35"))
-ACCUMULATION_MIN_NEXT_RESISTANCE_PCT = float(os.getenv("ACCUMULATION_MIN_NEXT_RESISTANCE_PCT", "1.2"))
-ACCUMULATION_MIN_SCORE = int(os.getenv("ACCUMULATION_MIN_SCORE", "84"))
-ACCUMULATION_MAX_RISK_PCT = float(os.getenv("ACCUMULATION_MAX_RISK_PCT", "4.0"))
+ACCUMULATION_ENABLED = ENGINE_ENV("SPOT", "ACCUMULATION_ENABLED", "1") == "1"
+ACCUMULATION_LOOKBACK_15M = int(ENGINE_ENV("SPOT", "ACCUMULATION_LOOKBACK_15M", "16"))
+ACCUMULATION_MAX_BASE_RANGE_PCT = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_BASE_RANGE_PCT", "4.2"))
+ACCUMULATION_MAX_AVG_BODY_ATR = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_AVG_BODY_ATR", "0.75"))
+ACCUMULATION_MIN_HIGHER_LOW_PCT = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_HIGHER_LOW_PCT", "0.10"))
+ACCUMULATION_MIN_VOLUME_BUILD = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_VOLUME_BUILD", "1.12"))
+ACCUMULATION_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_VOLUME_15M", "1.25"))
+ACCUMULATION_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_VOLUME_5M", "1.10"))
+ACCUMULATION_MIN_RSI_15M = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_RSI_15M", "48"))
+ACCUMULATION_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_RSI_15M", "67"))
+ACCUMULATION_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_ADX_15M", "16"))
+ACCUMULATION_MAX_15M_RISE = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_15M_RISE", "2.8"))
+ACCUMULATION_MAX_1H_RISE = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_1H_RISE", "6.0"))
+ACCUMULATION_MAX_EMA20_DISTANCE = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_EMA20_DISTANCE", "1.35"))
+ACCUMULATION_MIN_NEXT_RESISTANCE_PCT = float(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_NEXT_RESISTANCE_PCT", "1.2"))
+ACCUMULATION_MIN_SCORE = int(ENGINE_ENV("SPOT", "ACCUMULATION_MIN_SCORE", "84"))
+ACCUMULATION_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_RISK_PCT", "4.0"))
 
-MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "55"))
-TRACK_RESULTS = os.getenv("TRACK_RESULTS", "1") == "1"
+MARKET_CACHE_SECONDS = int(ENGINE_ENV("SPOT", "MARKET_CACHE_SECONDS", "55"))
+TRACK_RESULTS = ENGINE_ENV("SPOT", "TRACK_RESULTS", "1") == "1"
 STATE_FILE = Path("spot_signal_state.json")
 SESSION = requests.Session()
 SYMBOL_CACHE = {"symbols": [], "updated_at": 0.0}
 MARKET_CACHE = {"data": None, "updated_at": 0.0}
+SYMBOL_CACHE_LOCK = Lock()
+MARKET_CACHE_LOCK = Lock()
 REJECTION_LOCK = Lock()
 
 STABLE_BASES = {"USDC","FDUSD","TUSD","USDP","DAI","USD1","BUSD","USDS","EUR","AEUR","EURT","TRY","BRL","GBP","AUD","BIDR","IDRT","UAH","RUB","NGN","VAI","PAX","UST","USTC"}
@@ -226,8 +237,9 @@ def get_klines(symbol: str, interval: str, limit: int = 260) -> List[Dict]:
 
 def get_symbols() -> List[str]:
     now = time.time()
-    if SYMBOL_CACHE["symbols"] and now - float(SYMBOL_CACHE["updated_at"]) < SYMBOL_REFRESH_MINUTES * 60:
-        return list(SYMBOL_CACHE["symbols"])
+    with SYMBOL_CACHE_LOCK:
+        if SYMBOL_CACHE["symbols"] and now - float(SYMBOL_CACHE["updated_at"]) < SYMBOL_REFRESH_MINUTES * 60:
+            return list(SYMBOL_CACHE["symbols"])
     exchange = get_json("/api/v3/exchangeInfo", timeout=30)
     tickers = get_json("/api/v3/ticker/24hr", timeout=30)
     volume_map = {t.get("symbol",""): float(t.get("quoteVolume",0) or 0) for t in tickers}
@@ -239,9 +251,11 @@ def get_symbols() -> List[str]:
         qv = volume_map.get(symbol, 0.0)
         if qv >= MIN_DAILY_QUOTE_VOLUME: rows.append((symbol, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
-    SYMBOL_CACHE["symbols"] = [s for s,_ in rows]
-    SYMBOL_CACHE["updated_at"] = now
-    return list(SYMBOL_CACHE["symbols"])
+    fresh_symbols = [s for s,_ in rows]
+    with SYMBOL_CACHE_LOCK:
+        SYMBOL_CACHE["symbols"] = fresh_symbols
+        SYMBOL_CACHE["updated_at"] = now
+        return list(SYMBOL_CACHE["symbols"])
 
 
 def ema(values: List[float], period: int) -> List[Optional[float]]:
@@ -378,7 +392,9 @@ def frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
 
 def market_context() -> Dict:
     now=time.time()
-    if MARKET_CACHE["data"] and now-float(MARKET_CACHE["updated_at"])<MARKET_CACHE_SECONDS: return dict(MARKET_CACHE["data"])
+    with MARKET_CACHE_LOCK:
+        if MARKET_CACHE["data"] and now-float(MARKET_CACHE["updated_at"])<MARKET_CACHE_SECONDS:
+            return dict(MARKET_CACHE["data"])
     try:
         def snap(symbol):
             c5=get_klines(symbol,"5m",120)[:-1]; c15=get_klines(symbol,"15m",120)[:-1]
@@ -431,7 +447,8 @@ def market_context() -> Dict:
     except Exception as exc:
         print(f"Market filter error: {exc}", flush=True)
         data={"regime":"غير متاح","btc":{"rise_1h":0,"rise_4h":0,"rise_15m":0,"rsi5":50,"rsi15":50},"eth":{"rise_1h":0,"rise_4h":0},"required_score":MIN_SCORE+3,"severe_drop":False,"hard_block":False,"weak_pressure":False}
-    MARKET_CACHE["data"],MARKET_CACHE["updated_at"]=data,now
+    with MARKET_CACHE_LOCK:
+        MARKET_CACHE["data"],MARKET_CACHE["updated_at"]=data,now
     return dict(data)
 
 
@@ -724,81 +741,83 @@ from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, List, Optional, Tuple
 import requests
-SHORT_BINANCE_BASE = os.getenv('BINANCE_FUTURES_BASE', 'https://fapi.binance.com')
+SHORT_BINANCE_BASE = ENGINE_ENV("SHORT", 'BINANCE_FUTURES_BASE', 'https://fapi.binance.com')
 SHORT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 SHORT_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-SHORT_SCAN_MINUTES = int(os.getenv('SCAN_MINUTES', '1'))
-SHORT_COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '120'))
-SHORT_MAX_ALERTS_PER_SCAN = int(os.getenv('MAX_ALERTS_PER_SCAN', '5'))
-SHORT_MAX_WORKERS = int(os.getenv('MAX_WORKERS', '16'))
-SHORT_SYMBOL_REFRESH_MINUTES = int(os.getenv('SYMBOL_REFRESH_MINUTES', '30'))
-SHORT_MIN_DAILY_QUOTE_VOLUME = float(os.getenv('MIN_DAILY_QUOTE_VOLUME', '1000000'))
-SHORT_PREFILTER_LIMIT = int(os.getenv('PREFILTER_LIMIT', '80'))
-SHORT_MIN_SCORE = int(os.getenv('MIN_SCORE', '84'))
-SHORT_MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '4.0'))
-SHORT_MIN_15M_VOLUME_RATIO = float(os.getenv('MIN_15M_VOLUME_RATIO', '1.6'))
-SHORT_MAX_RSI_15M_FOR_ENTRY = float(os.getenv('MAX_RSI_15M_FOR_ENTRY', '52'))
-SHORT_MIN_RSI_15M_HARD = float(os.getenv('MIN_RSI_15M_HARD', '30'))
-SHORT_MIN_ADX_15M = float(os.getenv('MIN_ADX_15M', '22'))
-SHORT_MAX_15M_DROP_PCT = float(os.getenv('MAX_15M_DROP_PCT', '4.0'))
-SHORT_MAX_1H_DROP_PCT = float(os.getenv('MAX_1H_DROP_PCT', '9.0'))
-SHORT_MAX_4H_DROP_PCT = float(os.getenv('MAX_4H_DROP_PCT', '16.0'))
-SHORT_MAX_EMA20_DISTANCE_PCT = float(os.getenv('MAX_EMA20_DISTANCE_PCT', '2.2'))
-SHORT_MAX_CONSECUTIVE_RED = int(os.getenv('MAX_CONSECUTIVE_RED', '4'))
-SHORT_MAX_CANDLE_BODY_PCT = float(os.getenv('MAX_CANDLE_BODY_PCT', '3.5'))
-SHORT_BREAKDOWN_CONFIRM_5M = os.getenv('BREAKDOWN_CONFIRM_5M', '1') == '1'
-SHORT_CONFIRM_MAX_SPIKE_PCT = float(os.getenv('CONFIRM_MAX_SPIKE_PCT', '0.8'))
-SHORT_MIN_CONFIRM_CLOSE_LOCATION = float(os.getenv('MIN_CONFIRM_CLOSE_LOCATION', '0.45'))
-SHORT_MAX_BREAKDOWN_RANGE_ATR = float(os.getenv('MAX_BREAKDOWN_RANGE_ATR', '2.2'))
-SHORT_MAX_BREAKDOWN_BODY_ATR = float(os.getenv('MAX_BREAKDOWN_BODY_ATR', '1.8'))
-SHORT_MIN_NEXT_SUPPORT_PCT = float(os.getenv('MIN_NEXT_SUPPORT_PCT', '2.0'))
-SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT = float(os.getenv('MOMENTUM_MIN_NEXT_SUPPORT_PCT', '1.2'))
-SHORT_SUPPORT_MAX_DISTANCE_PCT = float(os.getenv('SUPPORT_MAX_DISTANCE_PCT', '18'))
-SHORT_SUPPORT_SWING_WINDOW = int(os.getenv('SUPPORT_SWING_WINDOW', '2'))
-SHORT_SUPPORT_CLUSTER_TOLERANCE_PCT = float(os.getenv('SUPPORT_CLUSTER_TOLERANCE_PCT', '0.45'))
-SHORT_SUPPORT_MIN_TOUCHES = int(os.getenv('SUPPORT_MIN_TOUCHES', '2'))
-SHORT_MOMENTUM_SHORT_ENABLED = os.getenv('MOMENTUM_SHORT_ENABLED', '1') == '1'
-SHORT_MOMENTUM_MIN_VOLUME_15M = float(os.getenv('MOMENTUM_MIN_VOLUME_15M', '2.8'))
-SHORT_MOMENTUM_MIN_VOLUME_5M = float(os.getenv('MOMENTUM_MIN_VOLUME_5M', '1.8'))
-SHORT_MOMENTUM_MIN_ADX_15M = float(os.getenv('MOMENTUM_MIN_ADX_15M', '27'))
-SHORT_MOMENTUM_MIN_RSI_15M = float(os.getenv('MOMENTUM_MIN_RSI_15M', '32'))
-SHORT_MOMENTUM_MAX_RSI_15M = float(os.getenv('MOMENTUM_MAX_RSI_15M', '49'))
-SHORT_MOMENTUM_MIN_SCORE = int(os.getenv('MOMENTUM_MIN_SCORE', '88'))
-SHORT_REJECTION_SHORT_ENABLED = os.getenv('REJECTION_SHORT_ENABLED', '1') == '1'
-SHORT_REJECTION_MIN_BOUNCE_PCT = float(os.getenv('REJECTION_MIN_BOUNCE_PCT', '2.0'))
-SHORT_REJECTION_MIN_VOLUME_15M = float(os.getenv('REJECTION_MIN_VOLUME_15M', '1.25'))
-SHORT_REJECTION_MIN_ADX_15M = float(os.getenv('REJECTION_MIN_ADX_15M', '18'))
-SHORT_REJECTION_MIN_RSI_15M = float(os.getenv('REJECTION_MIN_RSI_15M', '42'))
-SHORT_REJECTION_MAX_RSI_15M = float(os.getenv('REJECTION_MAX_RSI_15M', '60'))
-SHORT_REJECTION_MIN_SCORE = int(os.getenv('REJECTION_MIN_SCORE', '84'))
+SHORT_SCAN_MINUTES = int(ENGINE_ENV("SHORT", 'SCAN_MINUTES', '1'))
+SHORT_COOLDOWN_MINUTES = int(ENGINE_ENV("SHORT", 'COOLDOWN_MINUTES', '120'))
+SHORT_MAX_ALERTS_PER_SCAN = int(ENGINE_ENV("SHORT", 'MAX_ALERTS_PER_SCAN', '5'))
+SHORT_MAX_WORKERS = int(ENGINE_ENV("SHORT", 'MAX_WORKERS', '16'))
+SHORT_SYMBOL_REFRESH_MINUTES = int(ENGINE_ENV("SHORT", 'SYMBOL_REFRESH_MINUTES', '30'))
+SHORT_MIN_DAILY_QUOTE_VOLUME = float(ENGINE_ENV("SHORT", 'MIN_DAILY_QUOTE_VOLUME', '1000000'))
+SHORT_PREFILTER_LIMIT = int(ENGINE_ENV("SHORT", 'PREFILTER_LIMIT', '80'))
+SHORT_MIN_SCORE = int(ENGINE_ENV("SHORT", 'MIN_SCORE', '84'))
+SHORT_MAX_RISK_PCT = float(ENGINE_ENV("SHORT", 'MAX_RISK_PCT', '4.0'))
+SHORT_MIN_15M_VOLUME_RATIO = float(ENGINE_ENV("SHORT", 'MIN_15M_VOLUME_RATIO', '1.6'))
+SHORT_MAX_RSI_15M_FOR_ENTRY = float(ENGINE_ENV("SHORT", 'MAX_RSI_15M_FOR_ENTRY', '52'))
+SHORT_MIN_RSI_15M_HARD = float(ENGINE_ENV("SHORT", 'MIN_RSI_15M_HARD', '30'))
+SHORT_MIN_ADX_15M = float(ENGINE_ENV("SHORT", 'MIN_ADX_15M', '22'))
+SHORT_MAX_15M_DROP_PCT = float(ENGINE_ENV("SHORT", 'MAX_15M_DROP_PCT', '4.0'))
+SHORT_MAX_1H_DROP_PCT = float(ENGINE_ENV("SHORT", 'MAX_1H_DROP_PCT', '9.0'))
+SHORT_MAX_4H_DROP_PCT = float(ENGINE_ENV("SHORT", 'MAX_4H_DROP_PCT', '16.0'))
+SHORT_MAX_EMA20_DISTANCE_PCT = float(ENGINE_ENV("SHORT", 'MAX_EMA20_DISTANCE_PCT', '2.2'))
+SHORT_MAX_CONSECUTIVE_RED = int(ENGINE_ENV("SHORT", 'MAX_CONSECUTIVE_RED', '4'))
+SHORT_MAX_CANDLE_BODY_PCT = float(ENGINE_ENV("SHORT", 'MAX_CANDLE_BODY_PCT', '3.5'))
+SHORT_BREAKDOWN_CONFIRM_5M = ENGINE_ENV("SHORT", 'BREAKDOWN_CONFIRM_5M', '1') == '1'
+SHORT_CONFIRM_MAX_SPIKE_PCT = float(ENGINE_ENV("SHORT", 'CONFIRM_MAX_SPIKE_PCT', '0.8'))
+SHORT_MIN_CONFIRM_CLOSE_LOCATION = float(ENGINE_ENV("SHORT", 'MIN_CONFIRM_CLOSE_LOCATION', '0.45'))
+SHORT_MAX_BREAKDOWN_RANGE_ATR = float(ENGINE_ENV("SHORT", 'MAX_BREAKDOWN_RANGE_ATR', '2.2'))
+SHORT_MAX_BREAKDOWN_BODY_ATR = float(ENGINE_ENV("SHORT", 'MAX_BREAKDOWN_BODY_ATR', '1.8'))
+SHORT_MIN_NEXT_SUPPORT_PCT = float(ENGINE_ENV("SHORT", 'MIN_NEXT_SUPPORT_PCT', '2.0'))
+SHORT_MOMENTUM_MIN_NEXT_SUPPORT_PCT = float(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_NEXT_SUPPORT_PCT', '1.2'))
+SHORT_SUPPORT_MAX_DISTANCE_PCT = float(ENGINE_ENV("SHORT", 'SUPPORT_MAX_DISTANCE_PCT', '18'))
+SHORT_SUPPORT_SWING_WINDOW = int(ENGINE_ENV("SHORT", 'SUPPORT_SWING_WINDOW', '2'))
+SHORT_SUPPORT_CLUSTER_TOLERANCE_PCT = float(ENGINE_ENV("SHORT", 'SUPPORT_CLUSTER_TOLERANCE_PCT', '0.45'))
+SHORT_SUPPORT_MIN_TOUCHES = int(ENGINE_ENV("SHORT", 'SUPPORT_MIN_TOUCHES', '2'))
+SHORT_MOMENTUM_SHORT_ENABLED = ENGINE_ENV("SHORT", 'MOMENTUM_SHORT_ENABLED', '1') == '1'
+SHORT_MOMENTUM_MIN_VOLUME_15M = float(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_VOLUME_15M', '2.8'))
+SHORT_MOMENTUM_MIN_VOLUME_5M = float(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_VOLUME_5M', '1.8'))
+SHORT_MOMENTUM_MIN_ADX_15M = float(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_ADX_15M', '27'))
+SHORT_MOMENTUM_MIN_RSI_15M = float(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_RSI_15M', '32'))
+SHORT_MOMENTUM_MAX_RSI_15M = float(ENGINE_ENV("SHORT", 'MOMENTUM_MAX_RSI_15M', '49'))
+SHORT_MOMENTUM_MIN_SCORE = int(ENGINE_ENV("SHORT", 'MOMENTUM_MIN_SCORE', '88'))
+SHORT_REJECTION_SHORT_ENABLED = ENGINE_ENV("SHORT", 'REJECTION_SHORT_ENABLED', '1') == '1'
+SHORT_REJECTION_MIN_BOUNCE_PCT = float(ENGINE_ENV("SHORT", 'REJECTION_MIN_BOUNCE_PCT', '2.0'))
+SHORT_REJECTION_MIN_VOLUME_15M = float(ENGINE_ENV("SHORT", 'REJECTION_MIN_VOLUME_15M', '1.25'))
+SHORT_REJECTION_MIN_ADX_15M = float(ENGINE_ENV("SHORT", 'REJECTION_MIN_ADX_15M', '18'))
+SHORT_REJECTION_MIN_RSI_15M = float(ENGINE_ENV("SHORT", 'REJECTION_MIN_RSI_15M', '42'))
+SHORT_REJECTION_MAX_RSI_15M = float(ENGINE_ENV("SHORT", 'REJECTION_MAX_RSI_15M', '60'))
+SHORT_REJECTION_MIN_SCORE = int(ENGINE_ENV("SHORT", 'REJECTION_MIN_SCORE', '84'))
 # المحرك الخامس: انعكاس كبير من صعود إلى هبوط — شورت فقط
-SHORT_TREND_REVERSAL_ENABLED = os.getenv('TREND_REVERSAL_SHORT_ENABLED', '1') == '1'
-SHORT_TREND_REVERSAL_MIN_PRIOR_RISE_PCT = float(os.getenv('TREND_REVERSAL_MIN_PRIOR_RISE_PCT', '3.0'))
-SHORT_TREND_REVERSAL_MIN_VOLUME_15M = float(os.getenv('TREND_REVERSAL_MIN_VOLUME_15M', '1.35'))
-SHORT_TREND_REVERSAL_MIN_VOLUME_5M = float(os.getenv('TREND_REVERSAL_MIN_VOLUME_5M', '1.15'))
-SHORT_TREND_REVERSAL_MIN_ADX_15M = float(os.getenv('TREND_REVERSAL_MIN_ADX_15M', '18'))
-SHORT_TREND_REVERSAL_MIN_RSI_PEAK = float(os.getenv('TREND_REVERSAL_MIN_RSI_PEAK', '58'))
-SHORT_TREND_REVERSAL_MIN_RSI_NOW = float(os.getenv('TREND_REVERSAL_MIN_RSI_NOW', '38'))
-SHORT_TREND_REVERSAL_MAX_RSI_NOW = float(os.getenv('TREND_REVERSAL_MAX_RSI_NOW', '54'))
-SHORT_TREND_REVERSAL_MIN_SCORE = int(os.getenv('TREND_REVERSAL_MIN_SCORE', '88'))
-SHORT_TREND_REVERSAL_MAX_RISK_PCT = float(os.getenv('TREND_REVERSAL_MAX_RISK_PCT', '4.0'))
-SHORT_SMART_MARKET_FILTER = os.getenv('SMART_MARKET_FILTER', '1') == '1'
-SHORT_BTC_5M_RISE_BLOCK_PCT = float(os.getenv('BTC_5M_RISE_BLOCK_PCT', '0.75'))
-SHORT_BTC_1H_RISE_BLOCK_PCT = float(os.getenv('BTC_1H_RISE_BLOCK_PCT', '1.25'))
-SHORT_BTC_15M_RSI_BLOCK = float(os.getenv('BTC_15M_RSI_BLOCK', '60'))
-SHORT_BTC_BULLISH_RSI_15M = float(os.getenv('BTC_BULLISH_RSI_15M', '55'))
-SHORT_BTC_BULLISH_MIN_RELATIVE_WEAKNESS = float(os.getenv('BTC_BULLISH_MIN_RELATIVE_WEAKNESS', '-1.25'))
-SHORT_MARKET_CACHE_SECONDS = int(os.getenv('MARKET_CACHE_SECONDS', '55'))
-SHORT_TRACK_RESULTS = os.getenv('TRACK_RESULTS', '1') == '1'
-SHORT_REJECTION_LOG_ENABLED = os.getenv('REJECTION_LOG_ENABLED', '1') == '1'
-SHORT_REJECTION_LOG_FILE = Path(os.getenv('REJECTION_LOG_FILE', 'rejected_short_signals.jsonl'))
-SHORT_STATE_FILE = Path(os.getenv('STATE_FILE', 'short_signal_state.json'))
+SHORT_TREND_REVERSAL_ENABLED = ENGINE_ENV("SHORT", 'TREND_REVERSAL_SHORT_ENABLED', '1') == '1'
+SHORT_TREND_REVERSAL_MIN_PRIOR_RISE_PCT = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_PRIOR_RISE_PCT', '3.0'))
+SHORT_TREND_REVERSAL_MIN_VOLUME_15M = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_VOLUME_15M', '1.35'))
+SHORT_TREND_REVERSAL_MIN_VOLUME_5M = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_VOLUME_5M', '1.15'))
+SHORT_TREND_REVERSAL_MIN_ADX_15M = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_ADX_15M', '18'))
+SHORT_TREND_REVERSAL_MIN_RSI_PEAK = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_RSI_PEAK', '58'))
+SHORT_TREND_REVERSAL_MIN_RSI_NOW = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_RSI_NOW', '38'))
+SHORT_TREND_REVERSAL_MAX_RSI_NOW = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MAX_RSI_NOW', '54'))
+SHORT_TREND_REVERSAL_MIN_SCORE = int(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MIN_SCORE', '88'))
+SHORT_TREND_REVERSAL_MAX_RISK_PCT = float(ENGINE_ENV("SHORT", 'TREND_REVERSAL_MAX_RISK_PCT', '4.0'))
+SHORT_SMART_MARKET_FILTER = ENGINE_ENV("SHORT", 'SMART_MARKET_FILTER', '1') == '1'
+SHORT_BTC_5M_RISE_BLOCK_PCT = float(ENGINE_ENV("SHORT", 'BTC_5M_RISE_BLOCK_PCT', '0.75'))
+SHORT_BTC_1H_RISE_BLOCK_PCT = float(ENGINE_ENV("SHORT", 'BTC_1H_RISE_BLOCK_PCT', '1.25'))
+SHORT_BTC_15M_RSI_BLOCK = float(ENGINE_ENV("SHORT", 'BTC_15M_RSI_BLOCK', '60'))
+SHORT_BTC_BULLISH_RSI_15M = float(ENGINE_ENV("SHORT", 'BTC_BULLISH_RSI_15M', '55'))
+SHORT_BTC_BULLISH_MIN_RELATIVE_WEAKNESS = float(ENGINE_ENV("SHORT", 'BTC_BULLISH_MIN_RELATIVE_WEAKNESS', '-1.25'))
+SHORT_MARKET_CACHE_SECONDS = int(ENGINE_ENV("SHORT", 'MARKET_CACHE_SECONDS', '55'))
+SHORT_TRACK_RESULTS = ENGINE_ENV("SHORT", 'TRACK_RESULTS', '1') == '1'
+SHORT_REJECTION_LOG_ENABLED = ENGINE_ENV("SHORT", 'REJECTION_LOG_ENABLED', '1') == '1'
+SHORT_REJECTION_LOG_FILE = Path(ENGINE_ENV("SHORT", 'REJECTION_LOG_FILE', 'rejected_short_signals.jsonl'))
+SHORT_STATE_FILE = Path(ENGINE_ENV("SHORT", 'STATE_FILE', 'short_signal_state.json'))
 SHORT_SESSION = requests.Session()
 SHORT_SYMBOL_CACHE = {'symbols': [], 'updated_at': 0.0}
 SHORT_MARKET_CACHE = {'data': None, 'updated_at': 0.0}
+SHORT_SYMBOL_CACHE_LOCK = Lock()
+SHORT_MARKET_CACHE_LOCK = Lock()
 SHORT_REJECTION_LOCK = Lock()
 SHORT_STABLE_BASES = {'USDC', 'FDUSD', 'TUSD', 'USDP', 'DAI', 'USD1', 'BUSD', 'USDS', 'EUR', 'AEUR', 'EURT', 'TRY', 'BRL', 'GBP', 'AUD', 'BIDR', 'IDRT', 'UAH', 'RUB', 'NGN', 'VAI', 'PAX', 'UST', 'USTC'}
-SHORT_EXCLUDED_MAJORS = {value.strip().upper() for value in os.getenv('EXCLUDED_MAJORS', '').split(',') if value.strip()}
+SHORT_EXCLUDED_MAJORS = {value.strip().upper() for value in ENGINE_ENV("SHORT", 'EXCLUDED_MAJORS', '').split(',') if value.strip()}
 SHORT_LEVERAGED_SUFFIXES = ('UP', 'DOWN', 'BULL', 'BEAR')
 
 def SHORT_log_rejection(symbol: str, reason: str, details: Optional[Dict]=None) -> None:
@@ -916,8 +935,9 @@ def SHORT_get_klines(symbol: str, interval: str, limit: int=260) -> List[Dict]:
 
 def SHORT_get_symbols() -> List[str]:
     now = time.time()
-    if SHORT_SYMBOL_CACHE['symbols'] and now - float(SHORT_SYMBOL_CACHE['updated_at']) < SHORT_SYMBOL_REFRESH_MINUTES * 60:
-        return list(SHORT_SYMBOL_CACHE['symbols'])
+    with SHORT_SYMBOL_CACHE_LOCK:
+        if SHORT_SYMBOL_CACHE['symbols'] and now - float(SHORT_SYMBOL_CACHE['updated_at']) < SHORT_SYMBOL_REFRESH_MINUTES * 60:
+            return list(SHORT_SYMBOL_CACHE['symbols'])
     exchange = SHORT_get_json('/fapi/v1/exchangeInfo', timeout=30)
     tickers = SHORT_get_json('/fapi/v1/ticker/24hr', timeout=30)
     volume_map = {ticker.get('symbol', ''): float(ticker.get('quoteVolume', 0) or 0) for ticker in tickers}
@@ -935,9 +955,11 @@ def SHORT_get_symbols() -> List[str]:
         if quote_volume >= SHORT_MIN_DAILY_QUOTE_VOLUME:
             rows.append((symbol, quote_volume))
     rows.sort(key=lambda item: item[1], reverse=True)
-    SHORT_SYMBOL_CACHE['symbols'] = [symbol for symbol, _ in rows]
-    SHORT_SYMBOL_CACHE['updated_at'] = now
-    return list(SHORT_SYMBOL_CACHE['symbols'])
+    fresh_symbols = [symbol for symbol, _ in rows]
+    with SHORT_SYMBOL_CACHE_LOCK:
+        SHORT_SYMBOL_CACHE['symbols'] = fresh_symbols
+        SHORT_SYMBOL_CACHE['updated_at'] = now
+        return list(SHORT_SYMBOL_CACHE['symbols'])
 
 def SHORT_ema(values: List[float], period: int) -> List[Optional[float]]:
     if len(values) < period:
@@ -1144,8 +1166,9 @@ def SHORT_frame_snapshot(candles: List[Dict]) -> Optional[Dict]:
 
 def SHORT_market_context() -> Dict:
     now = time.time()
-    if SHORT_MARKET_CACHE['data'] and now - float(SHORT_MARKET_CACHE['updated_at']) < SHORT_MARKET_CACHE_SECONDS:
-        return dict(SHORT_MARKET_CACHE['data'])
+    with SHORT_MARKET_CACHE_LOCK:
+        if SHORT_MARKET_CACHE['data'] and now - float(SHORT_MARKET_CACHE['updated_at']) < SHORT_MARKET_CACHE_SECONDS:
+            return dict(SHORT_MARKET_CACHE['data'])
     try:
 
         def snapshot(symbol: str) -> Dict:
@@ -1180,8 +1203,9 @@ def SHORT_market_context() -> Dict:
     except Exception as exc:
         print(f'Market filter error: {exc}', flush=True)
         data = {'regime': 'غير متاح', 'btc': {'rise_1h': 0, 'rise_15m': 0, 'rise_5m': 0, 'rsi15': 50}, 'eth': {}, 'required_score': SHORT_MIN_SCORE + 4, 'hard_block': False, 'bullish_pressure': False}
-    SHORT_MARKET_CACHE['data'] = data
-    SHORT_MARKET_CACHE['updated_at'] = now
+    with SHORT_MARKET_CACHE_LOCK:
+        SHORT_MARKET_CACHE['data'] = data
+        SHORT_MARKET_CACHE['updated_at'] = now
     return dict(data)
 
 def SHORT_prefilter_symbol(symbol: str) -> Optional[Tuple[str, float]]:
@@ -1572,6 +1596,7 @@ STOCK_SHORT_EXCLUDE_SYMBOLS = {
     if value.strip()
 }
 STOCK_SHORT_SYMBOL_CACHE = {"symbols": [], "updated_at": 0.0}
+STOCK_SHORT_SYMBOL_CACHE_LOCK = Lock()
 STOCK_SHORT_SYMBOL_REFRESH_MINUTES = int(os.getenv("STOCK_SHORT_SYMBOL_REFRESH_MINUTES", "30"))
 STOCK_SHORT_SCAN_MINUTES = int(os.getenv("STOCK_SHORT_SCAN_MINUTES", "1"))
 STOCK_SHORT_COOLDOWN_MINUTES = int(os.getenv("STOCK_SHORT_COOLDOWN_MINUTES", "180"))
@@ -1596,17 +1621,23 @@ def STOCK_SHORT_is_equity_contract(item: Dict) -> bool:
     classification = " ".join((underlying_type, subtype_text))
     equity_words = ("STOCK", "EQUITY", "SHARE", "ADR")
     non_equity_words = ("ETF", "INDEX", "COMMODITY", "FOREX", "FX", "METAL")
-    return any(word in classification for word in equity_words) and not any(
+    metadata_match = any(word in classification for word in equity_words) and not any(
         word in classification for word in non_equity_words
     )
+    symbol = str(item.get("symbol", "")).upper()
+    base = str(item.get("baseAsset", "")).upper()
+    manual_bases = {value.removesuffix("USDT") for value in (STOCK_SHORT_SYMBOLS | STOCK_SHORT_FALLBACK_SYMBOLS)}
+    return metadata_match or symbol in STOCK_SHORT_SYMBOLS or base in manual_bases
 
 
 def STOCK_SHORT_available_symbols() -> List[str]:
     """يعيد جميع عقود الأسهم المتاحة تلقائيًا، مع دعم رموز إضافية أو مستبعدة."""
     now = time.time()
-    cached = STOCK_SHORT_SYMBOL_CACHE["symbols"]
-    if cached and now - float(STOCK_SHORT_SYMBOL_CACHE["updated_at"]) < STOCK_SHORT_SYMBOL_REFRESH_MINUTES * 60:
-        return list(cached)
+    with STOCK_SHORT_SYMBOL_CACHE_LOCK:
+        cached = list(STOCK_SHORT_SYMBOL_CACHE["symbols"])
+        updated_at = float(STOCK_SHORT_SYMBOL_CACHE["updated_at"])
+    if cached and now - updated_at < STOCK_SHORT_SYMBOL_REFRESH_MINUTES * 60:
+        return cached
     try:
         exchange = SHORT_get_json("/fapi/v1/exchangeInfo", timeout=30)
         trading_items = [
@@ -2013,8 +2044,18 @@ WHALE_FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("WHALE_FLOW_MIN_TOTAL_NOTIONAL",
 WHALE_FLOW_ABSORPTION_MOVE_PCT = float(os.getenv("WHALE_FLOW_ABSORPTION_MOVE_PCT", "0.18"))
 
 
+WHALE_FLOW_TRADES_CACHE_SECONDS = float(os.getenv("WHALE_FLOW_TRADES_CACHE_SECONDS", "12"))
+WHALE_FLOW_TRADES_CACHE: Dict[Tuple[str, bool], Dict] = {}
+WHALE_FLOW_TRADES_CACHE_LOCK = Lock()
+
 def WHALE_FLOW_get_trades(symbol: str, futures: bool = False) -> List[Dict]:
-    """يجلب أحدث الصفقات المجمعة. m=True يعني أن المشتري Maker، أي التنفيذ العدواني كان بيعًا."""
+    """يجلب aggTrades مرة واحدة ويشارك العينة بين Whale Flow وCVD."""
+    cache_key = (symbol.upper(), bool(futures))
+    now = time.time()
+    with WHALE_FLOW_TRADES_CACHE_LOCK:
+        cached = WHALE_FLOW_TRADES_CACHE.get(cache_key)
+        if cached and now - float(cached.get("updated_at", 0)) <= WHALE_FLOW_TRADES_CACHE_SECONDS:
+            return [dict(row) for row in cached.get("trades", [])]
     path = "/fapi/v1/aggTrades" if futures else "/api/v3/aggTrades"
     params = {"symbol": symbol, "limit": max(50, min(1000, WHALE_FLOW_TRADE_LIMIT))}
     if futures:
@@ -2037,6 +2078,8 @@ def WHALE_FLOW_get_trades(symbol: str, futures: bool = False) -> List[Dict]:
             })
         except (KeyError, TypeError, ValueError):
             continue
+    with WHALE_FLOW_TRADES_CACHE_LOCK:
+        WHALE_FLOW_TRADES_CACHE[cache_key] = {"updated_at": now, "trades": [dict(row) for row in rows]}
     return rows
 
 
@@ -2349,6 +2392,12 @@ def OPEN_INTEREST_snapshot(symbol: str, entry_price: float) -> Optional[Dict]:
         return None
 
 
+def _directional_relative_move(result: Dict, direction: str) -> float:
+    """Return the relative price move using the correct key for each engine."""
+    key = "relative_weakness" if direction == "short" else "relative_strength"
+    return float(result.get(key, 0) or 0)
+
+
 def CVD_OI_apply(result: Dict, direction: str, futures: bool) -> Optional[Dict]:
     if not CVD_OI_ENABLED:
         return result
@@ -2379,7 +2428,17 @@ def CVD_OI_apply(result: Dict, direction: str, futures: bool) -> Optional[Dict]:
     oi_bonus = 0
     if oi:
         change = float(oi.get("change_pct", 0))
-        price_move = float(result.get("relative_strength", 0))
+        price_move = _directional_relative_move(result, direction)
+        # حجب صارم: هبوط OI الكبير يعني غالبًا تصفية/تغطية لا بناء اتجاه جديد.
+        # كما نحجب ارتفاع OI الكبير إذا كان تحرك السعر يعاكس اتجاه الإشارة.
+        hard_oi_block = (
+            change <= -abs(OI_HARD_BLOCK_CHANGE_PCT)
+            or (direction == "short" and change >= abs(OI_HARD_BLOCK_CHANGE_PCT) and price_move >= 0)
+            or (direction == "long" and change >= abs(OI_HARD_BLOCK_CHANGE_PCT) and price_move <= 0)
+        )
+        if hard_oi_block:
+            print(f"Rejected {result.get('symbol')}: OI hard block | change={change:+.2f}% direction={direction} price_move={price_move:+.2f}%", flush=True)
+            return None
         if direction == "short":
             if change >= 1.0 and price_move < 0:
                 oi_bonus = min(OI_MAX_SCORE_BONUS, 6 if change < 3 else 8)
@@ -2711,7 +2770,7 @@ def _V11_weighted_apply(result: Dict, direction: str) -> Optional[Dict]:
     btc = {"available": False, "soft": False, "hard": False}
     if direction == "short" and BTC_REBOUND_FILTER_ENABLED:
         btc = _V11_btc_rebound_snapshot()
-        relative_weakness = float(result.get("relative_strength", 0))
+        relative_weakness = _directional_relative_move(result, direction)
         if btc.get("hard") and relative_weakness > BTC_REBOUND_HARD_REQUIRED_REL_WEAKNESS:
             SHORT_log_rejection(result.get("symbol", "?"), "رفض شورت: ارتداد BTC قوي والعملة ليست أضعف بما يكفي", {
                 "relative_weakness": round(relative_weakness, 2),
@@ -2816,6 +2875,263 @@ def SHORT_signal_message(result: Dict) -> str:
 def STOCK_SHORT_signal_message(result: Dict) -> str:
     return _V11_append_weighted(_V11_PREV_STOCK_MESSAGE(result), result)
 
+
+# ============================================================
+# V13 Probability Engine — Shadow Mode
+# طبقة احتمالية فوق جميع المحركات الحالية دون حذف أو تعطيل أي فلتر سابق.
+# في Shadow Mode يتم الحساب والعرض والتسجيل فقط، ولا تُرفض الإشارة بسببه.
+# ============================================================
+PROBABILITY_ENGINE_ENABLED = os.getenv("PROBABILITY_ENGINE_ENABLED", "1") == "1"
+PROBABILITY_SHADOW_MODE = os.getenv("PROBABILITY_SHADOW_MODE", "1") == "1"
+PROBABILITY_MIN_LONG = float(os.getenv("PROBABILITY_MIN_LONG", "75"))
+PROBABILITY_MIN_SHORT = float(os.getenv("PROBABILITY_MIN_SHORT", "75"))
+PROBABILITY_MIN_STOCK_SHORT = float(os.getenv("PROBABILITY_MIN_STOCK_SHORT", "78"))
+PROBABILITY_LOG_ENABLED = os.getenv("PROBABILITY_LOG_ENABLED", "1") == "1"
+PROBABILITY_LOG_FILE = Path(os.getenv("PROBABILITY_LOG_FILE", "probability_shadow_signals.jsonl"))
+PROBABILITY_LOG_LOCK = Lock()
+
+
+def _PROB_clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _PROB_component(result: Dict, key: str, default: float = 50.0) -> float:
+    weighted = result.get("weighted_confidence", {})
+    value = weighted.get(key, default)
+    try:
+        return _PROB_clamp(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def PROBABILITY_estimate(result: Dict, direction: str, engine: str) -> Dict:
+    """
+    تقدير احتمالي تجريبي مبني على المعلومات الموجودة فعليًا في الإشارة.
+    لا يدّعي أنه احتمال مُعاير إحصائيًا قبل جمع نتائج كافية؛ لذلك يبدأ Shadow Mode.
+    """
+    weighted = result.get("weighted_confidence", {})
+    technical = _PROB_component(result, "technical", float(result.get("score", 50)))
+    trend = _PROB_component(result, "trend", technical)
+    volume = _PROB_component(result, "volume", 50)
+    orderflow = _PROB_component(result, "orderflow", 50)
+    liquidity = _PROB_component(result, "liquidity", 50)
+    oi_score = _PROB_component(result, "open_interest", 50)
+    market = _PROB_component(result, "market", 50)
+
+    flow = result.get("whale_flow", {})
+    cvd = result.get("cvd", {})
+    oi = result.get("open_interest", {})
+    liq = result.get("liquidity", {})
+
+    sign = 1.0 if direction == "long" else -1.0
+    delta = float(flow.get("delta_pct", 0) or 0) if flow.get("available") else 0.0
+    whale_delta = float(flow.get("whale_delta_pct", 0) or 0) if flow.get("available") else 0.0
+    cvd_all = float(cvd.get("cvd_pct", 0) or 0) if cvd.get("available") else delta
+    cvd_recent = float(cvd.get("recent_cvd_pct", 0) or 0) if cvd.get("available") else cvd_all
+    oi_change = float(oi.get("change_pct", 0) or 0) if oi.get("available") else 0.0
+    bid_ask_ratio = float(liq.get("bid_ask_ratio", 1) or 1) if liq.get("available") else 1.0
+
+    # سرعة/اتجاه الحركة النسبية الحالية.
+    relative_move = _directional_relative_move(result, direction)
+    direction_move = relative_move if direction == "long" else -relative_move
+    momentum_score = _PROB_clamp(50 + direction_move * 7.5)
+
+    # توافق الميكروستركشر مع اتجاه الصفقة.
+    aligned_flow = sign * (
+        0.38 * delta +
+        0.17 * whale_delta +
+        0.28 * cvd_all +
+        0.17 * cvd_recent
+    )
+    flow_score = _PROB_clamp(50 + aligned_flow * 170)
+
+    # دفتر الأوامر: النسبة الأعلى تدعم LONG والأقل تدعم SHORT.
+    book_edge = (bid_ask_ratio - 1.0) if direction == "long" else (1.0 - bid_ask_ratio)
+    book_score = _PROB_clamp(50 + book_edge * 65)
+
+    # OI المرتفع مع حركة متوافقة يرفع جودة الاستمرار، بينما انخفاضه يعطي ثقة أقل.
+    oi_directional = _PROB_clamp(52 + oi_change * 9)
+    if not oi.get("available"):
+        oi_directional = 50.0
+
+    # النموذج يبدأ كتجميع احتمالي محافظ، ثم تتم معايرته لاحقًا من النتائج الفعلية.
+    raw = (
+        technical * 0.24 +
+        trend * 0.13 +
+        volume * 0.09 +
+        momentum_score * 0.10 +
+        orderflow * 0.11 +
+        flow_score * 0.11 +
+        liquidity * 0.07 +
+        book_score * 0.05 +
+        oi_score * 0.04 +
+        oi_directional * 0.03 +
+        market * 0.03
+    )
+
+    contradictions = list(weighted.get("contradictions", []))
+    penalty = min(15.0, len(contradictions) * 3.0)
+    raw -= penalty
+
+    # ضغط القيم المتطرفة لأن النسخة الأولى ليست معايرة بعد.
+    probability = 50 + (raw - 50) * 0.82
+    probability = int(round(_PROB_clamp(probability, 5, 95)))
+
+    threshold = (
+        PROBABILITY_MIN_STOCK_SHORT
+        if engine == "stock_short"
+        else PROBABILITY_MIN_SHORT
+        if direction == "short"
+        else PROBABILITY_MIN_LONG
+    )
+
+    evidence = {
+        "technical": round(technical, 1),
+        "trend": round(trend, 1),
+        "volume": round(volume, 1),
+        "momentum": round(momentum_score, 1),
+        "orderflow": round(orderflow, 1),
+        "flow_alignment": round(flow_score, 1),
+        "liquidity": round(liquidity, 1),
+        "orderbook": round(book_score, 1),
+        "open_interest": round(oi_directional, 1),
+        "market": round(market, 1),
+    }
+    strongest = sorted(evidence.items(), key=lambda item: item[1], reverse=True)[:3]
+    weakest = sorted(evidence.items(), key=lambda item: item[1])[:2]
+
+    return {
+        "enabled": True,
+        "shadow_mode": PROBABILITY_SHADOW_MODE,
+        "engine": engine,
+        "direction": direction,
+        "probability": probability,
+        "threshold": threshold,
+        "would_pass": probability >= threshold,
+        "raw_score": round(raw, 2),
+        "penalty": round(penalty, 1),
+        "strongest": strongest,
+        "weakest": weakest,
+        "components": evidence,
+        "calibration_status": "shadow_un calibrated".replace(" ", ""),
+    }
+
+
+def PROBABILITY_log(result: Dict) -> None:
+    if not PROBABILITY_LOG_ENABLED:
+        return
+    data = result.get("probability_engine")
+    if not data:
+        return
+    row = {
+        "time": int(time.time() * 1000),
+        "symbol": result.get("symbol"),
+        "entry": result.get("entry"),
+        "score": result.get("score"),
+        "mode": result.get("mode"),
+        "probability_engine": data,
+    }
+    try:
+        with PROBABILITY_LOG_LOCK:
+            with PROBABILITY_LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"Probability log error: {exc}", flush=True)
+
+
+def PROBABILITY_apply(result: Optional[Dict], direction: str, engine: str) -> Optional[Dict]:
+    if not result or not PROBABILITY_ENGINE_ENABLED:
+        return result
+    enriched = dict(result)
+    data = PROBABILITY_estimate(enriched, direction, engine)
+    enriched["probability_engine"] = data
+    PROBABILITY_log(enriched)
+
+    # الوضع الافتراضي Shadow: لا يمنع أي إشارة حالية.
+    if PROBABILITY_SHADOW_MODE:
+        return enriched
+
+    # عند تعطيل Shadow Mode فقط يصبح فلترًا فعليًا.
+    if not data.get("would_pass", False):
+        log_fn = SHORT_log_rejection if direction == "short" else log_rejection
+        log_fn(
+            enriched.get("symbol", "?"),
+            "رفض بواسطة Probability Engine",
+            {
+                "probability": data.get("probability"),
+                "required": data.get("threshold"),
+                "engine": engine,
+            },
+        )
+        return None
+    return enriched
+
+
+def PROBABILITY_message_section(result: Dict) -> str:
+    data = result.get("probability_engine", {})
+    if not data:
+        return ""
+    state = "يمر لاحقًا" if data.get("would_pass") else "أقل من الحد التجريبي"
+    mode = "Shadow — لا يمنع الإشارة" if data.get("shadow_mode") else "فلتر فعلي"
+    strongest = "، ".join(f"{name} {value:.0f}" for name, value in data.get("strongest", []))
+    weakest = "، ".join(f"{name} {value:.0f}" for name, value in data.get("weakest", []))
+    return (
+        "\n\n🧠 Probability Engine V13\n"
+        f"الاحتمال التقديري: {int(data.get('probability', 0))}% "
+        f"| الحد: {float(data.get('threshold', 0)):.0f}% | {state}\n"
+        f"الوضع: {mode}\n"
+        f"أقوى العوامل: {strongest or 'غير متاح'}\n"
+        f"أضعف العوامل: {weakest or 'غير متاح'}\n"
+        "ملاحظة: النسبة تجريبية وتحتاج معايرة بنتائج الصفقات الفعلية."
+    )
+
+
+# تغليف V13 فوق جميع الطبقات السابقة بدون حذف أي منطق.
+_V13_PREV_LONG_ANALYZE = analyze_symbol
+_V13_PREV_SHORT_ANALYZE = SHORT_analyze_symbol
+_V13_PREV_STOCK_ANALYZE = STOCK_SHORT_analyze_symbol
+_V13_PREV_LONG_MESSAGE = signal_message
+_V13_PREV_SHORT_MESSAGE = SHORT_signal_message
+_V13_PREV_STOCK_MESSAGE = STOCK_SHORT_signal_message
+
+
+def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    return PROBABILITY_apply(_V13_PREV_LONG_ANALYZE(symbol, market), "long", "spot")
+
+
+def SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    return PROBABILITY_apply(_V13_PREV_SHORT_ANALYZE(symbol, market), "short", "crypto_short")
+
+
+def STOCK_SHORT_analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
+    # يستدعي محرك الأسهم السابق، ثم نعيد توصيف الاحتمال كـ stock_short.
+    result = _V13_PREV_STOCK_ANALYZE(symbol, market)
+    if not result:
+        return None
+    enriched = dict(result)
+    enriched.pop("probability_engine", None)
+    return PROBABILITY_apply(enriched, "short", "stock_short")
+
+
+def _V13_append_probability(base: str, result: Dict) -> str:
+    section = PROBABILITY_message_section(result)
+    marker = "\n\n⚠️"
+    return base.replace(marker, section + marker, 1) if marker in base else base + section
+
+
+def signal_message(result: Dict) -> str:
+    return _V13_append_probability(_V13_PREV_LONG_MESSAGE(result), result)
+
+
+def SHORT_signal_message(result: Dict) -> str:
+    return _V13_append_probability(_V13_PREV_SHORT_MESSAGE(result), result)
+
+
+def STOCK_SHORT_signal_message(result: Dict) -> str:
+    return _V13_append_probability(_V13_PREV_STOCK_MESSAGE(result), result)
+
+
+
 # ============================================================
 # التشغيل الموحّد: شراء سبوت V2.4 + شورت Futures V1.0
 # إشارات تيليجرام فقط، ولا يوجد تنفيذ أوامر تداول.
@@ -2845,18 +3161,36 @@ def run_stock_short_bot() -> None:
         raise
 
 def combined_main() -> None:
-    threads = [
-        threading.Thread(target=run_long_bot, name="long-spot-signals", daemon=False),
-        threading.Thread(target=run_short_bot, name="short-futures-signals", daemon=False),
-        threading.Thread(target=run_stock_short_bot, name="stock-short-futures-signals", daemon=False),
-    ]
-    for thread in threads:
+    workers = {
+        "long-spot-signals": run_long_bot,
+        "short-futures-signals": run_short_bot,
+        "stock-short-futures-signals": run_stock_short_bot,
+    }
+    threads: Dict[str, threading.Thread] = {}
+    restart_counts: Dict[str, int] = {name: 0 for name in workers}
+
+    def start_worker(name: str) -> None:
+        thread = threading.Thread(target=workers[name], name=name, daemon=True)
+        threads[name] = thread
         thread.start()
-    while True:
-        for thread in threads:
-            if not thread.is_alive():
-                raise RuntimeError(f"Bot thread stopped unexpectedly: {thread.name}")
-        time.sleep(5)
+        print(f"Supervisor started: {name}", flush=True)
+
+    for worker_name in workers:
+        start_worker(worker_name)
+
+    try:
+        while True:
+            for name, thread in list(threads.items()):
+                if thread.is_alive():
+                    continue
+                restart_counts[name] += 1
+                delay = min(60, 5 * restart_counts[name])
+                print(f"Supervisor: {name} stopped; restarting in {delay}s", flush=True)
+                time.sleep(delay)
+                start_worker(name)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("Supervisor shutdown requested.", flush=True)
 
 if __name__ == "__main__":
     combined_main()
