@@ -663,10 +663,43 @@ def fmt(v: float) -> str:
 
 
 def signal_message(r: Dict) -> str:
-    reasons="\n".join(f"• {x}" for x in r["reasons"]); kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
-    return f"🟢 إشارة شراء سبوت — {r['symbol']}\n\nالنموذج: {r['setup']}\nنوع الإشارة: {kind}\nقوة الإشارة: {r['score']}%\nالفريمات: 4h فلتر، 1h تأكيد، 15m قرار، 5m دخول\nحالة السوق: {r['market_regime']} | BTC 15m: {r['btc_15m']:+.2f}% | RSI BTC: {r['btc_rsi15']:.1f}\nBTC ساعة: {r['btc_1h']:+.2f}% | القوة النسبية أمام BTC: {r['relative_strength']:+.2f}%\n\nسعر الشراء التقريبي: {fmt(r['entry'])}\nوقف الخسارة: {fmt(r['stop'])} ({r['risk_pct']:.2f}%)\nالهدف الأول: {fmt(r['tp1'])}\nالهدف الثاني: {fmt(r['tp2'])}\nالهدف الثالث: {fmt(r['tp3'])}\n\nRSI: {r['rsi']:.1f}\nADX: {r['adx']:.1f}\nالحجم: ×{r['volume_ratio']:.1f}\n\nأسباب الإشارة:\n{reasons}\n\n⚠️ تحليل فني آلي وليس ضمانًا للربح."
+    reasons="\n".join(f"• {x}" for x in r["reasons"])
+    kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    return f"""🟢 إشارة شراء سبوت — {r['symbol']}
 
+📈 التحليل متعدد الفريمات
+• 4H: فلتر الاتجاه العام
+• 1H: تأكيد الاتجاه
+• 15M: اتخاذ القرار
+• 5M: توقيت الدخول
 
+النموذج: {r['setup']}
+نوع الإشارة: {kind}
+قوة الإشارة: {r['score']}%
+
+🌍 حالة السوق
+• السوق: {r['market_regime']}
+• BTC 1H: {r['btc_1h']:+.2f}%
+• BTC 15M: {r['btc_15m']:+.2f}%
+• RSI BTC: {r['btc_rsi15']:.1f}
+• القوة النسبية: {r['relative_strength']:+.2f}%
+
+🎯 مستويات الصفقة
+• دخول: {fmt(r['entry'])}
+• وقف: {fmt(r['stop'])} ({r['risk_pct']:.2f}%)
+• TP1: {fmt(r['tp1'])}
+• TP2: {fmt(r['tp2'])}
+• TP3: {fmt(r['tp3'])}
+
+📊 المؤشرات
+• RSI: {r['rsi']:.1f}
+• ADX: {r['adx']:.1f}
+• الحجم: ×{r['volume_ratio']:.1f}
+
+✅ أسباب الإشارة
+{reasons}
+
+⚠️ تحليل فني آلي وليس ضمانًا للربح."""
 def load_state():
     try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception: return {"alerts":{}}
