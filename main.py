@@ -143,6 +143,8 @@ PULLBACK_MAX_EMA20_DISTANCE_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MAX_EMA20_D
 PULLBACK_MIN_SCORE = int(ENGINE_ENV("SPOT", "PULLBACK_MIN_SCORE", "84"))
 PULLBACK_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MAX_RISK_PCT", "4.0"))
 PULLBACK_MIN_NEXT_RESISTANCE_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MIN_NEXT_RESISTANCE_PCT", "1.5"))
+PULLBACK_A_PLUS_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "PULLBACK_A_PLUS_MIN_VOLUME_15M", "1.20"))
+PULLBACK_A_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "PULLBACK_A_MIN_VOLUME_15M", "0.90"))
 
 # تأثير MTF المتدرج في V18
 MTF_STRONG_BONUS = int(ENGINE_ENV("SPOT", "MTF_STRONG_BONUS", "8"))
@@ -549,8 +551,14 @@ def detect_launch_mode(
     )
 
 
-def signal_quality(score: int, mtf_score: float, mode: str, launch_mode: bool) -> Tuple[str, str]:
-    """يعيد تصنيف الجودة وعدد النجوم بدون تغيير قرار الدخول."""
+def signal_quality(
+    score: int,
+    mtf_score: float,
+    mode: str,
+    launch_mode: bool,
+    volume_ratio_15m: float,
+) -> Tuple[str, str]:
+    """يعيد تصنيف الجودة، مع منع تضخيم جودة Pullback عند ضعف حجم 15m."""
     quality_points = int(score)
     if mtf_score >= 72:
         quality_points += 2
@@ -560,12 +568,21 @@ def signal_quality(score: int, mtf_score: float, mode: str, launch_mode: bool) -
         quality_points += 1
 
     if quality_points >= 97:
-        return "A+", "⭐⭐⭐⭐⭐"
-    if quality_points >= 91:
-        return "A", "⭐⭐⭐⭐"
-    if quality_points >= 85:
-        return "B", "⭐⭐⭐"
-    return "C", "⭐⭐"
+        quality, stars = "A+", "⭐⭐⭐⭐⭐"
+    elif quality_points >= 91:
+        quality, stars = "A", "⭐⭐⭐⭐"
+    elif quality_points >= 85:
+        quality, stars = "B", "⭐⭐⭐"
+    else:
+        quality, stars = "C", "⭐⭐"
+
+    if mode == "pullback":
+        if volume_ratio_15m < PULLBACK_A_MIN_VOLUME_15M:
+            return "B", "⭐⭐⭐"
+        if volume_ratio_15m < PULLBACK_A_PLUS_MIN_VOLUME_15M and quality == "A+":
+            return "A", "⭐⭐⭐⭐"
+
+    return quality, stars
 
 
 def market_context() -> Dict:
@@ -899,6 +916,10 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 f"ADX 15m {a15:.0f}",
                 "MACD بدأ ينعطف صعودًا",
             ]
+            if vr15 < PULLBACK_A_MIN_VOLUME_15M:
+                reasons.append(f"تنبيه: حجم 15m ضعيف ×{vr15:.1f} — تم خفض الجودة")
+            elif vr15 < PULLBACK_A_PLUS_MIN_VOLUME_15M:
+                reasons.append(f"حجم 15m متوسط ×{vr15:.1f} — لا يسمح بتصنيف A+")
             if obv5[-1] > obv5[-5]: score += 6
             if rel >= 0.25: score += 5
             if market.get("regime") in ("إيجابي", "محايد"): score += 4
@@ -978,7 +999,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         )
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
-        quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode)
+        quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15)
         return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
@@ -1088,7 +1109,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V18 Pullback Quality.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V18 Pullback Quality.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
