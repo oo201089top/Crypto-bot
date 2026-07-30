@@ -119,6 +119,19 @@ MTF_NEW_COIN_WEEKLY_BARS = int(ENGINE_ENV("SPOT", "MTF_NEW_COIN_WEEKLY_BARS", "6
 MTF_NEW_COIN_DAILY_BARS = int(ENGINE_ENV("SPOT", "MTF_NEW_COIN_DAILY_BARS", "120"))
 HOT_RSI_15M = float(ENGINE_ENV("SPOT", "HOT_RSI_15M", "75"))
 HOT_RSI_MAX_BODY_ATR = float(ENGINE_ENV("SPOT", "HOT_RSI_MAX_BODY_ATR", "1.15"))
+
+# وضع الانطلاقة المبكرة V17
+LAUNCH_MODE_ENABLED = ENGINE_ENV("SPOT", "LAUNCH_MODE_ENABLED", "1") == "1"
+LAUNCH_MIN_15M_SCORE = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_15M_SCORE", "90"))
+LAUNCH_MIN_5M_SCORE = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_5M_SCORE", "95"))
+LAUNCH_MIN_1H_SCORE = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_1H_SCORE", "75"))
+LAUNCH_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_VOLUME_15M", "2.0"))
+LAUNCH_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_ADX_15M", "22"))
+LAUNCH_MIN_RSI_15M = float(ENGINE_ENV("SPOT", "LAUNCH_MIN_RSI_15M", "55"))
+LAUNCH_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "LAUNCH_MAX_RSI_15M", "72"))
+LAUNCH_SCORE_BONUS = int(ENGINE_ENV("SPOT", "LAUNCH_SCORE_BONUS", "4"))
+LAUNCH_THRESHOLD_RELIEF = int(ENGINE_ENV("SPOT", "LAUNCH_THRESHOLD_RELIEF", "2"))
+LAUNCH_MTF_WEIGHTS = {"1w": 3, "1d": 7, "4h": 15, "1h": 30, "15m": 35, "5m": 10}
 STATE_FILE = Path("spot_signal_state.json")
 SESSION = requests.Session()
 _retry=Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504], allowed_methods=frozenset(["GET","POST"]))
@@ -467,13 +480,14 @@ def frame_trend_score(snapshot: Dict) -> float:
     return max(0.0, min(100.0, score))
 
 
-def multi_timeframe_alignment(frames: Dict[str, Optional[Dict]]) -> Dict:
+def multi_timeframe_alignment(frames: Dict[str, Optional[Dict]], base_weights: Optional[Dict[str, float]] = None) -> Dict:
     """يعيد توزيع الأوزان تلقائيًا على الفريمات المتوفرة فقط."""
     available = {k: v for k, v in frames.items() if v is not None}
     if not available:
         return {"score": 50.0, "adjustment": 0, "label": "غير متاح", "frames": {}, "weights": {}}
 
-    raw_weights = {k: MTF_WEIGHTS[k] for k in available}
+    source_weights = base_weights or MTF_WEIGHTS
+    raw_weights = {k: source_weights[k] for k in available if k in source_weights}
     total = sum(raw_weights.values())
     weights = {k: raw_weights[k] * 100.0 / total for k in raw_weights}
     scores = {k: frame_trend_score(v) for k, v in available.items()}
@@ -487,6 +501,29 @@ def multi_timeframe_alignment(frames: Dict[str, Optional[Dict]]) -> Dict:
         "frames": {k: round(v, 1) for k, v in scores.items()},
         "weights": {k: round(v, 1) for k, v in weights.items()},
     }
+
+
+def detect_launch_mode(
+    mtf_frames: Dict[str, float],
+    volume_ratio_15m: float,
+    adx_15m: float,
+    rsi_15m: float,
+    breakout: bool,
+    squeeze_break: bool,
+    early_break: bool,
+) -> bool:
+    """يكتشف بداية انطلاقة حقيقية دون تجاوز فلاتر السوق أو المطاردة."""
+    if not LAUNCH_MODE_ENABLED:
+        return False
+    return bool(
+        mtf_frames.get("15m", 0) >= LAUNCH_MIN_15M_SCORE
+        and mtf_frames.get("5m", 0) >= LAUNCH_MIN_5M_SCORE
+        and mtf_frames.get("1h", 0) >= LAUNCH_MIN_1H_SCORE
+        and volume_ratio_15m >= LAUNCH_MIN_VOLUME_15M
+        and adx_15m >= LAUNCH_MIN_ADX_15M
+        and LAUNCH_MIN_RSI_15M <= rsi_15m <= LAUNCH_MAX_RSI_15M
+        and (breakout or squeeze_break or early_break)
+    )
 
 
 def market_context() -> Dict:
@@ -616,6 +653,17 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         mtf_frames_input = {"1w": s1w, "1d": s1d, "4h": s4, "1h": s1, "15m": s15, "5m": s5}
         mtf = multi_timeframe_alignment(mtf_frames_input) if MTF_ENABLED else {"score":50.0,"adjustment":0,"label":"معطل","frames":{},"weights":{}}
 
+        accumulation_info = accumulation_base(closed15, ACCUMULATION_LOOKBACK_15M) if ACCUMULATION_ENABLED else None
+        early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
+        early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
+
+        launch_mode = detect_launch_mode(
+            mtf.get("frames", {}), vr15, a15, r15,
+            breakout, squeeze_break, early_break
+        )
+        if launch_mode and MTF_ENABLED:
+            mtf = multi_timeframe_alignment(mtf_frames_input, LAUNCH_MTF_WEIGHTS)
+
         # حماية من مطاردة شمعة اندفاع: RSI مرتفع يُسمح به فقط مع إعادة اختبار/تهدئة.
         hot_rsi = r15 >= HOT_RSI_15M
         calm_candle = atr15 > 0 and breakout_body <= HOT_RSI_MAX_BODY_ATR * atr15 and close_location(candle15) < 0.80
@@ -660,9 +708,6 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
 
-        accumulation_info = accumulation_base(closed15, ACCUMULATION_LOOKBACK_15M) if ACCUMULATION_ENABLED else None
-        early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
-        early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
         accumulation = bool(
             ACCUMULATION_ENABLED and accumulation_info
             and accumulation_info["compressed"] and accumulation_info["higher_lows"] and accumulation_info["building_volume"]
@@ -805,12 +850,18 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         score += int(mtf["adjustment"])
         reasons.append(f"توافق الفريمات {mtf['label']} ({mtf['score']:.0f}/100، تعديل {mtf['adjustment']:+d})")
+        if launch_mode:
+            score += LAUNCH_SCORE_BONUS
+            threshold = max(MIN_SCORE, threshold - LAUNCH_THRESHOLD_RELIEF)
+            reasons.append(
+                f"وضع الانطلاقة المبكرة: توافق 1H/15M/5M مع حجم ×{vr15:.1f} وADX {a15:.0f}"
+            )
         if score < threshold:
             return None
         risk=price-stop
         max_risk = ACCUMULATION_MAX_RISK_PCT if mode=="accumulation" else REVERSAL_MAX_RISK_PCT if mode=="reversal" else MAX_RISK_PCT
         if risk<=0 or risk/price*100>max_risk: return None
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{})}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -834,6 +885,7 @@ def signal_message(r: Dict) -> str:
 • 5M: {r.get('mtf_frames',{}).get('5m',50):.0f}/100 — وزن {r.get('mtf_weights',{}).get('5m',0):.0f}%
 • التوافق العام: {r.get('mtf_score',50):.1f}/100 — {r.get('mtf_label','محايد')}
 • تعديل التقييم: {r.get('mtf_adjustment',0):+d}
+• وضع الانطلاقة: {'مفعل 🚀' if r.get('launch_mode') else 'غير مفعل'}
 
 النموذج: {r['setup']}
 نوع الإشارة: {kind}
@@ -917,7 +969,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V16 Dynamic MTF.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V17 Launch Mode.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
