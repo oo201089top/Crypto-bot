@@ -132,6 +132,22 @@ LAUNCH_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "LAUNCH_MAX_RSI_15M", "72"))
 LAUNCH_SCORE_BONUS = int(ENGINE_ENV("SPOT", "LAUNCH_SCORE_BONUS", "4"))
 LAUNCH_THRESHOLD_RELIEF = int(ENGINE_ENV("SPOT", "LAUNCH_THRESHOLD_RELIEF", "2"))
 LAUNCH_MTF_WEIGHTS = {"1w": 3, "1d": 7, "4h": 15, "1h": 30, "15m": 35, "5m": 10}
+
+# V18: المسار الخامس Trend Pullback + تصنيف جودة الإشارة
+PULLBACK_ENABLED = ENGINE_ENV("SPOT", "PULLBACK_ENABLED", "1") == "1"
+PULLBACK_MIN_RSI_15M = float(ENGINE_ENV("SPOT", "PULLBACK_MIN_RSI_15M", "38"))
+PULLBACK_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "PULLBACK_MAX_RSI_15M", "56"))
+PULLBACK_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "PULLBACK_MIN_ADX_15M", "18"))
+PULLBACK_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "PULLBACK_MIN_VOLUME_5M", "1.15"))
+PULLBACK_MAX_EMA20_DISTANCE_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MAX_EMA20_DISTANCE_PCT", "1.10"))
+PULLBACK_MIN_SCORE = int(ENGINE_ENV("SPOT", "PULLBACK_MIN_SCORE", "84"))
+PULLBACK_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MAX_RISK_PCT", "4.0"))
+PULLBACK_MIN_NEXT_RESISTANCE_PCT = float(ENGINE_ENV("SPOT", "PULLBACK_MIN_NEXT_RESISTANCE_PCT", "1.5"))
+
+# تأثير MTF المتدرج في V18
+MTF_STRONG_BONUS = int(ENGINE_ENV("SPOT", "MTF_STRONG_BONUS", "8"))
+MTF_GOOD_BONUS = int(ENGINE_ENV("SPOT", "MTF_GOOD_BONUS", "5"))
+MTF_WEAK_PENALTY = int(ENGINE_ENV("SPOT", "MTF_WEAK_PENALTY", "-6"))
 STATE_FILE = Path("spot_signal_state.json")
 SESSION = requests.Session()
 _retry=Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504], allowed_methods=frozenset(["GET","POST"]))
@@ -492,7 +508,14 @@ def multi_timeframe_alignment(frames: Dict[str, Optional[Dict]], base_weights: O
     weights = {k: raw_weights[k] * 100.0 / total for k in raw_weights}
     scores = {k: frame_trend_score(v) for k, v in available.items()}
     weighted = sum(scores[k] * weights[k] for k in scores) / 100.0
-    adjustment = round((weighted - 50.0) * MTF_SCORE_IMPACT)
+    if weighted >= 72:
+        adjustment = MTF_STRONG_BONUS
+    elif weighted >= 60:
+        adjustment = MTF_GOOD_BONUS
+    elif weighted >= 45:
+        adjustment = 0
+    else:
+        adjustment = MTF_WEAK_PENALTY
     label = "متوافق بقوة" if weighted >= 72 else "متوافق" if weighted >= 60 else "محايد" if weighted >= 45 else "ضعيف" if weighted >= 32 else "هابط بقوة"
     return {
         "score": round(weighted, 1),
@@ -524,6 +547,25 @@ def detect_launch_mode(
         and LAUNCH_MIN_RSI_15M <= rsi_15m <= LAUNCH_MAX_RSI_15M
         and (breakout or squeeze_break or early_break)
     )
+
+
+def signal_quality(score: int, mtf_score: float, mode: str, launch_mode: bool) -> Tuple[str, str]:
+    """يعيد تصنيف الجودة وعدد النجوم بدون تغيير قرار الدخول."""
+    quality_points = int(score)
+    if mtf_score >= 72:
+        quality_points += 2
+    if launch_mode:
+        quality_points += 2
+    if mode in ("momentum", "accumulation", "pullback"):
+        quality_points += 1
+
+    if quality_points >= 97:
+        return "A+", "⭐⭐⭐⭐⭐"
+    if quality_points >= 91:
+        return "A", "⭐⭐⭐⭐"
+    if quality_points >= 85:
+        return "B", "⭐⭐⭐"
+    return "C", "⭐⭐"
 
 
 def market_context() -> Dict:
@@ -607,6 +649,10 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
                 score += 24
                 if base["building_volume"]: score += 14
                 if closes[-1] >= base["resistance"] * 0.995: score += 12
+        # لا نهمل التصحيح الهادئ قرب EMA20 إذا بدأ ارتداد 5m.
+        if PULLBACK_ENABLED and e20 and e20 * 0.985 <= closes[-1] <= e20 * 1.012:
+            if rv[-1] is not None and rv[-2] is not None and rv[-1] >= rv[-2]:
+                score += 28
         if e20 and closes[-1]<e20*0.985: score-=20
         return symbol,score
     except Exception as exc:
@@ -711,6 +757,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         accumulation = bool(
             ACCUMULATION_ENABLED and accumulation_info
             and accumulation_info["compressed"] and accumulation_info["higher_lows"] and accumulation_info["building_volume"]
+            and vols15[-1] >= mean(vols15[-4:-1]) * 0.90
             and early_break
             and vr15 >= ACCUMULATION_MIN_VOLUME_15M and vr5 >= ACCUMULATION_MIN_VOLUME_5M
             and ACCUMULATION_MIN_RSI_15M <= r15 <= ACCUMULATION_MAX_RSI_15M
@@ -720,6 +767,45 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and dist <= ACCUMULATION_MAX_EMA20_DISTANCE
             and not s1["strongly_bearish"] and not s4["strongly_bearish"]
             and not market.get("severe_drop", False) and not market.get("hard_block", False)
+        )
+
+
+        # المسار الخامس V18: Trend Pullback بعد تصحيح صحي داخل اتجاه صاعد.
+        recent_pullback_window = closed15[-8:-1]
+        recent_pullback_low = min(c["low"] for c in recent_pullback_window)
+        touched_ema20 = recent_pullback_low <= e20_15 * 1.010
+        held_ema50 = min(c["close"] for c in recent_pullback_window) >= e50_15 * 0.992
+        bullish_1h = bool(
+            s1.get("e50") is not None
+            and s1["price"] > s1["e20"] > s1["e50"]
+            and s1["macd_hist"] >= 0
+        )
+        bullish_4h = bool(
+            s4.get("e50") is not None
+            and s4["price"] > s4["e20"] > s4["e50"]
+            and not s4["strongly_bearish"]
+        )
+        green_reclaim = bool(
+            candle15["close"] > candle15["open"]
+            and candle15["close"] > e20_15
+            and close_location(candle15) >= 0.55
+        )
+        volume_rebound = bool(
+            vr5 >= PULLBACK_MIN_VOLUME_5M
+            and vols5[-1] >= mean(vols5[-6:-1])
+        )
+        _, _, previous_h15 = macd(closes15[:-1])
+        macd_turn = previous_h15 is not None and h15 > previous_h15
+        pullback = bool(
+            PULLBACK_ENABLED
+            and bullish_1h and bullish_4h
+            and touched_ema20 and held_ema50 and green_reclaim
+            and PULLBACK_MIN_RSI_15M <= r15 <= PULLBACK_MAX_RSI_15M
+            and a15 >= PULLBACK_MIN_ADX_15M
+            and volume_rebound and h5 >= 0 and macd_turn
+            and dist <= PULLBACK_MAX_EMA20_DISTANCE_PCT
+            and not market.get("severe_drop", False)
+            and not market.get("hard_block", False)
         )
 
         rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
@@ -748,7 +834,12 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         overhead = nearest_overhead_resistance(c1h[:-1], price, 100)
         if overhead:
             overhead_pct = float(overhead["distance_pct"])
-            required_room = ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if accumulation else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal) else MIN_NEXT_RESISTANCE_PCT
+            required_room = (
+                ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if accumulation
+                else PULLBACK_MIN_NEXT_RESISTANCE_PCT if pullback
+                else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal)
+                else MIN_NEXT_RESISTANCE_PCT
+            )
             if overhead_pct < required_room:
                 log_rejection(symbol, "مقاومة قريبة مؤكدة", {
                     "distance_pct": round(overhead_pct, 2),
@@ -795,6 +886,26 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             threshold = max(REVERSAL_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
             swing_low = min(c["low"] for c in closed15[-10:-1])
             stop = min(swing_low, price-1.35*atr5)
+
+        elif pullback:
+            score = 22+18+14+12+10+8+6
+            reasons = [
+                "اتجاه 4H و1H صاعد",
+                "تصحيح صحي لملامسة EMA20 على 15m",
+                "التصحيح حافظ على EMA50",
+                "شمعة استعادة صاعدة فوق EMA20",
+                f"RSI بعد التهدئة {r15:.1f}",
+                f"عودة حجم الشراء على 5m ×{vr5:.1f}",
+                f"ADX 15m {a15:.0f}",
+                "MACD بدأ ينعطف صعودًا",
+            ]
+            if obv5[-1] > obv5[-5]: score += 6
+            if rel >= 0.25: score += 5
+            if market.get("regime") in ("إيجابي", "محايد"): score += 4
+            mode, setup = "pullback", "Trend Pullback داخل اتجاه صاعد"
+            threshold = max(PULLBACK_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
+            recent = min(c["low"] for c in closed5[-12:-1])
+            stop = min(recent, recent_pullback_low, price-1.20*atr5)
 
         elif momentum:
             score = 20+18+10+10+10+7+7+4+4
@@ -859,9 +970,16 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if score < threshold:
             return None
         risk=price-stop
-        max_risk = ACCUMULATION_MAX_RISK_PCT if mode=="accumulation" else REVERSAL_MAX_RISK_PCT if mode=="reversal" else MAX_RISK_PCT
+        max_risk = (
+            ACCUMULATION_MAX_RISK_PCT if mode=="accumulation"
+            else PULLBACK_MAX_RISK_PCT if mode=="pullback"
+            else REVERSAL_MAX_RISK_PCT if mode=="reversal"
+            else MAX_RISK_PCT
+        )
         if risk<=0 or risk/price*100>max_risk: return None
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":min(score,99),"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
+        final_score = min(score, 99)
+        quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode)
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -873,7 +991,7 @@ def fmt(v: float) -> str:
 
 def signal_message(r: Dict) -> str:
     reasons="\n".join(f"• {x}" for x in r["reasons"])
-    kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "Trend Pullback" if r.get("mode")=="pullback" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
     return f"""🟢 إشارة شراء سبوت — {r['symbol']}
 
 📈 التحليل متعدد الفريمات
@@ -890,6 +1008,7 @@ def signal_message(r: Dict) -> str:
 النموذج: {r['setup']}
 نوع الإشارة: {kind}
 قوة الإشارة: {r['score']}%
+🏆 جودة الإشارة: {r.get('quality','B')} {r.get('quality_stars','⭐⭐⭐')}
 
 🌍 حالة السوق
 • السوق: {r['market_regime']}
@@ -955,7 +1074,7 @@ def scan(state: Dict) -> None:
         for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
             x=f.result()
             if x and cooled(state,x): results.append(x)
-    results.sort(key=lambda x:(3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
+    results.sort(key=lambda x:(4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
         if not send_message(signal_message(r)):
@@ -969,7 +1088,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V17 Launch Mode.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nتم تشديد حماية BTC متعددة الفريمات: إيقاف كامل وقت الهبوط القوي، والسماح وقت الضعف فقط للعملات ذات القوة النسبية العالية.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V18 Pullback Quality.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
