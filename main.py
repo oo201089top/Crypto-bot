@@ -86,17 +86,31 @@ EXCEPTIONAL_SCORE_BONUS = int(ENGINE_ENV("SPOT", "EXCEPTIONAL_SCORE_BONUS", "6")
 
 # V21: Trend Ignition لالتقاط بدايات الترند الهادئة مثل MMT
 TREND_IGNITION_ENABLED = ENGINE_ENV("SPOT","TREND_IGNITION_ENABLED","1")=="1"
-TREND_IGNITION_MIN_MTF = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_MTF","70"))
+TREND_IGNITION_MIN_MTF = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_MTF","60"))
 TREND_IGNITION_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_VOLUME_15M","1.20"))
-TREND_IGNITION_MIN_ADX = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_ADX","18"))
+TREND_IGNITION_MIN_ADX = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_ADX","12"))
 TREND_IGNITION_MIN_RSI = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_RSI","50"))
 TREND_IGNITION_MAX_RSI = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_RSI","66"))
-TREND_IGNITION_MIN_VOLUME_BUILD = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_VOLUME_BUILD","1.12"))
+TREND_IGNITION_MIN_VOLUME_BUILD = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_VOLUME_BUILD","1.05"))
 TREND_IGNITION_MAX_15M_RISE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_15M_RISE","2.6"))
 TREND_IGNITION_MAX_1H_RISE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_1H_RISE","6.0"))
 TREND_IGNITION_MAX_EMA20_DISTANCE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_EMA20_DISTANCE","1.25"))
 TREND_IGNITION_MIN_SCORE = int(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_SCORE","84"))
 TREND_IGNITION_MAX_RISK_PCT = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_RISK_PCT","4.0"))
+
+# V24: Trend Ignition Structure Engine — يركز على بنية السعر قبل المؤشرات المتأخرة
+TI_STRUCTURE_LOOKBACK = int(ENGINE_ENV("SPOT","TI_STRUCTURE_LOOKBACK","32"))
+TI_STRUCTURE_MIN_BARS = int(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_BARS","20"))
+TI_STRUCTURE_MAX_RANGE_PCT = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MAX_RANGE_PCT","7.0"))
+TI_STRUCTURE_MAX_RECENT_RANGE_RATIO = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MAX_RECENT_RANGE_RATIO","0.72"))
+TI_STRUCTURE_MIN_HIGHER_LOW_PCT = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_HIGHER_LOW_PCT","0.05"))
+TI_STRUCTURE_SHELF_TOLERANCE_PCT = float(ENGINE_ENV("SPOT","TI_STRUCTURE_SHELF_TOLERANCE_PCT","0.75"))
+TI_STRUCTURE_MIN_SHELF_TOUCHES = int(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_SHELF_TOUCHES","3"))
+TI_STRUCTURE_MIN_VOLUME_BUILD = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_VOLUME_BUILD","1.05"))
+TI_STRUCTURE_MIN_BREAKOUT_VOLUME = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_BREAKOUT_VOLUME","1.25"))
+TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT","4.5"))
+TI_STRUCTURE_MIN_CLOSE_LOCATION = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_CLOSE_LOCATION","0.58"))
+TI_STRUCTURE_MIN_SCORE = float(ENGINE_ENV("SPOT","TI_STRUCTURE_MIN_SCORE","70"))
 
 
 # مسار الارتداد الذكي بعد الهبوط
@@ -472,6 +486,105 @@ def accumulation_base(candles: List[Dict], lookback: int = ACCUMULATION_LOOKBACK
     }
 
 
+def trend_ignition_structure(candles: List[Dict]) -> Optional[Dict]:
+    """يكشف قاعدة طويلة مضغوطة، رف مقاومة متكرر، قيعان صاعدة، وبناء حجم قبل الانطلاقة."""
+    closed = candles[:-1] if candles else []
+    if len(closed) < TI_STRUCTURE_MIN_BARS + 3:
+        return None
+
+    lookback = min(TI_STRUCTURE_LOOKBACK, len(closed) - 1)
+    base = closed[-lookback-1:-1]
+    trigger = closed[-1]
+    if len(base) < TI_STRUCTURE_MIN_BARS:
+        return None
+
+    highs = [float(c["high"]) for c in base]
+    lows = [float(c["low"]) for c in base]
+    closes = [float(c["close"]) for c in base]
+    vols = [float(c["volume"]) for c in base]
+
+    base_low = min(lows)
+    base_high = max(highs)
+    range_pct = pct_change(base_low, base_high) if base_low > 0 else 999.0
+
+    split = max(4, len(base) // 2)
+    first = base[:split]
+    second = base[split:]
+    first_range = max(float(c["high"]) for c in first) - min(float(c["low"]) for c in first)
+    recent_range = max(float(c["high"]) for c in second) - min(float(c["low"]) for c in second)
+    range_ratio = recent_range / first_range if first_range > 0 else 1.0
+
+    first_low = min(float(c["low"]) for c in first)
+    second_low = min(float(c["low"]) for c in second)
+    higher_low_pct = pct_change(first_low, second_low) if first_low > 0 else -999.0
+
+    # رف مقاومة: عدة قمم متقاربة قرب أعلى القاعدة، وليس ذيلًا واحدًا.
+    shelf_seed = sorted(highs)[max(0, int(len(highs) * 0.70)):]
+    shelf_level = mean(shelf_seed) if shelf_seed else base_high
+    shelf_touches = sum(
+        1 for h in highs
+        if abs(h / shelf_level - 1) * 100 <= TI_STRUCTURE_SHELF_TOLERANCE_PCT
+    )
+
+    old_vol = mean(vols[:max(5, len(vols)//2)])
+    recent_vol = mean(vols[-6:])
+    volume_build = recent_vol / old_vol if old_vol > 0 else 0.0
+    base_avg_vol = mean(vols[-20:]) if len(vols) >= 20 else mean(vols)
+    breakout_volume = float(trigger["volume"]) / base_avg_vol if base_avg_vol > 0 else 0.0
+
+    trigger_close = float(trigger["close"])
+    extension_pct = pct_change(shelf_level, trigger_close) if shelf_level > 0 else 999.0
+    trigger_close_location = close_location(trigger)
+    trigger_green = trigger_close > float(trigger["open"])
+
+    compressed = range_pct <= TI_STRUCTURE_MAX_RANGE_PCT
+    contracting = range_ratio <= TI_STRUCTURE_MAX_RECENT_RANGE_RATIO
+    higher_lows = higher_low_pct >= TI_STRUCTURE_MIN_HIGHER_LOW_PCT
+    shelf_ready = shelf_touches >= TI_STRUCTURE_MIN_SHELF_TOUCHES
+    volume_ready = volume_build >= TI_STRUCTURE_MIN_VOLUME_BUILD
+    breakout_ready = (
+        trigger_green
+        and trigger_close >= shelf_level * 0.995
+        and breakout_volume >= TI_STRUCTURE_MIN_BREAKOUT_VOLUME
+        and extension_pct <= TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT
+        and trigger_close_location >= TI_STRUCTURE_MIN_CLOSE_LOCATION
+    )
+
+    score = 0.0
+    score += 18 if compressed else 0
+    score += 16 if contracting else 0
+    score += 16 if higher_lows else 0
+    score += min(18.0, shelf_touches * 4.5)
+    score += min(14.0, max(0.0, (volume_build - 1.0) * 35.0))
+    score += min(18.0, max(0.0, (breakout_volume - 1.0) * 18.0))
+    score += 8 if breakout_ready else 0
+    score = min(100.0, score)
+
+    return {
+        "score": round(score, 1),
+        "range_pct": range_pct,
+        "range_ratio": range_ratio,
+        "higher_low_pct": higher_low_pct,
+        "shelf_level": shelf_level,
+        "shelf_touches": shelf_touches,
+        "volume_build": volume_build,
+        "breakout_volume": breakout_volume,
+        "extension_pct": extension_pct,
+        "close_location": trigger_close_location,
+        "base_low": base_low,
+        "compressed": compressed,
+        "contracting": contracting,
+        "higher_lows": higher_lows,
+        "shelf_ready": shelf_ready,
+        "volume_ready": volume_ready,
+        "breakout_ready": breakout_ready,
+        "valid": bool(
+            compressed and contracting and higher_lows and shelf_ready
+            and volume_ready and breakout_ready and score >= TI_STRUCTURE_MIN_SCORE
+        ),
+    }
+
+
 def adaptive_frame_snapshot(candles: List[Dict], min_bars: int = 35) -> Optional[Dict]:
     """لقطة اتجاه مرنة تدعم العملات الجديدة ولا تشترط EMA200."""
     closed = candles[:-1]
@@ -814,6 +927,14 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
                 score += 24
                 if base["building_volume"]: score += 14
                 if closes[-1] >= base["resistance"] * 0.995: score += 12
+        # V24: إبقاء القواعد الطويلة المضغوطة ذات رف المقاومة ضمن القائمة المختصرة.
+        if TREND_IGNITION_ENABLED:
+            ti5 = trend_ignition_structure(c + [{"open":closes[-1],"high":closes[-1],"low":closes[-1],"close":closes[-1],"volume":0.0,"close_time":0,"quote_volume":0.0,"trades":0}])
+            if ti5:
+                score += ti5["score"] * 0.35
+                if ti5["shelf_ready"]: score += 12
+                if ti5["contracting"]: score += 10
+
         # لا نهمل التصحيح الهادئ قرب EMA20 إذا بدأ ارتداد 5m.
         if PULLBACK_ENABLED and e20 and e20 * 0.985 <= closes[-1] <= e20 * 1.012:
             if rv[-1] is not None and rv[-2] is not None and rv[-1] >= rv[-2]:
@@ -868,36 +989,33 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
         early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
 
-        # V22: Trend Ignition أصبح مسارًا مستقلًا، لا مجرد Bonus داخل السكور.
+        # V24: Trend Ignition Structure Engine — بنية السعر أولًا، والمؤشرات كفلاتر أمان.
+        ti_structure = trend_ignition_structure(c15)
         closes_above_e20 = sum(1 for close, e in zip(closes15[-5:], e20v[-5:]) if e is not None and close > e)
-        ema20_rising = bool(e20_15 > e20v[-4] > e20v[-7])
-        near_base_break = bool(
-            accumulation_info
-            and candle15["close"] >= float(accumulation_info["resistance"]) * 0.992
+        ema20_flat_or_rising = bool(e20_15 >= e20v[-4] * 0.998)
+        structure_ready = bool(ti_structure and ti_structure["valid"])
+        early_structure_break = bool(
+            ti_structure
+            and candle15["close"] >= float(ti_structure["shelf_level"]) * 0.995
+            and ti_structure["extension_pct"] <= TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT
         )
+
         trend_ignition = bool(
             TREND_IGNITION_ENABLED
-            and accumulation_info
-            and accumulation_info["compressed"]
-            and accumulation_info["higher_lows"]
-            and accumulation_info["volume_build"] >= TREND_IGNITION_MIN_VOLUME_BUILD
-            and near_base_break
-            and ema20_rising
-            and closes_above_e20 >= 3
-            and vr15 >= TREND_IGNITION_MIN_VOLUME_15M
-            and a15 >= TREND_IGNITION_MIN_ADX
-            and TREND_IGNITION_MIN_RSI <= r15 <= TREND_IGNITION_MAX_RSI
-            and mtf["score"] >= TREND_IGNITION_MIN_MTF
+            and structure_ready
+            and early_structure_break
+            and ema20_flat_or_rising
+            and closes_above_e20 >= 2
             and h15 >= 0 and h5 >= 0
-            and price > e20 and price > vw5
-            and rise15 <= TREND_IGNITION_MAX_15M_RISE
+            and price > vw5
+            and rise15 <= max(TREND_IGNITION_MAX_15M_RISE, TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT)
             and rise1 <= TREND_IGNITION_MAX_1H_RISE
-            and dist <= TREND_IGNITION_MAX_EMA20_DISTANCE
             and not s1["strongly_bearish"] and not s4["strongly_bearish"]
+            and mtf["score"] >= TREND_IGNITION_MIN_MTF
             and not market.get("severe_drop", False)
             and not market.get("hard_block", False)
-            and not breakout
         )
+
 
 
         launch_mode = detect_launch_mode(
@@ -1081,24 +1199,24 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 return None
 
         if trend_ignition:
-            score = 22+16+14+12+10+8+6
+            score = int(ti_structure["score"])
             reasons = [
-                f"🚀 Trend Ignition: بداية ترند مستقلة قبل الاختراق الكامل",
-                f"📦 قاعدة مضغوطة {accumulation_info['range_pct']:.1f}% مع قيعان صاعدة {accumulation_info['higher_low_pct']:+.2f}%",
-                f"📈 بناء حجم تدريجي ×{accumulation_info['volume_build']:.2f} وحجم 15m ×{vr15:.1f}",
-                f"EMA20 صاعد و{closes_above_e20}/5 إغلاقات فوقه",
-                f"السعر قريب من قمة القاعدة دون مطاردة ({pct_change(price, early_level):+.2f}% للمستوى)",
-                f"RSI مبكر {r15:.1f} وADX {a15:.0f}",
-                f"توافق الفريمات {mtf['score']:.0f}/100",
-                f"قوة نسبية مقابل BTC {rel:+.2f}%",
+                "🚀 Trend Ignition V3: خروج مبكر من قاعدة هيكلية قبل الانفجار",
+                f"📦 قاعدة {ti_structure['range_pct']:.1f}% وانكماش تذبذب إلى ×{ti_structure['range_ratio']:.2f}",
+                f"🧱 رف مقاومة مؤكد عند {fmt(ti_structure['shelf_level'])} بعدد {ti_structure['shelf_touches']} لمسات",
+                f"📈 قاع أحدث أعلى {ti_structure['higher_low_pct']:+.2f}%",
+                f"🌊 بناء حجم ×{ti_structure['volume_build']:.2f} وحجم اختراق ×{ti_structure['breakout_volume']:.2f}",
+                f"🎯 امتداد عن الرف {ti_structure['extension_pct']:+.2f}% وإغلاق الشمعة عند {ti_structure['close_location']*100:.0f}% من مداها",
+                f"EMA20 مستقر/صاعد و{closes_above_e20}/5 إغلاقات فوقه",
+                f"توافق الفريمات {mtf['score']:.0f}/100 وقوة نسبية {rel:+.2f}%",
             ]
-            if obv5[-1] > obv5[-5]: score += 6
-            if tr15 >= 1.15: score += 5
-            if rel >= 0.35: score += 6
-            if market.get("regime") in ("إيجابي", "محايد"): score += 4
-            mode, setup = "trend_ignition", "Trend Ignition — بداية ترند قبل الانفجار"
+            if obv5[-1] > obv5[-5]: score += 5
+            if tr15 >= 1.15: score += 4
+            if rel >= 0.35: score += 5
+            if market.get("regime") in ("إيجابي", "محايد"): score += 3
+            mode, setup = "trend_ignition", "Trend Ignition V3 — Structure Break"
             threshold = max(TREND_IGNITION_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
-            base_low = float(accumulation_info["base_low"])
+            base_low = float(ti_structure["base_low"])
             recent_low = min(c["low"] for c in closed5[-12:-1])
             stop = min(base_low, recent_low, price-1.20*atr5)
 
@@ -1253,7 +1371,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"ti_structure":ti_structure or {}}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1352,7 +1470,7 @@ def scan(state: Dict) -> None:
         for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
             x=f.result()
             if x and cooled(state,x): results.append(x)
-    results.sort(key=lambda x:(4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
+    results.sort(key=lambda x:(5 if x.get("mode")=="trend_ignition" else 4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
         if not send_message(signal_message(r)):
@@ -1366,7 +1484,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V20 Exceptional Strength.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V24 Trend Ignition Structure Engine.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
