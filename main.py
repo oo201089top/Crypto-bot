@@ -64,6 +64,16 @@ BTC_WEAK_RSI_5M = float(ENGINE_ENV("SPOT", "BTC_WEAK_RSI_5M", "45"))
 BTC_WEAK_15M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_WEAK_15M_DROP_PCT", "0.35"))
 BTC_WEAK_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "BTC_WEAK_MIN_RELATIVE_STRENGTH", "1.75"))
 
+# V25: استثناء ذكي للعملات المستقلة أثناء ضعف BTC، مع بقاء منع الانهيار الحقيقي.
+BTC_OVERRIDE_ENABLED = ENGINE_ENV("SPOT", "BTC_OVERRIDE_ENABLED", "1") == "1"
+BTC_OVERRIDE_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "BTC_OVERRIDE_MIN_RELATIVE_STRENGTH", "3.0"))
+BTC_OVERRIDE_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "BTC_OVERRIDE_MIN_VOLUME_15M", "1.8"))
+BTC_OVERRIDE_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "BTC_OVERRIDE_MIN_VOLUME_5M", "1.25"))
+BTC_OVERRIDE_MIN_MTF_SCORE = float(ENGINE_ENV("SPOT", "BTC_OVERRIDE_MIN_MTF_SCORE", "60"))
+BTC_CATASTROPHIC_5M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_CATASTROPHIC_5M_DROP_PCT", "1.20"))
+BTC_CATASTROPHIC_15M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_CATASTROPHIC_15M_DROP_PCT", "1.80"))
+BTC_CATASTROPHIC_1H_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_CATASTROPHIC_1H_DROP_PCT", "2.50"))
+
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
 BTC_HEALTH_WEIGHTS = {"1w": 10, "1d": 20, "4h": 25, "1h": 20, "15m": 20, "5m": 5}
@@ -1012,8 +1022,6 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and rise1 <= TREND_IGNITION_MAX_1H_RISE
             and not s1["strongly_bearish"] and not s4["strongly_bearish"]
             and mtf["score"] >= TREND_IGNITION_MIN_MTF
-            and not market.get("severe_drop", False)
-            and not market.get("hard_block", False)
         )
 
 
@@ -1046,14 +1054,18 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             })
             return None
 
-        # يجب أن تكون آخر شمعة 5m مغلقة بعد شمعة الاختراق 15m، وتثبت فوق المستوى.
+        # تأكيد 5m: السماح بتساوي وقت إغلاق 5m و15m، لأنهما قد يغلقان في اللحظة نفسها.
+        # Trend Ignition يحصل على استثناء زمني فقط إذا ثبت المستوى وكان الإغلاق صحيًا والزخم غير سلبي.
         if BREAKOUT_CONFIRM_5M and breakout:
-            confirm_after_breakout = candle5["close_time"] > candle15["close_time"]
+            confirm_after_breakout = candle5["close_time"] >= candle15["close_time"]
             held_level = candle5["close"] > resistance and candle5["low"] >= resistance * (1 - CONFIRM_MAX_DIP_PCT / 100)
             healthy_close = candle5["close"] >= candle5["open"] and close_location(candle5) >= MIN_CONFIRM_CLOSE_LOCATION
-            if not (confirm_after_breakout and held_level and healthy_close and h5 >= 0):
+            confirmation_core = held_level and healthy_close and h5 >= 0
+            confirmation_valid = confirmation_core and (confirm_after_breakout or trend_ignition)
+            if not confirmation_valid:
                 log_rejection(symbol, "فشل تأكيد الاختراق 5m", {
                     "after_breakout": confirm_after_breakout,
+                    "trend_ignition_override": bool(trend_ignition and confirmation_core),
                     "held_level": held_level,
                     "healthy_close": healthy_close,
                     "confirm_close": candle5["close"],
@@ -1072,7 +1084,6 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         # لا تتجاوز الإيقاف الكامل، ولا تسمح بمطاردة RSI أو شمعة استنزافية.
         exceptional_strength = bool(
             EXCEPTIONAL_STRENGTH_ENABLED
-            and not market.get("hard_block", False)
             and rel >= EXCEPTIONAL_MIN_RELATIVE_STRENGTH
             and mtf["score"] >= EXCEPTIONAL_MIN_MTF_SCORE
             and float(mtf.get("frames", {}).get("15m", 0)) >= EXCEPTIONAL_MIN_15M_SCORE
@@ -1158,14 +1169,47 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             })
             return None
 
-        if market.get("hard_block",False):
+        # V25: لا نغلق الباب على العملات المستقلة لمجرد ضعف BTC المتوسط.
+        # التجاوز مسموح فقط لمسار Trend Ignition أو Exceptional Strength، وبشروط قوة واضحة.
+        btc5_move = float(market.get("btc", {}).get("rise_5m", 0.0))
+        btc15_move = float(market.get("btc", {}).get("rise_15m", 0.0))
+        btc1h_move = float(market.get("btc", {}).get("rise_1h", 0.0))
+        btc_catastrophic = bool(
+            btc5_move <= -BTC_CATASTROPHIC_5M_DROP_PCT
+            or btc15_move <= -BTC_CATASTROPHIC_15M_DROP_PCT
+            or btc1h_move <= -BTC_CATASTROPHIC_1H_DROP_PCT
+        )
+        btc_override = bool(
+            BTC_OVERRIDE_ENABLED
+            and market.get("hard_block", False)
+            and not btc_catastrophic
+            and (trend_ignition or exceptional_strength)
+            and rel >= BTC_OVERRIDE_MIN_RELATIVE_STRENGTH
+            and vr15 >= BTC_OVERRIDE_MIN_VOLUME_15M
+            and vr5 >= BTC_OVERRIDE_MIN_VOLUME_5M
+            and mtf["score"] >= BTC_OVERRIDE_MIN_MTF_SCORE
+            and h15 >= 0 and h5 >= 0
+            and price > e20 and price > vw5
+            and r15 <= EXCEPTIONAL_MAX_RSI_15M
+        )
+
+        if market.get("hard_block",False) and not btc_override:
             log_rejection(symbol, "إيقاف كامل بسبب هبوط BTC", {
-                "btc5": round(float(market.get("btc",{}).get("rise_5m",0)), 3),
-                "btc15": round(float(market.get("btc",{}).get("rise_15m",0)), 3),
-                "btc1h": round(float(market.get("btc",{}).get("rise_1h",0)), 3),
+                "btc5": round(btc5_move, 3),
+                "btc15": round(btc15_move, 3),
+                "btc1h": round(btc1h_move, 3),
                 "btc_rsi15": round(float(market.get("btc",{}).get("rsi15",0)), 2),
+                "btc_catastrophic": btc_catastrophic,
+                "trend_ignition": trend_ignition,
+                "exceptional_strength": exceptional_strength,
+                "relative_strength": round(rel, 2),
+                "volume15": round(vr15, 2),
+                "volume5": round(vr5, 2),
+                "mtf_score": round(float(mtf["score"]), 1),
             })
             return None
+        elif btc_override:
+            log(f"BTC override accepted {symbol} | rel={rel:.2f}% | vr15={vr15:.2f} | vr5={vr5:.2f} | mtf={mtf['score']:.1f}")
 
         # في ضعف BTC المتوسط لا نسمح إلا بعملة تتفوق عليه بوضوح.
         if market.get("weak_pressure",False) and not exceptional_strength and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
@@ -1371,7 +1415,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"ti_structure":ti_structure or {}}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"btc_override":btc_override,"ti_structure":ti_structure or {}}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1398,6 +1442,7 @@ def signal_message(r: Dict) -> str:
 • تعديل التقييم: {r.get('mtf_adjustment',0):+d}
 • وضع الانطلاقة: {'مفعل 🚀' if r.get('launch_mode') else 'غير مفعل'}
 • القوة الاستثنائية: {'مفعلة ⚡' if r.get('exceptional_strength') else 'غير مفعلة'}
+• تجاوز فلتر BTC: {'نعم 🛡️' if r.get('btc_override') else 'لا'}
 
 النموذج: {r['setup']}
 نوع الإشارة: {kind}
