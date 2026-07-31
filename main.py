@@ -84,6 +84,21 @@ EXCEPTIONAL_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_ADX_15M", "2
 EXCEPTIONAL_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MAX_RSI_15M", "72"))
 EXCEPTIONAL_SCORE_BONUS = int(ENGINE_ENV("SPOT", "EXCEPTIONAL_SCORE_BONUS", "6"))
 
+# V21: Trend Ignition لالتقاط بدايات الترند الهادئة مثل MMT
+TREND_IGNITION_ENABLED = ENGINE_ENV("SPOT","TREND_IGNITION_ENABLED","1")=="1"
+TREND_IGNITION_MIN_MTF = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_MTF","70"))
+TREND_IGNITION_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_VOLUME_15M","1.20"))
+TREND_IGNITION_MIN_ADX = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_ADX","18"))
+TREND_IGNITION_MIN_RSI = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_RSI","50"))
+TREND_IGNITION_MAX_RSI = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_RSI","66"))
+TREND_IGNITION_MIN_VOLUME_BUILD = float(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_VOLUME_BUILD","1.12"))
+TREND_IGNITION_MAX_15M_RISE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_15M_RISE","2.6"))
+TREND_IGNITION_MAX_1H_RISE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_1H_RISE","6.0"))
+TREND_IGNITION_MAX_EMA20_DISTANCE = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_EMA20_DISTANCE","1.25"))
+TREND_IGNITION_MIN_SCORE = int(ENGINE_ENV("SPOT","TREND_IGNITION_MIN_SCORE","84"))
+TREND_IGNITION_MAX_RISK_PCT = float(ENGINE_ENV("SPOT","TREND_IGNITION_MAX_RISK_PCT","4.0"))
+
+
 # مسار الارتداد الذكي بعد الهبوط
 REVERSAL_ENABLED = ENGINE_ENV("SPOT", "REVERSAL_ENABLED", "1") == "1"
 REVERSAL_MIN_DRAWDOWN_PCT = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_DRAWDOWN_PCT", "3.5"))
@@ -583,6 +598,9 @@ def signal_quality(
     mtf_frames: Optional[Dict[str, float]] = None,
 ) -> Tuple[str, str]:
     """يعيد تصنيف الجودة مع قيود خاصة للحجم وقوة الفريمات العليا."""
+    if mode == "trend_ignition":
+        return "A", "⭐⭐⭐⭐"
+
     quality_points = int(score)
     if mtf_score >= 72:
         quality_points += 2
@@ -593,16 +611,12 @@ def signal_quality(
 
     if quality_points >= 97:
         quality, stars = "A+", "⭐⭐⭐⭐⭐"
-    elif quality_points >= 91:
-        quality, stars = "A", "⭐⭐⭐⭐"
-    elif quality_points >= 85:
-        quality, stars = "B", "⭐⭐⭐"
     else:
-        quality, stars = "C", "⭐⭐"
+        quality, stars = "A", "⭐⭐⭐⭐"
 
     if mode == "pullback":
         if volume_ratio_15m < PULLBACK_A_MIN_VOLUME_15M:
-            return "B", "⭐⭐⭐"
+            return "A", "⭐⭐⭐⭐"
         if volume_ratio_15m < PULLBACK_A_PLUS_MIN_VOLUME_15M and quality == "A+":
             return "A", "⭐⭐⭐⭐"
 
@@ -617,7 +631,7 @@ def signal_quality(
             and score_1h >= REVERSAL_A_MIN_1H_SCORE
         )
         if not reversal_grade_ready and quality in ("A+", "A"):
-            return "B", "⭐⭐⭐"
+            return "A", "⭐⭐⭐⭐"
 
     return quality, stars
 
@@ -854,6 +868,38 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
         early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
 
+        # V22: Trend Ignition أصبح مسارًا مستقلًا، لا مجرد Bonus داخل السكور.
+        closes_above_e20 = sum(1 for close, e in zip(closes15[-5:], e20v[-5:]) if e is not None and close > e)
+        ema20_rising = bool(e20_15 > e20v[-4] > e20v[-7])
+        near_base_break = bool(
+            accumulation_info
+            and candle15["close"] >= float(accumulation_info["resistance"]) * 0.992
+        )
+        trend_ignition = bool(
+            TREND_IGNITION_ENABLED
+            and accumulation_info
+            and accumulation_info["compressed"]
+            and accumulation_info["higher_lows"]
+            and accumulation_info["volume_build"] >= TREND_IGNITION_MIN_VOLUME_BUILD
+            and near_base_break
+            and ema20_rising
+            and closes_above_e20 >= 3
+            and vr15 >= TREND_IGNITION_MIN_VOLUME_15M
+            and a15 >= TREND_IGNITION_MIN_ADX
+            and TREND_IGNITION_MIN_RSI <= r15 <= TREND_IGNITION_MAX_RSI
+            and mtf["score"] >= TREND_IGNITION_MIN_MTF
+            and h15 >= 0 and h5 >= 0
+            and price > e20 and price > vw5
+            and rise15 <= TREND_IGNITION_MAX_15M_RISE
+            and rise1 <= TREND_IGNITION_MAX_1H_RISE
+            and dist <= TREND_IGNITION_MAX_EMA20_DISTANCE
+            and not s1["strongly_bearish"] and not s4["strongly_bearish"]
+            and not market.get("severe_drop", False)
+            and not market.get("hard_block", False)
+            and not breakout
+        )
+
+
         launch_mode = detect_launch_mode(
             mtf.get("frames", {}), vr15, a15, r15,
             breakout, squeeze_break, early_break
@@ -1020,6 +1066,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             overhead_pct = float(overhead["distance_pct"])
             required_room = (
                 ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if accumulation
+                else ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if trend_ignition
                 else PULLBACK_MIN_NEXT_RESISTANCE_PCT if pullback
                 else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal)
                 else MIN_NEXT_RESISTANCE_PCT
@@ -1033,7 +1080,29 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
-        if accumulation:
+        if trend_ignition:
+            score = 22+16+14+12+10+8+6
+            reasons = [
+                f"🚀 Trend Ignition: بداية ترند مستقلة قبل الاختراق الكامل",
+                f"📦 قاعدة مضغوطة {accumulation_info['range_pct']:.1f}% مع قيعان صاعدة {accumulation_info['higher_low_pct']:+.2f}%",
+                f"📈 بناء حجم تدريجي ×{accumulation_info['volume_build']:.2f} وحجم 15m ×{vr15:.1f}",
+                f"EMA20 صاعد و{closes_above_e20}/5 إغلاقات فوقه",
+                f"السعر قريب من قمة القاعدة دون مطاردة ({pct_change(price, early_level):+.2f}% للمستوى)",
+                f"RSI مبكر {r15:.1f} وADX {a15:.0f}",
+                f"توافق الفريمات {mtf['score']:.0f}/100",
+                f"قوة نسبية مقابل BTC {rel:+.2f}%",
+            ]
+            if obv5[-1] > obv5[-5]: score += 6
+            if tr15 >= 1.15: score += 5
+            if rel >= 0.35: score += 6
+            if market.get("regime") in ("إيجابي", "محايد"): score += 4
+            mode, setup = "trend_ignition", "Trend Ignition — بداية ترند قبل الانفجار"
+            threshold = max(TREND_IGNITION_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
+            base_low = float(accumulation_info["base_low"])
+            recent_low = min(c["low"] for c in closed5[-12:-1])
+            stop = min(base_low, recent_low, price-1.20*atr5)
+
+        elif accumulation:
             score = 20+16+14+12+10+8+6
             reasons = [
                 f"قاعدة تجميع مضغوطة {accumulation_info['range_pct']:.1f}%",
@@ -1175,7 +1244,8 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             return None
         risk=price-stop
         max_risk = (
-            ACCUMULATION_MAX_RISK_PCT if mode=="accumulation"
+            TREND_IGNITION_MAX_RISK_PCT if mode=="trend_ignition"
+            else ACCUMULATION_MAX_RISK_PCT if mode=="accumulation"
             else PULLBACK_MAX_RISK_PCT if mode=="pullback"
             else REVERSAL_MAX_RISK_PCT if mode=="reversal"
             else MAX_RISK_PCT
@@ -1183,7 +1253,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1195,8 +1265,9 @@ def fmt(v: float) -> str:
 
 def signal_message(r: Dict) -> str:
     reasons="\n".join(f"• {x}" for x in r["reasons"])
-    kind="تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "Trend Pullback" if r.get("mode")=="pullback" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
-    return f"""🟢 إشارة شراء سبوت — {r['symbol']}
+    kind="Trend Ignition 🚀" if r.get("mode")=="trend_ignition" else "تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "Trend Pullback" if r.get("mode")=="pullback" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    title = "🚀 إشارة Trend Ignition مستقلة" if r.get("mode")=="trend_ignition" else "🟢 إشارة شراء سبوت"
+    return f"""{title} — {r['symbol']}
 
 📈 التحليل متعدد الفريمات
 • 1W: {r.get('mtf_frames',{}).get('1w',50):.0f}/100 — وزن {r.get('mtf_weights',{}).get('1w',0):.0f}%
@@ -1213,7 +1284,7 @@ def signal_message(r: Dict) -> str:
 النموذج: {r['setup']}
 نوع الإشارة: {kind}
 قوة الإشارة: {r['score']}%
-🏆 جودة الإشارة: {r.get('quality','B')} {r.get('quality_stars','⭐⭐⭐')}
+🏆 جودة الإشارة: {r.get('quality','A')} {r.get('quality_stars','⭐⭐⭐⭐')}
 
 🌍 حالة السوق
 • السوق: {r['market_regime']}
