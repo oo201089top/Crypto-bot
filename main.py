@@ -75,6 +75,9 @@ REVERSAL_MAX_RSI_RECENT_LOW = float(ENGINE_ENV("SPOT", "REVERSAL_MAX_RSI_RECENT_
 REVERSAL_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_ADX_15M", "18"))
 REVERSAL_MIN_SCORE = int(ENGINE_ENV("SPOT", "REVERSAL_MIN_SCORE", "84"))
 REVERSAL_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "REVERSAL_MAX_RISK_PCT", "4.5"))
+REVERSAL_A_MIN_MTF_SCORE = float(ENGINE_ENV("SPOT", "REVERSAL_A_MIN_MTF_SCORE", "60"))
+REVERSAL_A_MIN_4H_SCORE = float(ENGINE_ENV("SPOT", "REVERSAL_A_MIN_4H_SCORE", "60"))
+REVERSAL_A_MIN_1H_SCORE = float(ENGINE_ENV("SPOT", "REVERSAL_A_MIN_1H_SCORE", "40"))
 
 # مسار الزخم القوي مثل SHIB
 MOMENTUM_ENABLED = ENGINE_ENV("SPOT", "MOMENTUM_ENABLED", "1") == "1"
@@ -557,8 +560,9 @@ def signal_quality(
     mode: str,
     launch_mode: bool,
     volume_ratio_15m: float,
+    mtf_frames: Optional[Dict[str, float]] = None,
 ) -> Tuple[str, str]:
-    """يعيد تصنيف الجودة، مع منع تضخيم جودة Pullback عند ضعف حجم 15m."""
+    """يعيد تصنيف الجودة مع قيود خاصة للحجم وقوة الفريمات العليا."""
     quality_points = int(score)
     if mtf_score >= 72:
         quality_points += 2
@@ -581,6 +585,19 @@ def signal_quality(
             return "B", "⭐⭐⭐"
         if volume_ratio_15m < PULLBACK_A_PLUS_MIN_VOLUME_15M and quality == "A+":
             return "A", "⭐⭐⭐⭐"
+
+    # الارتداد لا يحصل على A/A+ إذا بقيت الفريمات العليا ضعيفة.
+    if mode == "reversal":
+        frames = mtf_frames or {}
+        score_4h = float(frames.get("4h", 0))
+        score_1h = float(frames.get("1h", 0))
+        reversal_grade_ready = (
+            mtf_score >= REVERSAL_A_MIN_MTF_SCORE
+            and score_4h >= REVERSAL_A_MIN_4H_SCORE
+            and score_1h >= REVERSAL_A_MIN_1H_SCORE
+        )
+        if not reversal_grade_ready and quality in ("A+", "A"):
+            return "B", "⭐⭐⭐"
 
     return quality, stars
 
@@ -896,6 +913,16 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 f"حجم ارتداد 15m ×{vr15:.1f}", f"تأكيد حجم 5m ×{vr5:.1f}",
                 "السعر فوق VWAP",
             ]
+            reversal_4h_score = float(mtf.get("frames", {}).get("4h", 0))
+            reversal_1h_score = float(mtf.get("frames", {}).get("1h", 0))
+            if (
+                mtf["score"] < REVERSAL_A_MIN_MTF_SCORE
+                or reversal_4h_score < REVERSAL_A_MIN_4H_SCORE
+                or reversal_1h_score < REVERSAL_A_MIN_1H_SCORE
+            ):
+                reasons.append(
+                    f"تنبيه: الفريمات العليا غير مكتملة — MTF {mtf['score']:.0f}، 4H {reversal_4h_score:.0f}، 1H {reversal_1h_score:.0f}; أقصى جودة B"
+                )
             if obv5[-1] > obv5[-5]: score += 6
             if rel >= 0.5: score += 6
             if market.get("regime") in ("إيجابي", "محايد"): score += 4
@@ -999,7 +1026,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         )
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
-        quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15)
+        quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
