@@ -1,5 +1,5 @@
-# V26: extreme-strength BTC override, flexible Trend Ignition confirmation, plus V12 foundations,
-# thread-safe caches, safer stock-contract discovery, and self-healing thread supervisor.
+# V28: early-A qualification for strong Trend Ignition / Exceptional Strength setups,
+# plus V27 defensive validation, V26 BTC overrides, and V12 foundations.
 import os, time, json
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,6 +7,10 @@ from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, List, Optional, Tuple
 import requests
+
+# V27: ترتيب صريح عند تحقق أكثر من استراتيجية في الشمعة نفسها.
+# هذا يطابق ترتيب elif التاريخي ولا يغير سلوك التداول.
+MODE_PRIORITY = ("trend_ignition", "accumulation", "reversal", "pullback", "momentum", "balanced")
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -89,6 +93,17 @@ BTC_FLASH_CRASH_1H_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_FLASH_CRASH_1H_DROP_
 # وبـ MACD 5m محايد قليلًا إذا ثبت الاختراق وكان هيكل Trend Ignition قويًا.
 TI_CONFIRM_ALLOW_FLAT_MACD = ENGINE_ENV("SPOT", "TI_CONFIRM_ALLOW_FLAT_MACD", "1") == "1"
 TI_CONFIRM_MAX_NEGATIVE_HIST_RATIO = float(ENGINE_ENV("SPOT", "TI_CONFIRM_MAX_NEGATIVE_HIST_RATIO", "0.15"))
+
+# V28: مسار A المبكر — يسمح بإشارة A فقط عندما يكون النمط الأساسي قويًا
+# لكن السكور النهائي ناقص بسبب شروط ثانوية أو ضعف السوق، دون تمرير B/C.
+EARLY_A_ENABLED = ENGINE_ENV("SPOT", "EARLY_A_ENABLED", "1") == "1"
+EARLY_A_MAX_SCORE_GAP = int(ENGINE_ENV("SPOT", "EARLY_A_MAX_SCORE_GAP", "8"))
+EARLY_A_MIN_MTF_SCORE = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_MTF_SCORE", "55"))
+EARLY_A_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_RELATIVE_STRENGTH", "1.50"))
+EARLY_A_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_VOLUME_15M", "1.25"))
+EARLY_A_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_VOLUME_5M", "1.10"))
+EARLY_A_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "EARLY_A_MAX_RSI_15M", "72"))
+EARLY_A_MIN_STRUCTURE_SCORE = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_STRUCTURE_SCORE", "70"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -759,7 +774,7 @@ def signal_quality(
         if volume_ratio_15m < PULLBACK_A_PLUS_MIN_VOLUME_15M and quality == "A+":
             return "A", "⭐⭐⭐⭐"
 
-    # الارتداد لا يحصل على A/A+ إذا بقيت الفريمات العليا ضعيفة.
+    # سياسة المستخدم تبقي A/A+ فقط؛ ضعف الفريمات العليا يمنع A+ ويثبت الجودة عند A.
     if mode == "reversal":
         frames = mtf_frames or {}
         score_4h = float(frames.get("4h", 0))
@@ -792,6 +807,13 @@ def market_context() -> Dict:
             a = [c["close"] for c in c15]
             b = [c["close"] for c in c1]
             d = [c["close"] for c in c4]
+            # V27: لا نقارن None بأرقام. هذا مهم إذا أعادت المنصة بيانات ناقصة
+            # أو تم استخدام الدالة لاحقًا مع زوج حديث قليل الشموع.
+            series_by_frame = {"5m": z, "15m": a, "1h": b, "4h": d}
+            for frame, values in series_by_frame.items():
+                if len(values) < 50:
+                    raise ValueError(f"{symbol} {frame}: insufficient closed candles ({len(values)})")
+
             e20z, e50z = ema(z, 20)[-1], ema(z, 50)[-1]
             e20a, e50a = ema(a, 20)[-1], ema(a, 50)[-1]
             e20b, e50b = ema(b, 20)[-1], ema(b, 50)[-1]
@@ -799,6 +821,17 @@ def market_context() -> Dict:
             _, _, hz = macd(z); _, _, ha = macd(a)
             _, _, hb = macd(b); _, _, hd = macd(d)
             rz, ra, rb, rd = rsi(z)[-1], rsi(a)[-1], rsi(b)[-1], rsi(d)[-1]
+
+            required = {
+                "e20z": e20z, "e50z": e50z, "e20a": e20a, "e50a": e50a,
+                "e20b": e20b, "e50b": e50b, "e20d": e20d, "e50d": e50d,
+                "hz": hz, "ha": ha, "hb": hb, "hd": hd,
+                "rz": rz, "ra": ra, "rb": rb, "rd": rd,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(f"{symbol}: incomplete indicators: {', '.join(missing)}")
+
             return {
                 "rise_5m": pct_change(z[-2], z[-1]),
                 "rise_15m": pct_change(z[-4], z[-1]),
@@ -1291,6 +1324,24 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
+        # V27: تدقيق تعارض المسارات دون تغيير القرار. إذا تحققت عدة أنماط،
+        # نُسجلها ويستمر الاختيار حسب MODE_PRIORITY المطابق لترتيب elif الحالي.
+        matched_modes = [
+            name for name, matched in (
+                ("trend_ignition", trend_ignition),
+                ("accumulation", accumulation),
+                ("reversal", reversal),
+                ("pullback", pullback),
+                ("momentum", momentum),
+            ) if matched
+        ]
+        if len(matched_modes) > 1:
+            selected_by_priority = next(name for name in MODE_PRIORITY if name in matched_modes)
+            log(
+                f"Mode overlap {symbol}: matched={matched_modes} | "
+                f"selected={selected_by_priority} | priority={MODE_PRIORITY}"
+            )
+
         if trend_ignition:
             score = int(ti_structure["score"])
             reasons = [
@@ -1451,7 +1502,55 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             reasons.append(
                 f"وضع الانطلاقة المبكرة: توافق 1H/15M/5M مع حجم ×{vr15:.1f} وADX {a15:.0f}"
             )
-        if score < threshold:
+        # V28: تأهيل A المبكر لحالات مثل COTI وDIA.
+        # لا يخلق نمطًا جديدًا ولا يتجاوز فلاتر الأمان السابقة؛ فقط يمنع رفض
+        # Trend Ignition / Exceptional Strength بسبب نقص محدود في السكور النهائي.
+        score_gap = max(0, int(threshold) - int(score))
+        strong_ignition_for_a = bool(
+            mode == "trend_ignition"
+            and trend_ignition
+            and ti_structure
+            and float(ti_structure.get("score", 0)) >= EARLY_A_MIN_STRUCTURE_SCORE
+            and bool(ti_structure.get("breakout_ready", False))
+        )
+        strong_exceptional_for_a = bool(exceptional_strength)
+        early_a_qualified = bool(
+            EARLY_A_ENABLED
+            and (strong_ignition_for_a or strong_exceptional_for_a)
+            and score_gap <= EARLY_A_MAX_SCORE_GAP
+            and float(mtf["score"]) >= EARLY_A_MIN_MTF_SCORE
+            and rel >= EARLY_A_MIN_RELATIVE_STRENGTH
+            and vr15 >= EARLY_A_MIN_VOLUME_15M
+            and vr5 >= EARLY_A_MIN_VOLUME_5M
+            and r15 <= EARLY_A_MAX_RSI_15M
+            and h15 >= 0
+            and price > e20 and price > vw5
+            and not btc_flash_crash
+        )
+
+        if score < threshold and early_a_qualified:
+            original_score = int(score)
+            score = int(threshold)
+            reasons.append(
+                f"تأهيل A مبكر: النمط قوي والسكور كان أقل من الحد بـ {score_gap} نقاط فقط"
+            )
+            log(
+                f"Early A accepted {symbol} | mode={mode} | "
+                f"score={original_score}->{score} | gap={score_gap} | "
+                f"rel={rel:.2f}% | vr15={vr15:.2f} | mtf={mtf['score']:.1f}"
+            )
+        elif score < threshold:
+            log_rejection(symbol, "السكور أقل من حد المسار", {
+                "mode": mode,
+                "score": int(score),
+                "threshold": int(threshold),
+                "score_gap": score_gap,
+                "early_a_qualified": early_a_qualified,
+                "strong_ignition_for_a": strong_ignition_for_a,
+                "strong_exceptional_for_a": strong_exceptional_for_a,
+                "mtf_score": round(float(mtf["score"]), 1),
+                "mtf_adjustment": int(mtf["adjustment"]),
+            })
             return None
         risk=price-stop
         max_risk = (
@@ -1461,10 +1560,20 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             else REVERSAL_MAX_RISK_PCT if mode=="reversal"
             else MAX_RISK_PCT
         )
-        if risk<=0 or risk/price*100>max_risk: return None
+        if risk <= 0 or risk / price * 100 > max_risk:
+            log_rejection(symbol, "المخاطرة خارج الحد", {
+                "mode": mode,
+                "risk_pct": round((risk / price * 100) if price > 0 else 999.0, 3),
+                "max_risk_pct": max_risk,
+                "entry": price,
+                "stop": stop,
+            })
+            return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"ti_structure":ti_structure or {}}
+        if early_a_qualified:
+            quality, quality_stars = "A", "⭐⭐⭐⭐"
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1491,6 +1600,7 @@ def signal_message(r: Dict) -> str:
 • تعديل التقييم: {r.get('mtf_adjustment',0):+d}
 • وضع الانطلاقة: {'مفعل 🚀' if r.get('launch_mode') else 'غير مفعل'}
 • القوة الاستثنائية: {'مفعلة ⚡' if r.get('exceptional_strength') else 'غير مفعلة'}
+• تأهيل A المبكر: {'مفعل 🚀' if r.get('early_a_qualified') else 'غير مفعل'}
 • تجاوز فلتر BTC: {'استثنائي 🚀' if r.get('btc_extreme_override') else 'نعم 🛡️' if r.get('btc_override') else 'لا'}
 
 النموذج: {r['setup']}
