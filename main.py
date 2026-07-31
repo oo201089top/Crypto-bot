@@ -64,6 +64,26 @@ BTC_WEAK_RSI_5M = float(ENGINE_ENV("SPOT", "BTC_WEAK_RSI_5M", "45"))
 BTC_WEAK_15M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_WEAK_15M_DROP_PCT", "0.35"))
 BTC_WEAK_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "BTC_WEAK_MIN_RELATIVE_STRENGTH", "1.75"))
 
+# V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
+BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
+BTC_HEALTH_WEIGHTS = {"1w": 10, "1d": 20, "4h": 25, "1h": 20, "15m": 20, "5m": 5}
+BTC_HEALTH_HARD_BLOCK_SCORE = float(ENGINE_ENV("SPOT", "BTC_HEALTH_HARD_BLOCK_SCORE", "42"))
+BTC_HEALTH_WEAK_SCORE = float(ENGINE_ENV("SPOT", "BTC_HEALTH_WEAK_SCORE", "60"))
+BTC_PULLBACK_MIN_HEALTH_SCORE = float(ENGINE_ENV("SPOT", "BTC_PULLBACK_MIN_HEALTH_SCORE", "55"))
+BTC_PULLBACK_MAX_15M_DROP_PCT = float(ENGINE_ENV("SPOT", "BTC_PULLBACK_MAX_15M_DROP_PCT", "0.50"))
+BTC_HEALTH_WEAK_SCORE_BONUS = int(ENGINE_ENV("SPOT", "BTC_HEALTH_WEAK_SCORE_BONUS", "5"))
+
+# V20: استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC مثل EUL
+EXCEPTIONAL_STRENGTH_ENABLED = ENGINE_ENV("SPOT", "EXCEPTIONAL_STRENGTH_ENABLED", "1") == "1"
+EXCEPTIONAL_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_RELATIVE_STRENGTH", "3.0"))
+EXCEPTIONAL_MIN_MTF_SCORE = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_MTF_SCORE", "78"))
+EXCEPTIONAL_MIN_15M_SCORE = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_15M_SCORE", "85"))
+EXCEPTIONAL_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_VOLUME_15M", "2.2"))
+EXCEPTIONAL_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_VOLUME_5M", "1.5"))
+EXCEPTIONAL_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MIN_ADX_15M", "24"))
+EXCEPTIONAL_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "EXCEPTIONAL_MAX_RSI_15M", "72"))
+EXCEPTIONAL_SCORE_BONUS = int(ENGINE_ENV("SPOT", "EXCEPTIONAL_SCORE_BONUS", "6"))
+
 # مسار الارتداد الذكي بعد الهبوط
 REVERSAL_ENABLED = ENGINE_ENV("SPOT", "REVERSAL_ENABLED", "1") == "1"
 REVERSAL_MIN_DRAWDOWN_PCT = float(ENGINE_ENV("SPOT", "REVERSAL_MIN_DRAWDOWN_PCT", "3.5"))
@@ -603,64 +623,157 @@ def signal_quality(
 
 
 def market_context() -> Dict:
-    now=time.time()
+    """سياق السوق V19: صحة BTC على ستة فريمات مع حماية الهبوط اللحظي."""
+    now = time.time()
     with MARKET_CACHE_LOCK:
-        if MARKET_CACHE["data"] and now-float(MARKET_CACHE["updated_at"])<MARKET_CACHE_SECONDS:
+        if MARKET_CACHE["data"] and now - float(MARKET_CACHE["updated_at"]) < MARKET_CACHE_SECONDS:
             return dict(MARKET_CACHE["data"])
+
     try:
-        def snap(symbol):
-            c5=get_klines(symbol,"5m",120)[:-1]; c15=get_klines(symbol,"15m",120)[:-1]
-            c1=get_klines(symbol,"1h",120)[:-1]; c4=get_klines(symbol,"4h",120)[:-1]
-            z=[c["close"] for c in c5]; a=[c["close"] for c in c15]
-            b=[c["close"] for c in c1]; d=[c["close"] for c in c4]
-            e20z,e50z=ema(z,20)[-1],ema(z,50)[-1]
-            e20a,e50a=ema(a,20)[-1],ema(a,50)[-1]
-            e20b,e50b=ema(b,20)[-1],ema(b,50)[-1]
-            e20d,e50d=ema(d,20)[-1],ema(d,50)[-1]
-            _,_,hz=macd(z); _,_,ha=macd(a); _,_,hb=macd(b); _,_,hd=macd(d)
-            rz,ra,rb,rd=rsi(z)[-1],rsi(a)[-1],rsi(b)[-1],rsi(d)[-1]
+        def short_snapshot(symbol: str) -> Dict:
+            c5 = get_klines(symbol, "5m", 120)[:-1]
+            c15 = get_klines(symbol, "15m", 120)[:-1]
+            c1 = get_klines(symbol, "1h", 120)[:-1]
+            c4 = get_klines(symbol, "4h", 120)[:-1]
+            z = [c["close"] for c in c5]
+            a = [c["close"] for c in c15]
+            b = [c["close"] for c in c1]
+            d = [c["close"] for c in c4]
+            e20z, e50z = ema(z, 20)[-1], ema(z, 50)[-1]
+            e20a, e50a = ema(a, 20)[-1], ema(a, 50)[-1]
+            e20b, e50b = ema(b, 20)[-1], ema(b, 50)[-1]
+            e20d, e50d = ema(d, 20)[-1], ema(d, 50)[-1]
+            _, _, hz = macd(z); _, _, ha = macd(a)
+            _, _, hb = macd(b); _, _, hd = macd(d)
+            rz, ra, rb, rd = rsi(z)[-1], rsi(a)[-1], rsi(b)[-1], rsi(d)[-1]
             return {
-                "rise_5m":pct_change(z[-2],z[-1]),
-                "rise_15m":pct_change(z[-4],z[-1]),
-                "rise_1h":pct_change(a[-5],a[-1]),
-                "rise_4h":pct_change(b[-5],b[-1]),
-                "rsi5":rz,"rsi15":ra,"rsi1h":rb,"rsi4h":rd,
-                "bull5":z[-1]>e20z>e50z and hz>=0,"bear5":z[-1]<e20z and hz<0,
-                "bull15":a[-1]>e20a>e50a and ha>=0,"bear15":a[-1]<e20a and ha<0,
-                "bull1h":b[-1]>e20b>e50b and hb>=0,"bear1h":b[-1]<e20b and hb<0,
-                "bull4h":d[-1]>e20d>e50d and hd>=0,"bear4h":d[-1]<e20d<e50d and hd<0,
+                "rise_5m": pct_change(z[-2], z[-1]),
+                "rise_15m": pct_change(z[-4], z[-1]),
+                "rise_1h": pct_change(a[-5], a[-1]),
+                "rise_4h": pct_change(b[-5], b[-1]),
+                "rsi5": rz, "rsi15": ra, "rsi1h": rb, "rsi4h": rd,
+                "bull5": z[-1] > e20z > e50z and hz >= 0,
+                "bear5": z[-1] < e20z and hz < 0,
+                "bull15": a[-1] > e20a > e50a and ha >= 0,
+                "bear15": a[-1] < e20a and ha < 0,
+                "bull1h": b[-1] > e20b > e50b and hb >= 0,
+                "bear1h": b[-1] < e20b and hb < 0,
+                "bull4h": d[-1] > e20d > e50d and hd >= 0,
+                "bear4h": d[-1] < e20d < e50d and hd < 0,
             }
-        btc,eth=snap("BTCUSDT"),snap("ETHUSDT")
-        points=(2 if btc["bull4h"] else -2 if btc["bear4h"] else 0)+(2 if btc["bull1h"] else -2 if btc["bear1h"] else 0)+(1 if btc["bull15"] else -1 if btc["bear15"] else 0)+(1 if eth["bull1h"] else -1 if eth["bear1h"] else 0)+(1 if eth["bull15"] else -1 if eth["bear15"] else 0)
-        sudden_drop = btc["rise_5m"] <= -BTC_5M_DROP_BLOCK_PCT and btc["bear5"] and btc["rsi15"] < BTC_15M_RSI_BLOCK
-        trend_break = btc["rise_1h"] <= -BTC_1H_DROP_BLOCK_PCT and btc["bear15"] and btc["bear1h"]
+
+        btc = short_snapshot("BTCUSDT")
+        eth = short_snapshot("ETHUSDT")
+
+        # تحليل مستقل لصحة BTC عبر جميع الفريمات.
+        btc_health_frames = {}
+        if BTC_HEALTH_ENABLED:
+            btc_raw = {
+                "5m": get_klines("BTCUSDT", "5m", 120),
+                "15m": get_klines("BTCUSDT", "15m", 120),
+                "1h": get_klines("BTCUSDT", "1h", 220),
+                "4h": get_klines("BTCUSDT", "4h", 220),
+                "1d": get_klines("BTCUSDT", "1d", 220),
+                "1w": get_klines("BTCUSDT", "1w", 220),
+            }
+            btc_health_input = {
+                "1w": adaptive_frame_snapshot(btc_raw["1w"], 35),
+                "1d": adaptive_frame_snapshot(btc_raw["1d"], 50),
+                "4h": adaptive_frame_snapshot(btc_raw["4h"], 120),
+                "1h": adaptive_frame_snapshot(btc_raw["1h"], 120),
+                "15m": adaptive_frame_snapshot(btc_raw["15m"], 60),
+                "5m": adaptive_frame_snapshot(btc_raw["5m"], 60),
+            }
+            btc_health = multi_timeframe_alignment(btc_health_input, BTC_HEALTH_WEIGHTS)
+            btc_health_score = float(btc_health["score"])
+            btc_health_frames = dict(btc_health.get("frames", {}))
+            btc_health_label = btc_health.get("label", "غير متاح")
+        else:
+            btc_health_score = 50.0
+            btc_health_label = "معطل"
+
+        points = (
+            (2 if btc["bull4h"] else -2 if btc["bear4h"] else 0)
+            + (2 if btc["bull1h"] else -2 if btc["bear1h"] else 0)
+            + (1 if btc["bull15"] else -1 if btc["bear15"] else 0)
+            + (1 if eth["bull1h"] else -1 if eth["bear1h"] else 0)
+            + (1 if eth["bull15"] else -1 if eth["bear15"] else 0)
+        )
+        sudden_drop = (
+            btc["rise_5m"] <= -BTC_5M_DROP_BLOCK_PCT
+            and btc["bear5"]
+            and btc["rsi15"] < BTC_15M_RSI_BLOCK
+        )
+        trend_break = (
+            btc["rise_1h"] <= -BTC_1H_DROP_BLOCK_PCT
+            and btc["bear15"]
+            and btc["bear1h"]
+        )
         weak_pressure = bool(
             SMART_MARKET_FILTER
-            and btc["rsi15"] < BTC_WEAK_RSI_15M
             and (
-                btc["rsi5"] < BTC_WEAK_RSI_5M
-                or btc["rise_15m"] <= -BTC_WEAK_15M_DROP_PCT
+                btc_health_score < BTC_HEALTH_WEAK_SCORE
+                or (
+                    btc["rsi15"] < BTC_WEAK_RSI_15M
+                    and (btc["rsi5"] < BTC_WEAK_RSI_5M or btc["rise_15m"] <= -BTC_WEAK_15M_DROP_PCT)
+                    and (btc["bear5"] or btc["bear15"])
+                )
             )
-            and (btc["bear5"] or btc["bear15"])
         )
-        severe=btc["rise_1h"]<=-1.4 or btc["rise_4h"]<=-3 or sudden_drop or trend_break
-        hard_block=bool(SMART_MARKET_FILTER and (sudden_drop or trend_break or (btc["bear4h"] and btc["bear1h"] and btc["bear15"])))
-        regime="ضعيف جدًا" if severe or points<=-4 else "ضعيف" if points<=-2 or weak_pressure else "إيجابي" if points>=3 else "محايد"
-        bonus=12 if regime=="ضعيف جدًا" else 7 if regime=="ضعيف" else 0 if regime=="إيجابي" else 3
-        data={
-            "regime":regime,
-            "btc":btc,
-            "eth":eth,
-            "required_score":MIN_SCORE+bonus,
-            "severe_drop":severe,
-            "hard_block":hard_block,
-            "weak_pressure":weak_pressure,
+        severe = bool(
+            btc["rise_1h"] <= -1.4
+            or btc["rise_4h"] <= -3
+            or sudden_drop
+            or trend_break
+            or (BTC_HEALTH_ENABLED and btc_health_score < BTC_HEALTH_HARD_BLOCK_SCORE)
+        )
+        hard_block = bool(
+            SMART_MARKET_FILTER
+            and (
+                sudden_drop
+                or trend_break
+                or (btc["bear4h"] and btc["bear1h"] and btc["bear15"])
+                or (BTC_HEALTH_ENABLED and btc_health_score < BTC_HEALTH_HARD_BLOCK_SCORE)
+            )
+        )
+        regime = (
+            "ضعيف جدًا" if severe or points <= -4
+            else "ضعيف" if points <= -2 or weak_pressure
+            else "إيجابي" if points >= 3 and btc_health_score >= BTC_HEALTH_WEAK_SCORE
+            else "محايد"
+        )
+        bonus = 12 if regime == "ضعيف جدًا" else 7 if regime == "ضعيف" else 0 if regime == "إيجابي" else 3
+        if BTC_HEALTH_ENABLED and BTC_HEALTH_HARD_BLOCK_SCORE <= btc_health_score < BTC_HEALTH_WEAK_SCORE:
+            bonus += BTC_HEALTH_WEAK_SCORE_BONUS
+
+        data = {
+            "regime": regime,
+            "btc": btc,
+            "eth": eth,
+            "btc_health_score": round(btc_health_score, 1),
+            "btc_health_label": btc_health_label,
+            "btc_health_frames": btc_health_frames,
+            "required_score": MIN_SCORE + bonus,
+            "severe_drop": severe,
+            "hard_block": hard_block,
+            "weak_pressure": weak_pressure,
         }
     except Exception as exc:
         log(f"Market filter error: {exc}")
-        data={"regime":"غير متاح","btc":{"rise_1h":0,"rise_4h":0,"rise_15m":0,"rsi5":50,"rsi15":50},"eth":{"rise_1h":0,"rise_4h":0},"required_score":MIN_SCORE+3,"severe_drop":False,"hard_block":False,"weak_pressure":False}
+        data = {
+            "regime": "غير متاح",
+            "btc": {"rise_1h": 0, "rise_4h": 0, "rise_15m": 0, "rise_5m": 0, "rsi5": 50, "rsi15": 50},
+            "eth": {"rise_1h": 0, "rise_4h": 0},
+            "btc_health_score": 50.0,
+            "btc_health_label": "غير متاح",
+            "btc_health_frames": {},
+            "required_score": MIN_SCORE + 3,
+            "severe_drop": False,
+            "hard_block": False,
+            "weak_pressure": False,
+        }
     with MARKET_CACHE_LOCK:
-        MARKET_CACHE["data"],MARKET_CACHE["updated_at"]=data,now
+        MARKET_CACHE["data"], MARKET_CACHE["updated_at"] = data, now
     return dict(data)
 
 
@@ -671,7 +784,11 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
         closes=[x["close"] for x in c]; vols=[x["volume"] for x in c]
         av=mean(vols[-21:-1]); vr=vols[-1]/av if av else 0; e20=ema(closes,20)[-1]
         resistance=max(x["high"] for x in c[-21:-1]); proximity=closes[-1]/resistance if resistance else 0
-        score=vr*34+max(pct_change(closes[-7],closes[-1]),0)*5+max(proximity-0.965,0)*230
+        short_rise = pct_change(closes[-7], closes[-1])
+        score=vr*34+max(short_rise,0)*5+max(proximity-0.965,0)*230
+        # إبقاء العملات ذات الحجم الاستثنائي والحركة المستقلة ضمن القائمة المختصرة.
+        if EXCEPTIONAL_STRENGTH_ENABLED and vr >= 2.0 and short_rise >= 1.5:
+            score += 30
         # لا نهمل العملات التي بدأت ارتدادًا من هبوط واضح.
         dd=recent_drawdown_pct(c, 24)
         rv=rsi(closes)
@@ -780,10 +897,30 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 })
                 return None
 
+        rel = rise1 - float(market.get("btc", {}).get("rise_1h", 0))
+
         drawdown15=recent_drawdown_pct(closed15, 18)
         recent_rsi_low=min(x for x in r15v[-10:] if x is not None)
         structure_shift=higher_low_structure(closed5, 18)
         reclaimed_15=candle15["close"]>candle15["open"] and candle15["close"]>=prev15["high"]*0.997 and candle15["close"]>e20_15
+
+        # قوة استثنائية: العملة تتفوق بوضوح على BTC مع حجم واختراق حقيقي.
+        # لا تتجاوز الإيقاف الكامل، ولا تسمح بمطاردة RSI أو شمعة استنزافية.
+        exceptional_strength = bool(
+            EXCEPTIONAL_STRENGTH_ENABLED
+            and not market.get("hard_block", False)
+            and rel >= EXCEPTIONAL_MIN_RELATIVE_STRENGTH
+            and mtf["score"] >= EXCEPTIONAL_MIN_MTF_SCORE
+            and float(mtf.get("frames", {}).get("15m", 0)) >= EXCEPTIONAL_MIN_15M_SCORE
+            and vr15 >= EXCEPTIONAL_MIN_VOLUME_15M
+            and vr5 >= EXCEPTIONAL_MIN_VOLUME_5M
+            and a15 >= EXCEPTIONAL_MIN_ADX_15M
+            and r15 <= EXCEPTIONAL_MAX_RSI_15M
+            and h15 > 0 and h5 >= 0
+            and price > e20 and price > vw5
+            and (breakout or squeeze_break or early_break)
+        )
+
         reversal = REVERSAL_ENABLED and drawdown15>=REVERSAL_MIN_DRAWDOWN_PCT and recent_rsi_low<=REVERSAL_MAX_RSI_RECENT_LOW and REVERSAL_MIN_RSI_NOW<=r15<=REVERSAL_MAX_RSI_NOW and r15>r15v[-3] and reclaimed_15 and structure_shift and vr15>=REVERSAL_MIN_VOLUME_15M and vr5>=REVERSAL_MIN_VOLUME_5M and a15>=REVERSAL_MIN_ADX_15M and h5>=0 and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("hard_block",False)
 
         momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
@@ -842,7 +979,20 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and not market.get("hard_block", False)
         )
 
-        rel=rise1-float(market.get("btc",{}).get("rise_1h",0))
+        # V19: لا نرسل Trend Pullback أثناء ضعف صحة BTC أو موجة بيع 15m.
+        btc_health_score = float(market.get("btc_health_score", 50.0))
+        btc_15m_move = float(market.get("btc", {}).get("rise_15m", 0.0))
+        if pullback and BTC_HEALTH_ENABLED and not exceptional_strength and (
+            btc_health_score < BTC_PULLBACK_MIN_HEALTH_SCORE
+            or btc_15m_move <= -BTC_PULLBACK_MAX_15M_DROP_PCT
+        ):
+            log_rejection(symbol, "Trend Pullback مرفوض بسبب ضعف BTC متعدد الفريمات", {
+                "btc_health_score": round(btc_health_score, 1),
+                "required_health": BTC_PULLBACK_MIN_HEALTH_SCORE,
+                "btc_15m": round(btc_15m_move, 3),
+                "max_15m_drop": -BTC_PULLBACK_MAX_15M_DROP_PCT,
+            })
+            return None
 
         if market.get("hard_block",False):
             log_rejection(symbol, "إيقاف كامل بسبب هبوط BTC", {
@@ -854,7 +1004,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             return None
 
         # في ضعف BTC المتوسط لا نسمح إلا بعملة تتفوق عليه بوضوح.
-        if market.get("weak_pressure",False) and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
+        if market.get("weak_pressure",False) and not exceptional_strength and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
             log_rejection(symbol, "ضعف BTC والقوة النسبية غير كافية", {
                 "relative_strength": round(rel, 2),
                 "required_relative_strength": BTC_WEAK_MIN_RELATIVE_STRENGTH,
@@ -1007,6 +1157,12 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             recent = min(c["low"] for c in closed5[-12:-1])
             stop = min(recent, support, price-1.25*atr5)
 
+        if exceptional_strength:
+            score += EXCEPTIONAL_SCORE_BONUS
+            reasons.append(
+                f"قوة استثنائية مقابل BTC: تفوق {rel:+.2f}%، حجم 15m ×{vr15:.1f}، MTF {mtf['score']:.0f}"
+            )
+
         score += int(mtf["adjustment"])
         reasons.append(f"توافق الفريمات {mtf['label']} ({mtf['score']:.0f}/100، تعديل {mtf['adjustment']:+d})")
         if launch_mode:
@@ -1027,7 +1183,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if risk<=0 or risk/price*100>max_risk: return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1052,6 +1208,7 @@ def signal_message(r: Dict) -> str:
 • التوافق العام: {r.get('mtf_score',50):.1f}/100 — {r.get('mtf_label','محايد')}
 • تعديل التقييم: {r.get('mtf_adjustment',0):+d}
 • وضع الانطلاقة: {'مفعل 🚀' if r.get('launch_mode') else 'غير مفعل'}
+• القوة الاستثنائية: {'مفعلة ⚡' if r.get('exceptional_strength') else 'غير مفعلة'}
 
 النموذج: {r['setup']}
 نوع الإشارة: {kind}
@@ -1060,6 +1217,8 @@ def signal_message(r: Dict) -> str:
 
 🌍 حالة السوق
 • السوق: {r['market_regime']}
+• صحة BTC: {r.get('btc_health_score',50):.1f}/100 — {r.get('btc_health_label','غير متاح')}
+• BTC 4H/1H/15M/5M: {r.get('btc_health_frames',{}).get('4h',50):.0f}/{r.get('btc_health_frames',{}).get('1h',50):.0f}/{r.get('btc_health_frames',{}).get('15m',50):.0f}/{r.get('btc_health_frames',{}).get('5m',50):.0f}
 • BTC 1H: {r['btc_1h']:+.2f}%
 • BTC 15M: {r['btc_15m']:+.2f}%
 • RSI BTC: {r['btc_rsi15']:.1f}
@@ -1136,7 +1295,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V18 Pullback Quality.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V20 Exceptional Strength.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل تصنيف الجودة A+/A/B/C مع النجوم وتأثير MTF الأقوى.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
