@@ -1,5 +1,7 @@
-# V31: independent Strong Reclaim / Early Reversal A path for fast recovery setups,
-# plus V28 early-A qualification, V27 defensive validation, and V26 BTC overrides.
+# V32: model-calibrated independent surge/reclaim engine built from the supplied
+# EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT and ORDI examples.
+# Keeps A/A+ only, fixes relative-strength ordering, and avoids blocking independent
+# altcoin breakouts merely because BTC is weak (Flash Crash protection remains).
 import os, time, json
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -131,6 +133,11 @@ SURGE_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "SURGE_MAX_RSI_15M", "96"))
 SURGE_MAX_EXTENSION_ATR = float(ENGINE_ENV("SPOT", "SURGE_MAX_EXTENSION_ATR", "3.2"))
 SURGE_MIN_SCORE = int(ENGINE_ENV("SPOT", "SURGE_MIN_SCORE", "84"))
 SURGE_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "SURGE_MAX_RISK_PCT", "4.5"))
+SURGE_RECENT_VOLUME_LOOKBACK = int(ENGINE_ENV("SPOT", "SURGE_RECENT_VOLUME_LOOKBACK", "4"))
+SURGE_MIN_RECENT_VOLUME_15M = float(ENGINE_ENV("SPOT", "SURGE_MIN_RECENT_VOLUME_15M", "1.35"))
+SURGE_MIN_RECENT_VOLUME_5M = float(ENGINE_ENV("SPOT", "SURGE_MIN_RECENT_VOLUME_5M", "1.15"))
+SURGE_NEAR_HIGH_TOLERANCE_PCT = float(ENGINE_ENV("SPOT", "SURGE_NEAR_HIGH_TOLERANCE_PCT", "1.2"))
+SURGE_MIN_RISING_CLOSES = int(ENGINE_ENV("SPOT", "SURGE_MIN_RISING_CLOSES", "4"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -1115,6 +1122,21 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         if launch_mode and MTF_ENABLED:
             mtf = multi_timeframe_alignment(mtf_frames_input, LAUNCH_MTF_WEIGHTS)
 
+        # V32: القوة النسبية يجب أن تُحسب قبل أي مسار يستخدمها.
+        # في V31 كان مسار surge_continuation يقرأ rel قبل تعريفه، ما كان يؤدي
+        # إلى Analyze <symbol>: local variable 'rel' referenced before assignment
+        # ويمنع جميع المرشحين من الوصول إلى مرحلة الإرسال.
+        rel = rise1 - float(market.get("btc", {}).get("rise_1h", 0.0))
+
+        # النماذج المرسلة كثيرًا ما تكون بعد أول شمعة انفجار؛ عندها ينخفض حجم
+        # الشمعة الحالية رغم أن آخر عدة شمعات تحمل اندفاعًا واضحًا. لذلك نحتفظ
+        # بأعلى نسبة حجم حديثة بدل اشتراط أن تكون الشمعة الأخيرة وحدها ضخمة.
+        recent_n = max(2, SURGE_RECENT_VOLUME_LOOKBACK)
+        base15 = mean(vols15[-(24 + recent_n):-recent_n]) if len(vols15) >= 24 + recent_n else av15
+        base5 = mean(vols5[-(24 + recent_n):-recent_n]) if len(vols5) >= 24 + recent_n else av5
+        recent_vr15 = max(vols15[-recent_n:]) / base15 if base15 else vr15
+        recent_vr5 = max(vols5[-recent_n:]) / base5 if base5 else vr5
+
         # V31: حالة BTC المبكرة حتى تستطيع فلاتر RSI/الشمعة التمييز بين
         # انهيار السوق الحقيقي وبين ضعف BTC العادي مع عملة مستقلة قوية.
         btc5_move_early = float(market.get("btc", {}).get("rise_5m", 0.0))
@@ -1126,26 +1148,40 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             or btc1h_move_early <= -BTC_FLASH_CRASH_1H_DROP_PCT
         )
 
-        # مسار اندفاع مستقل: اختراق/استمرار واضح، حجم داعم، تفوق على BTC،
-        # واتجاه قصير صاعد. يسمح بـ RSI مرتفع لأنه يصف نفس النمط المطلوب،
-        # لكنه لا يعمل أثناء Flash Crash ولا مع امتداد شمعة غير منطقي.
-        surge_reference = max(c["high"] for c in closed15[-14:-2])
+        # V32: مسار اندفاع مستقل معاير على النماذج المرسلة. يقبل حالتين:
+        # 1) اختراق القمة الآن، أو 2) استمرار قريب جدًا من القمة بعد انفجار سابق
+        # مع بقاء الهيكل والحجم الحديث صاعدين. لا يعتمد على ضعف/قوة BTC إلا
+        # في منع Flash Crash الحقيقي.
+        surge_reference = max(c["high"] for c in closed15[-18:-2])
         surge_break = candle15["close"] >= surge_reference * 0.995 and candle15["close"] > candle15["open"]
+        near_recent_high = candle15["close"] >= surge_reference * (1 - SURGE_NEAR_HIGH_TOLERANCE_PCT / 100)
+        rising_closes = sum(
+            1 for a, b in zip(closes15[-7:-1], closes15[-6:]) if b > a
+        )
+        continuation_structure = bool(
+            near_recent_high
+            and rising_closes >= SURGE_MIN_RISING_CLOSES
+            and closes_above_e20 >= 4
+            and candle15["close"] >= e20_15
+        )
         surge_extension_atr = (candle15["close"] - e20_15) / atr15 if atr15 > 0 else 999.0
+        surge_volume_ready = bool(
+            (vr15 >= SURGE_MIN_VOLUME_15M and vr5 >= SURGE_MIN_VOLUME_5M)
+            or (recent_vr15 >= SURGE_MIN_RECENT_VOLUME_15M and recent_vr5 >= SURGE_MIN_RECENT_VOLUME_5M)
+        )
         surge_continuation = bool(
             SURGE_CONTINUATION_ENABLED
-            and surge_break
+            and (surge_break or continuation_structure)
             and price > e20 and price > vw5 and candle15["close"] > e20_15
             and e20_15 >= e20v[-4] * 0.995
-            and (h15 >= 0 or h5 >= 0)
+            and (h15 >= 0 or h5 >= 0 or e20_15 > e20v[-3])
             and a15 >= SURGE_MIN_ADX_15M
-            and vr15 >= SURGE_MIN_VOLUME_15M
-            and vr5 >= SURGE_MIN_VOLUME_5M
+            and surge_volume_ready
             and rel >= SURGE_MIN_RELATIVE_STRENGTH
             and mtf["score"] >= SURGE_MIN_MTF_SCORE
             and r15 <= SURGE_MAX_RSI_15M
             and surge_extension_atr <= SURGE_MAX_EXTENSION_ATR
-            and close_location(candle15) >= 0.52
+            and close_location(candle15) >= 0.45
             and not btc_flash_crash_early
         )
 
@@ -1172,8 +1208,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         # V30: تأكيد 5m مرن للاختراق.
         # الشمعة الحمراء الصغيرة فوق المقاومة قد تكون إعادة اختبار سليمة، وليست فشلًا.
-        # نحسب القوة النسبية قبل قرار الرفض حتى لا تُرفض العملات المستقلة مبكرًا.
-        rel = rise1 - float(market.get("btc", {}).get("rise_1h", 0))
+        # القوة النسبية حُسبت مبكرًا قبل مسارات الاندفاع والتأكيد.
         if BREAKOUT_CONFIRM_5M and breakout:
             confirm_after_breakout = candle5["close_time"] >= candle15["close_time"]
             held_level = (
@@ -1471,22 +1506,24 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             reasons = [
                 "⚡ اندفاع متكيف مستقل عن BTC مع اختراق قمة حديثة",
                 f"قوة نسبية أمام BTC {rel:+.2f}%",
-                f"حجم 15m ×{vr15:.1f} وتأكيد 5m ×{vr5:.1f}",
+                f"حجم حالي 15m ×{vr15:.1f}/5m ×{vr5:.1f}، وأعلى حجم حديث ×{recent_vr15:.1f}/×{recent_vr5:.1f}",
                 f"RSI زخم {r15:.1f} مع إغلاق صحي عند {close_location(candle15)*100:.0f}% من مدى الشمعة",
                 f"ADX 15m {a15:.0f} وEMA20 صاعد/مستقر",
                 f"توافق الفريمات {mtf['score']:.0f}/100",
                 "السعر فوق EMA20 وVWAP",
             ]
             if breakout or squeeze_break: score += 8
-            if vr15 >= 1.5: score += 6
-            if vr5 >= 1.3: score += 4
+            if max(vr15, recent_vr15) >= 1.5: score += 6
+            if max(vr5, recent_vr5) >= 1.3: score += 4
             if rel >= 4.0: score += 6
             if obv5[-1] > obv5[-5]: score += 5
             if mtf["score"] >= 60: score += 5
             mode, setup = "surge_continuation", "Adaptive Surge / Multi-frame Breakout"
-            threshold = max(SURGE_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
-            recent_low = min(c["low"] for c in closed5[-10:-1])
-            stop = min(recent_low, e20, price - 1.15 * atr5)
+            # المسار مستقل عن مزاج BTC؛ لا نرفع حده بسبب weak market bonus.
+            threshold = SURGE_MIN_SCORE
+            recent_low = min(c["low"] for c in closed5[-8:-1])
+            stop_candidates = [recent_low, e20 * 0.995, price - 1.25 * atr5]
+            stop = max(x for x in stop_candidates if 0 < x < price)
 
         elif trend_ignition:
             score = int(ti_structure["score"])
@@ -1742,7 +1779,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
