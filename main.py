@@ -1117,14 +1117,20 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             })
             return None
 
-        # V26 تأكيد 5m مرن: لا نفوّت أول انطلاقة بسبب تزامن إغلاق 5m و15m.
-        # في Trend Ignition القوي نسمح لـ MACD 5m أن يكون محايدًا/سالبًا قليلًا فقط،
-        # بشرط ثبات المستوى وإغلاق صحي؛ ولا نسمح بكسر واضح للزخم.
+        # V30: تأكيد 5m مرن للاختراق.
+        # الشمعة الحمراء الصغيرة فوق المقاومة قد تكون إعادة اختبار سليمة، وليست فشلًا.
+        # نحسب القوة النسبية قبل قرار الرفض حتى لا تُرفض العملات المستقلة مبكرًا.
+        rel = rise1 - float(market.get("btc", {}).get("rise_1h", 0))
         if BREAKOUT_CONFIRM_5M and breakout:
             confirm_after_breakout = candle5["close_time"] >= candle15["close_time"]
-            held_level = candle5["close"] > resistance and candle5["low"] >= resistance * (1 - CONFIRM_MAX_DIP_PCT / 100)
-            healthy_close = candle5["close"] >= candle5["open"] and close_location(candle5) >= MIN_CONFIRM_CLOSE_LOCATION
+            held_level = (
+                candle5["close"] > resistance
+                and candle5["low"] >= resistance * (1 - CONFIRM_MAX_DIP_PCT / 100)
+            )
+            close_loc_5m = close_location(candle5)
+            healthy_close = candle5["close"] >= candle5["open"] and close_loc_5m >= MIN_CONFIRM_CLOSE_LOCATION
             normal_confirmation = held_level and healthy_close and h5 >= 0 and confirm_after_breakout
+
             hist_floor = -abs(h15) * TI_CONFIRM_MAX_NEGATIVE_HIST_RATIO
             ignition_confirmation = bool(
                 TI_CONFIRM_ALLOW_FLAT_MACD
@@ -1132,21 +1138,37 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 and held_level and healthy_close
                 and h5 >= hist_floor
             )
-            confirmation_valid = normal_confirmation or ignition_confirmation
+
+            # إعادة اختبار هادئة: يسمح بشمعة حمراء صغيرة ما دام السعر حافظ على المقاومة،
+            # الإغلاق ليس قرب القاع، والزخم ليس منكسرًا بوضوح، مع حجم أو قوة نسبية داعمة.
+            candle_body_pct_5m = abs(candle5["close"] - candle5["open"]) / candle5["open"] * 100 if candle5["open"] else 999.0
+            retest_confirmation = bool(
+                confirm_after_breakout
+                and held_level
+                and close_loc_5m >= 0.30
+                and candle_body_pct_5m <= 1.20
+                and h5 >= hist_floor
+                and (vr5 >= 1.0 or rel >= 1.5)
+            )
+
+            confirmation_valid = normal_confirmation or ignition_confirmation or retest_confirmation
             if not confirmation_valid:
                 log_rejection(symbol, "فشل تأكيد الاختراق 5m", {
                     "after_breakout": confirm_after_breakout,
                     "trend_ignition_override": ignition_confirmation,
+                    "retest_override": retest_confirmation,
                     "held_level": held_level,
                     "healthy_close": healthy_close,
+                    "close_location": round(float(close_loc_5m), 3),
+                    "body_pct": round(float(candle_body_pct_5m), 3),
                     "h5": round(float(h5), 8),
                     "hist_floor": round(float(hist_floor), 8),
+                    "relative_strength": round(float(rel), 2),
+                    "volume5": round(float(vr5), 2),
                     "confirm_close": candle5["close"],
                     "resistance": resistance,
                 })
                 return None
-
-        rel = rise1 - float(market.get("btc", {}).get("rise_1h", 0))
 
         drawdown15=recent_drawdown_pct(closed15, 18)
         recent_rsi_low=min(x for x in r15v[-10:] if x is not None)
