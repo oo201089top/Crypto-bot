@@ -1,5 +1,5 @@
-# V28: early-A qualification for strong Trend Ignition / Exceptional Strength setups,
-# plus V27 defensive validation, V26 BTC overrides, and V12 foundations.
+# V29: independent Strong Reclaim / Early Reversal A path for fast recovery setups,
+# plus V28 early-A qualification, V27 defensive validation, and V26 BTC overrides.
 import os, time, json
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,7 +10,7 @@ import requests
 
 # V27: ترتيب صريح عند تحقق أكثر من استراتيجية في الشمعة نفسها.
 # هذا يطابق ترتيب elif التاريخي ولا يغير سلوك التداول.
-MODE_PRIORITY = ("trend_ignition", "accumulation", "reversal", "pullback", "momentum", "balanced")
+MODE_PRIORITY = ("trend_ignition", "accumulation", "strong_reclaim", "reversal", "pullback", "momentum", "balanced")
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -104,6 +104,20 @@ EARLY_A_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_VOLUME_15M", "1.2
 EARLY_A_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_VOLUME_5M", "1.10"))
 EARLY_A_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "EARLY_A_MAX_RSI_15M", "72"))
 EARLY_A_MIN_STRUCTURE_SCORE = float(ENGINE_ENV("SPOT", "EARLY_A_MIN_STRUCTURE_SCORE", "70"))
+
+# V29: مسار Strong Reclaim مستقل لالتقاط ارتداد قوي مبكر مثل DEXE دون إرسال B/C.
+STRONG_RECLAIM_ENABLED = ENGINE_ENV("SPOT", "STRONG_RECLAIM_ENABLED", "1") == "1"
+STRONG_RECLAIM_MIN_DRAWDOWN_PCT = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_DRAWDOWN_PCT", "2.5"))
+STRONG_RECLAIM_MIN_RELATIVE_STRENGTH = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_RELATIVE_STRENGTH", "2.25"))
+STRONG_RECLAIM_MIN_VOLUME_15M = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_VOLUME_15M", "1.35"))
+STRONG_RECLAIM_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_VOLUME_5M", "1.15"))
+STRONG_RECLAIM_MIN_RSI_15M = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_RSI_15M", "45"))
+STRONG_RECLAIM_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MAX_RSI_15M", "68"))
+STRONG_RECLAIM_MIN_ADX_15M = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_ADX_15M", "16"))
+STRONG_RECLAIM_MIN_MTF_SCORE = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_MTF_SCORE", "40"))
+STRONG_RECLAIM_MAX_EMA20_DISTANCE = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MAX_EMA20_DISTANCE", "2.0"))
+STRONG_RECLAIM_MIN_SCORE = int(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MIN_SCORE", "84"))
+STRONG_RECLAIM_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "STRONG_RECLAIM_MAX_RISK_PCT", "4.5"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -1155,6 +1169,27 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and (breakout or squeeze_break or early_break)
         )
 
+        # V29: ارتداد قوي مبكر مستقل. لا يشترط اكتمال الاتجاه على الفريمات العليا،
+        # لكنه يشترط استعادة بنية وحجم وقوة نسبية واضحة، ولا يتجاوز Flash Crash لاحقًا.
+        strong_reclaim = bool(
+            STRONG_RECLAIM_ENABLED
+            and drawdown15 >= STRONG_RECLAIM_MIN_DRAWDOWN_PCT
+            and structure_shift and reclaimed_15
+            and candle15["close"] > e20_15
+            and price > e20 and price > vw5
+            and STRONG_RECLAIM_MIN_RSI_15M <= r15 <= STRONG_RECLAIM_MAX_RSI_15M
+            and r15 > r15v[-3]
+            and vr15 >= STRONG_RECLAIM_MIN_VOLUME_15M
+            and vr5 >= STRONG_RECLAIM_MIN_VOLUME_5M
+            and a15 >= STRONG_RECLAIM_MIN_ADX_15M
+            and mtf["score"] >= STRONG_RECLAIM_MIN_MTF_SCORE
+            and rel >= STRONG_RECLAIM_MIN_RELATIVE_STRENGTH
+            and h5 >= 0 and macd_turn
+            and dist <= STRONG_RECLAIM_MAX_EMA20_DISTANCE
+            and close_location(candle15) >= 0.55
+            and not s4["strongly_bearish"]
+        )
+
         reversal = REVERSAL_ENABLED and drawdown15>=REVERSAL_MIN_DRAWDOWN_PCT and recent_rsi_low<=REVERSAL_MAX_RSI_RECENT_LOW and REVERSAL_MIN_RSI_NOW<=r15<=REVERSAL_MAX_RSI_NOW and r15>r15v[-3] and reclaimed_15 and structure_shift and vr15>=REVERSAL_MIN_VOLUME_15M and vr5>=REVERSAL_MIN_VOLUME_5M and a15>=REVERSAL_MIN_ADX_15M and h5>=0 and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("hard_block",False)
 
         momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
@@ -1247,7 +1282,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             BTC_OVERRIDE_ENABLED
             and market.get("hard_block", False)
             and not btc_catastrophic
-            and (trend_ignition or exceptional_strength)
+            and (trend_ignition or exceptional_strength or strong_reclaim)
             and rel >= BTC_OVERRIDE_MIN_RELATIVE_STRENGTH
             and vr15 >= BTC_OVERRIDE_MIN_VOLUME_15M
             and vr5 >= BTC_OVERRIDE_MIN_VOLUME_5M
@@ -1261,7 +1296,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and market.get("hard_block", False)
             and btc_catastrophic
             and not btc_flash_crash
-            and (trend_ignition or exceptional_strength)
+            and (trend_ignition or exceptional_strength or strong_reclaim)
             and rel >= BTC_EXTREME_MIN_RELATIVE_STRENGTH
             and vr15 >= BTC_EXTREME_MIN_VOLUME_15M
             and vr5 >= BTC_EXTREME_MIN_VOLUME_5M
@@ -1294,7 +1329,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             log(f"BTC override accepted {symbol} [{override_kind}] | rel={rel:.2f}% | vr15={vr15:.2f} | vr5={vr5:.2f} | mtf={mtf['score']:.1f}")
 
         # في ضعف BTC المتوسط لا نسمح إلا بعملة تتفوق عليه بوضوح.
-        if market.get("weak_pressure",False) and not exceptional_strength and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
+        if market.get("weak_pressure",False) and not (exceptional_strength or strong_reclaim) and rel < BTC_WEAK_MIN_RELATIVE_STRENGTH:
             log_rejection(symbol, "ضعف BTC والقوة النسبية غير كافية", {
                 "relative_strength": round(rel, 2),
                 "required_relative_strength": BTC_WEAK_MIN_RELATIVE_STRENGTH,
@@ -1312,7 +1347,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if accumulation
                 else ACCUMULATION_MIN_NEXT_RESISTANCE_PCT if trend_ignition
                 else PULLBACK_MIN_NEXT_RESISTANCE_PCT if pullback
-                else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal)
+                else MOMENTUM_MIN_NEXT_RESISTANCE_PCT if (momentum or reversal or strong_reclaim)
                 else MIN_NEXT_RESISTANCE_PCT
             )
             if overhead_pct < required_room:
@@ -1330,6 +1365,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             name for name, matched in (
                 ("trend_ignition", trend_ignition),
                 ("accumulation", accumulation),
+                ("strong_reclaim", strong_reclaim),
                 ("reversal", reversal),
                 ("pullback", pullback),
                 ("momentum", momentum),
@@ -1386,6 +1422,27 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             recent_low = min(c["low"] for c in closed5[-10:-1])
             stop = min(base_low, recent_low, price-1.20*atr5)
 
+        elif strong_reclaim:
+            score = 22+16+14+12+10+8+6
+            reasons = [
+                f"⚡ Strong Reclaim بعد هبوط {drawdown15:.1f}%",
+                "تحول هيكل 5m إلى قاع أعلى",
+                "استعادة EMA20 على 15m بإغلاق صحي",
+                f"قوة نسبية أمام BTC {rel:+.2f}%",
+                f"حجم ارتداد 15m ×{vr15:.1f} وتأكيد 5m ×{vr5:.1f}",
+                f"RSI استعادة غير متشبع {r15:.1f}",
+                "MACD بدأ ينعطف والسعر فوق VWAP",
+            ]
+            if obv5[-1] > obv5[-5]: score += 6
+            if rel >= 3.5: score += 5
+            if vr15 >= 1.8: score += 4
+            if market.get("regime") in ("إيجابي", "محايد"): score += 3
+            mode, setup = "strong_reclaim", "Strong Reclaim / Early Reversal"
+            threshold = max(STRONG_RECLAIM_MIN_SCORE, int(market.get("required_score", MIN_SCORE)))
+            swing_low = min(c["low"] for c in closed15[-12:-1])
+            recent_low = min(c["low"] for c in closed5[-12:-1])
+            stop = min(swing_low, recent_low, price-1.25*atr5)
+
         elif reversal:
             score = 22+16+12+10+8+8+6
             reasons = [
@@ -1402,7 +1459,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 or reversal_1h_score < REVERSAL_A_MIN_1H_SCORE
             ):
                 reasons.append(
-                    f"تنبيه: الفريمات العليا غير مكتملة — MTF {mtf['score']:.0f}، 4H {reversal_4h_score:.0f}، 1H {reversal_1h_score:.0f}; أقصى جودة B"
+                    f"تنبيه: الفريمات العليا غير مكتملة — MTF {mtf['score']:.0f}، 4H {reversal_4h_score:.0f}، 1H {reversal_1h_score:.0f}; لا يسمح بتصنيف A+"
                 )
             if obv5[-1] > obv5[-5]: score += 6
             if rel >= 0.5: score += 6
@@ -1557,6 +1614,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             TREND_IGNITION_MAX_RISK_PCT if mode=="trend_ignition"
             else ACCUMULATION_MAX_RISK_PCT if mode=="accumulation"
             else PULLBACK_MAX_RISK_PCT if mode=="pullback"
+            else STRONG_RECLAIM_MAX_RISK_PCT if mode=="strong_reclaim"
             else REVERSAL_MAX_RISK_PCT if mode=="reversal"
             else MAX_RISK_PCT
         )
@@ -1571,9 +1629,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             return None
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
-        if early_a_qualified:
+        if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1585,7 +1643,7 @@ def fmt(v: float) -> str:
 
 def signal_message(r: Dict) -> str:
     reasons="\n".join(f"• {x}" for x in r["reasons"])
-    kind="Trend Ignition 🚀" if r.get("mode")=="trend_ignition" else "تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "Trend Pullback" if r.get("mode")=="pullback" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
+    kind="Trend Ignition 🚀" if r.get("mode")=="trend_ignition" else "تجميع قبل الانطلاقة" if r.get("mode")=="accumulation" else "Strong Reclaim ⚡" if r.get("mode")=="strong_reclaim" else "Trend Pullback" if r.get("mode")=="pullback" else "انطلاقة قوية" if r.get("mode")=="momentum" else "ارتداد ذكي" if r.get("mode")=="reversal" else "دخول متوازن"
     title = "🚀 إشارة Trend Ignition مستقلة" if r.get("mode")=="trend_ignition" else "🟢 إشارة شراء سبوت"
     return f"""{title} — {r['symbol']}
 
@@ -1674,7 +1732,7 @@ def scan(state: Dict) -> None:
         for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
             x=f.result()
             if x and cooled(state,x): results.append(x)
-    results.sort(key=lambda x:(5 if x.get("mode")=="trend_ignition" else 4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
+    results.sort(key=lambda x:(6 if x.get("mode")=="trend_ignition" else 5 if x.get("mode")=="strong_reclaim" else 4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
         if not send_message(signal_message(r)):
