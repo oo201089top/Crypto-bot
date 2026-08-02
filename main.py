@@ -1,4 +1,4 @@
-# V32: model-calibrated independent surge/reclaim engine built from the supplied
+# V33: early-wave calibrated independent surge/reclaim engine built from the supplied
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT and ORDI examples.
 # Keeps A/A+ only, fixes relative-strength ordering, and avoids blocking independent
 # altcoin breakouts merely because BTC is weak (Flash Crash protection remains).
@@ -138,6 +138,19 @@ SURGE_MIN_RECENT_VOLUME_15M = float(ENGINE_ENV("SPOT", "SURGE_MIN_RECENT_VOLUME_
 SURGE_MIN_RECENT_VOLUME_5M = float(ENGINE_ENV("SPOT", "SURGE_MIN_RECENT_VOLUME_5M", "1.15"))
 SURGE_NEAR_HIGH_TOLERANCE_PCT = float(ENGINE_ENV("SPOT", "SURGE_NEAR_HIGH_TOLERANCE_PCT", "1.2"))
 SURGE_MIN_RISING_CLOSES = int(ENGINE_ENV("SPOT", "SURGE_MIN_RISING_CLOSES", "4"))
+
+# V33: التقاط بداية الموجة ومنع الإشارة بعد امتداد الحركة.
+EARLY_WAVE_ENABLED = ENGINE_ENV("SPOT", "EARLY_WAVE_ENABLED", "1") == "1"
+EARLY_WAVE_MIN_PROJECTED_VOLUME_15M = float(ENGINE_ENV("SPOT", "EARLY_WAVE_MIN_PROJECTED_VOLUME_15M", "1.30"))
+EARLY_WAVE_MIN_VOLUME_5M = float(ENGINE_ENV("SPOT", "EARLY_WAVE_MIN_VOLUME_5M", "1.10"))
+EARLY_WAVE_MIN_CLOSE_LOCATION = float(ENGINE_ENV("SPOT", "EARLY_WAVE_MIN_CLOSE_LOCATION", "0.55"))
+EARLY_WAVE_MAX_BREAKOUT_EXTENSION_PCT = float(ENGINE_ENV("SPOT", "EARLY_WAVE_MAX_BREAKOUT_EXTENSION_PCT", "1.80"))
+EARLY_WAVE_MAX_EMA20_DISTANCE_ATR = float(ENGINE_ENV("SPOT", "EARLY_WAVE_MAX_EMA20_DISTANCE_ATR", "1.80"))
+CHASE_MAX_BREAKOUT_EXTENSION_PCT = float(ENGINE_ENV("SPOT", "CHASE_MAX_BREAKOUT_EXTENSION_PCT", "3.20"))
+CHASE_MAX_EMA20_DISTANCE_ATR = float(ENGINE_ENV("SPOT", "CHASE_MAX_EMA20_DISTANCE_ATR", "2.60"))
+CHASE_MAX_15M_RISE_PCT = float(ENGINE_ENV("SPOT", "CHASE_MAX_15M_RISE_PCT", "4.50"))
+CHASE_MAX_1H_RISE_PCT = float(ENGINE_ENV("SPOT", "CHASE_MAX_1H_RISE_PCT", "9.00"))
+CHASE_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "CHASE_MAX_RSI_15M", "82"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -395,6 +408,17 @@ def close_location(candle: Dict) -> float:
     """موضع الإغلاق داخل مدى الشمعة: 0 عند القاع و1 عند القمة."""
     span = candle["high"] - candle["low"]
     return (candle["close"] - candle["low"]) / span if span > 0 else 0.5
+
+
+def projected_volume_ratio(candle: Dict, average_volume: float, interval_seconds: int) -> float:
+    """يقدّر نسبة حجم الشمعة الحية دون انتظار إغلاقها، مع حد محافظ للتضخيم."""
+    if average_volume <= 0 or interval_seconds <= 0:
+        return 0.0
+    close_time_s = float(candle.get("close_time", 0)) / 1000.0
+    remaining = max(0.0, close_time_s - time.time())
+    elapsed_ratio = max(0.20, min(1.0, 1.0 - remaining / interval_seconds))
+    raw_ratio = float(candle.get("volume", 0.0)) / average_volume
+    return min(raw_ratio / elapsed_ratio, raw_ratio * 3.0)
 
 
 def send_message(text: str) -> bool:
@@ -1050,6 +1074,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         c1d=get_klines(symbol,"1d",220)
         c1w=get_klines(symbol,"1w",220)
         closed5,closed15=c5[:-1],c15[:-1]
+        live5,live15=c5[-1],c15[-1]
         if min(len(closed5),len(closed15),len(c1h)-1,len(c4h)-1)<210:
             return None
         closes5=[c["close"] for c in closed5]; vols5=[c["volume"] for c in closed5]; price=closes5[-1]; candle5=closed5[-1]
@@ -1064,6 +1089,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         e20v,e50v=ema(closes15,20),ema(closes15,50); e20_15,e50_15=e20v[-1],e50v[-1]; r15v=rsi(closes15); r15=r15v[-1]; m15,s15,h15=macd(closes15); a15=adx(closed15)
         if None in (e20_15,e50_15,r15,m15,s15,h15): return None
         av15=mean(vols15[-21:-1]); vr15=vols15[-1]/av15 if av15 else 0; at15=mean(trades15[-21:-1]); tr15=trades15[-1]/at15 if at15 else 0
+        live_vr15=projected_volume_ratio(live15, av15, 15*60)
+        live_vr5=projected_volume_ratio(live5, av5, 5*60)
+        live_price=float(live5["close"] or price)
         resistance=max(c["high"] for c in closed15[-22:-2]); support=min(c["low"] for c in closed15[-12:-1])
         atr15=atr(closed15)
         breakout_range=candle15["high"]-candle15["low"]
@@ -1086,17 +1114,40 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         accumulation_info = accumulation_base(closed15, ACCUMULATION_LOOKBACK_15M) if ACCUMULATION_ENABLED else None
         early_level = float(accumulation_info["resistance"]) if accumulation_info else 0.0
-        early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
+        closed_early_break = bool(accumulation_info and candle15["close"] >= early_level * 0.998 and candle15["close"] > candle15["open"])
+        live_break_extension = pct_change(early_level, live_price) if early_level > 0 else 999.0
+        live_early_break = bool(
+            EARLY_WAVE_ENABLED and accumulation_info and early_level > 0
+            and live_price >= early_level * 0.998
+            and live15["close"] > live15["open"]
+            and close_location(live15) >= EARLY_WAVE_MIN_CLOSE_LOCATION
+            and live_vr15 >= EARLY_WAVE_MIN_PROJECTED_VOLUME_15M
+            and max(vr5, live_vr5) >= EARLY_WAVE_MIN_VOLUME_5M
+            and live_break_extension <= EARLY_WAVE_MAX_BREAKOUT_EXTENSION_PCT
+        )
+        early_break = closed_early_break or live_early_break
 
         # V24: Trend Ignition Structure Engine — بنية السعر أولًا، والمؤشرات كفلاتر أمان.
         ti_structure = trend_ignition_structure(c15)
         closes_above_e20 = sum(1 for close, e in zip(closes15[-5:], e20v[-5:]) if e is not None and close > e)
         ema20_flat_or_rising = bool(e20_15 >= e20v[-4] * 0.998)
-        structure_ready = bool(ti_structure and ti_structure["valid"])
+        structure_ready = bool(ti_structure and (ti_structure["valid"] or (float(ti_structure.get("score", 0)) >= TI_STRUCTURE_MIN_SCORE - 8)))
+        shelf_level = float(ti_structure["shelf_level"]) if ti_structure else 0.0
+        live_structure_extension = pct_change(shelf_level, live_price) if shelf_level > 0 else 999.0
+        live_structure_break = bool(
+            EARLY_WAVE_ENABLED and ti_structure and shelf_level > 0
+            and live_price >= shelf_level * 0.998
+            and live15["close"] > live15["open"]
+            and close_location(live15) >= EARLY_WAVE_MIN_CLOSE_LOCATION
+            and live_vr15 >= EARLY_WAVE_MIN_PROJECTED_VOLUME_15M
+            and max(vr5, live_vr5) >= EARLY_WAVE_MIN_VOLUME_5M
+            and live_structure_extension <= EARLY_WAVE_MAX_BREAKOUT_EXTENSION_PCT
+        )
         early_structure_break = bool(
-            ti_structure
-            and candle15["close"] >= float(ti_structure["shelf_level"]) * 0.995
-            and ti_structure["extension_pct"] <= TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT
+            ti_structure and (
+                (candle15["close"] >= shelf_level * 0.995 and ti_structure["extension_pct"] <= TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT)
+                or live_structure_break
+            )
         )
 
         trend_ignition = bool(
@@ -1105,8 +1156,8 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and early_structure_break
             and ema20_flat_or_rising
             and closes_above_e20 >= 2
-            and h15 >= 0 and h5 >= 0
-            and price > vw5
+            and (h15 >= 0 or live_structure_break) and (h5 >= 0 or live_vr5 >= EARLY_WAVE_MIN_VOLUME_5M)
+            and live_price > vw5
             and rise15 <= max(TREND_IGNITION_MAX_15M_RISE, TI_STRUCTURE_MAX_BREAKOUT_EXTENSION_PCT)
             and rise1 <= TREND_IGNITION_MAX_1H_RISE
             and not s1["strongly_bearish"] and not s4["strongly_bearish"]
@@ -1169,9 +1220,27 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             (vr15 >= SURGE_MIN_VOLUME_15M and vr5 >= SURGE_MIN_VOLUME_5M)
             or (recent_vr15 >= SURGE_MIN_RECENT_VOLUME_15M and recent_vr5 >= SURGE_MIN_RECENT_VOLUME_5M)
         )
+        live_surge_break = bool(
+            EARLY_WAVE_ENABLED
+            and live_price >= surge_reference * 0.998
+            and live15["close"] > live15["open"]
+            and close_location(live15) >= EARLY_WAVE_MIN_CLOSE_LOCATION
+            and live_vr15 >= EARLY_WAVE_MIN_PROJECTED_VOLUME_15M
+            and max(vr5, live_vr5) >= EARLY_WAVE_MIN_VOLUME_5M
+            and pct_change(surge_reference, live_price) <= EARLY_WAVE_MAX_BREAKOUT_EXTENSION_PCT
+        )
+        breakout_extension_pct = pct_change(surge_reference, live_price) if surge_reference > 0 else 999.0
+        ema_extension_atr = (live_price - e20_15) / atr15 if atr15 > 0 else 999.0
+        chased_move = bool(
+            breakout_extension_pct > CHASE_MAX_BREAKOUT_EXTENSION_PCT
+            or ema_extension_atr > CHASE_MAX_EMA20_DISTANCE_ATR
+            or rise15 > CHASE_MAX_15M_RISE_PCT
+            or rise1 > CHASE_MAX_1H_RISE_PCT
+            or (r15 > CHASE_MAX_RSI_15M and not retest)
+        )
         surge_continuation = bool(
             SURGE_CONTINUATION_ENABLED
-            and (surge_break or continuation_structure)
+            and (live_surge_break or surge_break or continuation_structure)
             and price > e20 and price > vw5 and candle15["close"] > e20_15
             and e20_15 >= e20v[-4] * 0.995
             and (h15 >= 0 or h5 >= 0 or e20_15 > e20v[-3])
@@ -1181,9 +1250,20 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and mtf["score"] >= SURGE_MIN_MTF_SCORE
             and r15 <= SURGE_MAX_RSI_15M
             and surge_extension_atr <= SURGE_MAX_EXTENSION_ATR
-            and close_location(candle15) >= 0.45
+            and (live_surge_break or not chased_move)
+            and (close_location(live15) if live_surge_break else close_location(candle15)) >= 0.45
             and not btc_flash_crash_early
         )
+
+        if chased_move and not (retest or live_early_break or live_structure_break or live_surge_break):
+            log_rejection(symbol, "مطاردة حركة ممتدة بعد بداية الموجة", {
+                "breakout_extension_pct": round(breakout_extension_pct, 2),
+                "ema_extension_atr": round(ema_extension_atr, 2),
+                "rise15": round(rise15, 2),
+                "rise1h": round(rise1, 2),
+                "rsi15": round(r15, 2),
+            })
+            return None
 
         # حماية من مطاردة شمعة اندفاع: مسار V31 يعالج الاندفاع المؤكد كحالة مستقلة.
         hot_rsi = r15 >= HOT_RSI_15M
@@ -1501,6 +1581,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 f"selected={selected_by_priority} | priority={MODE_PRIORITY}"
             )
 
+        early_wave_triggered = bool(live_surge_break or live_structure_break or live_early_break)
+        signal_price = live_price if early_wave_triggered else price
+
         if surge_continuation:
             score = 72
             reasons = [
@@ -1512,7 +1595,10 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 f"توافق الفريمات {mtf['score']:.0f}/100",
                 "السعر فوق EMA20 وVWAP",
             ]
-            if breakout or squeeze_break: score += 8
+            if live_surge_break:
+                score += 10
+                reasons.insert(0, "🚀 دخول مبكر أثناء تكوّن الاختراق قبل إغلاق 15m")
+            elif breakout or squeeze_break: score += 8
             if max(vr15, recent_vr15) >= 1.5: score += 6
             if max(vr5, recent_vr5) >= 1.3: score += 4
             if rel >= 4.0: score += 6
@@ -1537,6 +1623,9 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 f"EMA20 مستقر/صاعد و{closes_above_e20}/5 إغلاقات فوقه",
                 f"توافق الفريمات {mtf['score']:.0f}/100 وقوة نسبية {rel:+.2f}%",
             ]
+            if live_structure_break:
+                score += 8
+                reasons.insert(0, "🚀 كسر حي للرف مع حجم متوقع قوي — بداية الموجة")
             if obv5[-1] > obv5[-5]: score += 5
             if tr15 >= 1.15: score += 4
             if rel >= 0.35: score += 5
@@ -1756,6 +1845,8 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 "mtf_adjustment": int(mtf["adjustment"]),
             })
             return None
+        # عند الإشارة الحية تُحسب الصفقة من السعر الحي لا من آخر إغلاق 5m.
+        price = signal_price
         risk=price-stop
         max_risk = (
             SURGE_MAX_RISK_PCT if mode=="surge_continuation"
@@ -1779,7 +1870,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {}}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -1894,7 +1985,7 @@ def scan(state: Dict) -> None:
 def main() -> None:
     state=load_state();
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V31 Adaptive Surge Engine.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V33 Early-Wave Engine.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
