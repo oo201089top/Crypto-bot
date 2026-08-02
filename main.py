@@ -1,7 +1,8 @@
-# V33: early-wave calibrated independent surge/reclaim engine built from the supplied
-# EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT and ORDI examples.
-# Keeps A/A+ only, fixes relative-strength ordering, and avoids blocking independent
-# altcoin breakouts merely because BTC is weak (Flash Crash protection remains).
+# V34: early-wave / anti-chase engine calibrated from the supplied
+# EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
+# RIF, ESP, ROSE, WLD and HEI examples.
+# Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
+# and keeps BTC independence only when the altcoin structure is genuinely early.
 import os, time, json
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -151,6 +152,20 @@ CHASE_MAX_EMA20_DISTANCE_ATR = float(ENGINE_ENV("SPOT", "CHASE_MAX_EMA20_DISTANC
 CHASE_MAX_15M_RISE_PCT = float(ENGINE_ENV("SPOT", "CHASE_MAX_15M_RISE_PCT", "4.50"))
 CHASE_MAX_1H_RISE_PCT = float(ENGINE_ENV("SPOT", "CHASE_MAX_1H_RISE_PCT", "9.00"))
 CHASE_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "CHASE_MAX_RSI_15M", "82"))
+
+# V34: فلاتر منع الإشارة عند القمة أو بعد انتهاء الموجة الأولى.
+LATE_BREAKOUT_FILTER_ENABLED = ENGINE_ENV("SPOT", "LATE_BREAKOUT_FILTER_ENABLED", "1") == "1"
+LATE_MAX_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "LATE_MAX_WAVE_PROGRESS", "0.58"))
+LATE_MAX_GREEN_15M = int(ENGINE_ENV("SPOT", "LATE_MAX_GREEN_15M", "3"))
+LATE_MAX_BASE_DISTANCE_ATR = float(ENGINE_ENV("SPOT", "LATE_MAX_BASE_DISTANCE_ATR", "2.40"))
+LATE_MAX_BASE_DISTANCE_PCT = float(ENGINE_ENV("SPOT", "LATE_MAX_BASE_DISTANCE_PCT", "5.0"))
+LATE_BLOWOFF_MIN_RISE_PCT = float(ENGINE_ENV("SPOT", "LATE_BLOWOFF_MIN_RISE_PCT", "6.0"))
+LATE_BLOWOFF_MIN_RANGE_ATR = float(ENGINE_ENV("SPOT", "LATE_BLOWOFF_MIN_RANGE_ATR", "2.2"))
+LATE_BLOWOFF_LOOKBACK = int(ENGINE_ENV("SPOT", "LATE_BLOWOFF_LOOKBACK", "12"))
+LATE_REBREAK_LOOKBACK = int(ENGINE_ENV("SPOT", "LATE_REBREAK_LOOKBACK", "18"))
+LATE_REBREAK_RESET_PCT = float(ENGINE_ENV("SPOT", "LATE_REBREAK_RESET_PCT", "1.8"))
+LATE_VOLUME_DECAY_RATIO = float(ENGINE_ENV("SPOT", "LATE_VOLUME_DECAY_RATIO", "0.58"))
+LATE_MIN_ROOM_DAILY_PCT = float(ENGINE_ENV("SPOT", "LATE_MIN_ROOM_DAILY_PCT", "1.5"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -419,6 +434,67 @@ def projected_volume_ratio(candle: Dict, average_volume: float, interval_seconds
     elapsed_ratio = max(0.20, min(1.0, 1.0 - remaining / interval_seconds))
     raw_ratio = float(candle.get("volume", 0.0)) / average_volume
     return min(raw_ratio / elapsed_ratio, raw_ratio * 3.0)
+
+
+def consecutive_green_closed(candles: List[Dict], lookback: int = 8) -> int:
+    n = 0
+    for c in reversed(candles[-lookback:]):
+        if float(c["close"]) > float(c["open"]):
+            n += 1
+        else:
+            break
+    return n
+
+
+def wave_stage_context(candles: List[Dict], price: float, ema20_value: float, atr_value: float) -> Dict:
+    """يقيس هل السعر في بداية الموجة أم في آخرها/إعادة كسر متأخرة."""
+    if len(candles) < 30 or price <= 0:
+        return {"progress": 0.0, "base_distance_pct": 0.0, "base_distance_atr": 0.0,
+                "blowoff": False, "rebreak_without_reset": False, "volume_decay": False,
+                "green_15m": 0, "prior_peak": price, "base_low": price}
+    w = candles[-30:]
+    recent = w[-LATE_BLOWOFF_LOOKBACK:]
+    base = w[:-max(6, LATE_BLOWOFF_LOOKBACK // 2)]
+    base_low = min(float(c["low"]) for c in base) if base else min(float(c["low"]) for c in w)
+    prior_peak = max(float(c["high"]) for c in recent[:-1]) if len(recent) > 1 else price
+    total_leg = max(prior_peak - base_low, atr_value, price * 0.001)
+    progress = max(0.0, min(2.0, (price - base_low) / total_leg))
+    base_anchor = max(base_low, ema20_value if ema20_value > 0 else base_low)
+    base_distance_pct = pct_change(base_anchor, price) if base_anchor > 0 else 999.0
+    base_distance_atr = (price - base_anchor) / atr_value if atr_value > 0 else 999.0
+
+    ranges = [float(c["high"]) - float(c["low"]) for c in recent]
+    max_range_atr = max(ranges) / atr_value if atr_value > 0 and ranges else 0.0
+    recent_low = min(float(c["low"]) for c in recent)
+    recent_high = max(float(c["high"]) for c in recent)
+    rise_from_low = pct_change(recent_low, recent_high) if recent_low > 0 else 0.0
+    blowoff = bool(rise_from_low >= LATE_BLOWOFF_MIN_RISE_PCT and max_range_atr >= LATE_BLOWOFF_MIN_RANGE_ATR)
+
+    rb = candles[-LATE_REBREAK_LOOKBACK:]
+    previous_breaks = [i for i,c in enumerate(rb[:-2]) if float(c["close"]) >= prior_peak * 0.995]
+    reset_low = min(float(c["low"]) for c in rb[-8:]) if rb else price
+    reset_depth = max(0.0, -pct_change(prior_peak, reset_low)) if prior_peak > 0 else 0.0
+    rebreak_without_reset = bool(previous_breaks and price >= prior_peak * 0.995 and reset_depth < LATE_REBREAK_RESET_PCT)
+
+    vols = [float(c["volume"]) for c in recent]
+    peak_vol = max(vols[:-2]) if len(vols) > 3 else max(vols or [0.0])
+    tail_vol = sum(vols[-2:]) / 2 if len(vols) >= 2 else (vols[-1] if vols else 0.0)
+    volume_decay = bool(peak_vol > 0 and tail_vol / peak_vol < LATE_VOLUME_DECAY_RATIO and price >= prior_peak * 0.985)
+
+    return {
+        "progress": progress,
+        "base_distance_pct": base_distance_pct,
+        "base_distance_atr": base_distance_atr,
+        "blowoff": blowoff,
+        "rebreak_without_reset": rebreak_without_reset,
+        "volume_decay": volume_decay,
+        "green_15m": consecutive_green_closed(candles, 8),
+        "prior_peak": prior_peak,
+        "base_low": base_low,
+        "reset_depth_pct": reset_depth,
+        "max_range_atr": max_range_atr,
+        "rise_from_low_pct": rise_from_low,
+    }
 
 
 def send_message(text: str) -> bool:
@@ -1238,6 +1314,19 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             or rise1 > CHASE_MAX_1H_RISE_PCT
             or (r15 > CHASE_MAX_RSI_15M and not retest)
         )
+        wave_stage = wave_stage_context(closed15, live_price, e20_15, atr15)
+        late_wave = bool(
+            LATE_BREAKOUT_FILTER_ENABLED
+            and not (live_early_break or live_structure_break)
+            and (
+                wave_stage["progress"] > LATE_MAX_WAVE_PROGRESS
+                or wave_stage["green_15m"] > LATE_MAX_GREEN_15M
+                or wave_stage["base_distance_atr"] > LATE_MAX_BASE_DISTANCE_ATR
+                or wave_stage["base_distance_pct"] > LATE_MAX_BASE_DISTANCE_PCT
+                or wave_stage["rebreak_without_reset"]
+                or (wave_stage["blowoff"] and wave_stage["volume_decay"])
+            )
+        )
         surge_continuation = bool(
             SURGE_CONTINUATION_ENABLED
             and (live_surge_break or surge_break or continuation_structure)
@@ -1251,9 +1340,22 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and r15 <= SURGE_MAX_RSI_15M
             and surge_extension_atr <= SURGE_MAX_EXTENSION_ATR
             and (live_surge_break or not chased_move)
+            and not late_wave
             and (close_location(live15) if live_surge_break else close_location(candle15)) >= 0.45
             and not btc_flash_crash_early
         )
+
+        if late_wave:
+            log_rejection(symbol, "مرحلة متأخرة من الموجة/إعادة كسر بلا قاعدة جديدة", {
+                "wave_progress": round(float(wave_stage["progress"]), 3),
+                "green_15m": int(wave_stage["green_15m"]),
+                "base_distance_pct": round(float(wave_stage["base_distance_pct"]), 2),
+                "base_distance_atr": round(float(wave_stage["base_distance_atr"]), 2),
+                "blowoff": bool(wave_stage["blowoff"]),
+                "volume_decay": bool(wave_stage["volume_decay"]),
+                "rebreak_without_reset": bool(wave_stage["rebreak_without_reset"]),
+                "reset_depth_pct": round(float(wave_stage.get("reset_depth_pct", 0)), 2),
+            })
 
         if chased_move and not (retest or live_early_break or live_structure_break or live_surge_break):
             log_rejection(symbol, "مطاردة حركة ممتدة بعد بداية الموجة", {
@@ -1364,6 +1466,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and h15 > 0 and h5 >= 0
             and price > e20 and price > vw5
             and (breakout or squeeze_break or early_break)
+            and not late_wave
         )
 
         _, _, previous_h15 = macd(closes15[:-1])
@@ -1392,10 +1495,10 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
 
         reversal = REVERSAL_ENABLED and drawdown15>=REVERSAL_MIN_DRAWDOWN_PCT and recent_rsi_low<=REVERSAL_MAX_RSI_RECENT_LOW and REVERSAL_MIN_RSI_NOW<=r15<=REVERSAL_MAX_RSI_NOW and r15>r15v[-3] and reclaimed_15 and structure_shift and vr15>=REVERSAL_MIN_VOLUME_15M and vr5>=REVERSAL_MIN_VOLUME_5M and a15>=REVERSAL_MIN_ADX_15M and h5>=0 and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("hard_block",False)
 
-        momentum = MOMENTUM_ENABLED and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
+        momentum = MOMENTUM_ENABLED and not late_wave and candle15["close"]>resistance and candle15["close"]>candle15["open"] and vr15>=MOMENTUM_MIN_VOLUME_15M and vr5>=MOMENTUM_MIN_VOLUME_5M and a15>=MOMENTUM_MIN_ADX_15M and MOMENTUM_MIN_RSI_15M<=r15<=MOMENTUM_MAX_RSI_15M and h15>0 and h5>=0 and e20_15>e20v[-4] and not s1["strongly_bearish"] and not s4["strongly_bearish"] and not market.get("severe_drop",False) and not market.get("hard_block",False) and rise15<=MOMENTUM_MAX_15M_RISE and rise1<=MOMENTUM_MAX_1H_RISE and dist<=MOMENTUM_MAX_EMA20_DISTANCE and greens<=MOMENTUM_MAX_GREEN and body<=4.0
 
         accumulation = bool(
-            ACCUMULATION_ENABLED and accumulation_info
+            ACCUMULATION_ENABLED and not late_wave and accumulation_info
             and accumulation_info["compressed"] and accumulation_info["higher_lows"] and accumulation_info["building_volume"]
             and vols15[-1] >= mean(vols15[-4:-1]) * 0.90
             and early_break
@@ -1445,6 +1548,11 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and not market.get("severe_drop", False)
             and not market.get("hard_block", False)
         )
+
+        # V34: الحركة المتأخرة لا تمر كاختراق جديد. يسمح فقط بإعادة تصنيفها
+        # إلى Strong Reclaim أو Pullback إذا تكوّن تصحيح حقيقي وقاعدة جديدة.
+        if late_wave and not (strong_reclaim or pullback):
+            return None
 
         # V19: لا نرسل Trend Pullback أثناء ضعف صحة BTC أو موجة بيع 15m.
         btc_health_score = float(market.get("btc_health_score", 50.0))
@@ -1560,6 +1668,17 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                     "touches": int(overhead["touches"]),
                 })
                 return None
+
+        # V34: مساحة كافية حتى أقرب مقاومة يومية/4H موثوقة؛ تمنع الدخول تحت القمة مباشرة.
+        higher_overhead = nearest_overhead_resistance(c4h[:-1], price, 140) or nearest_overhead_resistance(c1d[:-1], price, 140)
+        if higher_overhead and float(higher_overhead["distance_pct"]) < LATE_MIN_ROOM_DAILY_PCT and not (strong_reclaim or pullback):
+            log_rejection(symbol, "قمة عليا قريبة — هامش الربح غير كاف", {
+                "distance_pct": round(float(higher_overhead["distance_pct"]), 2),
+                "required_pct": LATE_MIN_ROOM_DAILY_PCT,
+                "resistance": round(float(higher_overhead["level"]), 10),
+                "touches": int(higher_overhead["touches"]),
+            })
+            return None
 
         # V27: تدقيق تعارض المسارات دون تغيير القرار. إذا تحققت عدة أنماط،
         # نُسجلها ويستمر الاختيار حسب MODE_PRIORITY المطابق لترتيب elif الحالي.
@@ -1870,7 +1989,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
