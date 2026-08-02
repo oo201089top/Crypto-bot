@@ -1,4 +1,4 @@
-# V34: early-wave / anti-chase engine calibrated from the supplied
+# V36: first-leg timing / hard anti-chase engine calibrated from the supplied
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -166,6 +166,19 @@ LATE_REBREAK_LOOKBACK = int(ENGINE_ENV("SPOT", "LATE_REBREAK_LOOKBACK", "18"))
 LATE_REBREAK_RESET_PCT = float(ENGINE_ENV("SPOT", "LATE_REBREAK_RESET_PCT", "1.8"))
 LATE_VOLUME_DECAY_RATIO = float(ENGINE_ENV("SPOT", "LATE_VOLUME_DECAY_RATIO", "0.58"))
 LATE_MIN_ROOM_DAILY_PCT = float(ENGINE_ENV("SPOT", "LATE_MIN_ROOM_DAILY_PCT", "1.5"))
+
+# V36: نافذة دخول صارمة — أول شمعة أو ثاني شمعة فقط بعد الكسر.
+FIRST_LEG_ONLY_ENABLED = ENGINE_ENV("SPOT", "FIRST_LEG_ONLY_ENABLED", "1") == "1"
+FIRST_LEG_LOOKBACK = int(ENGINE_ENV("SPOT", "FIRST_LEG_LOOKBACK", "10"))
+FIRST_LEG_REFERENCE_BARS = int(ENGINE_ENV("SPOT", "FIRST_LEG_REFERENCE_BARS", "14"))
+FIRST_LEG_MAX_CLOSED_BARS = int(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_CLOSED_BARS", "1"))
+FIRST_LEG_MAX_EXTENSION_PCT = float(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_EXTENSION_PCT", "1.80"))
+FIRST_LEG_MAX_EXTENSION_ATR = float(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_EXTENSION_ATR", "1.25"))
+FIRST_LEG_MAX_RSI_15M = float(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_RSI_15M", "72"))
+FIRST_LEG_MAX_TRIGGER_RANGE_ATR = float(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_TRIGGER_RANGE_ATR", "1.80"))
+FIRST_LEG_MAX_TRIGGER_BODY_ATR = float(ENGINE_ENV("SPOT", "FIRST_LEG_MAX_TRIGGER_BODY_ATR", "1.35"))
+FIRST_LEG_MIN_VOLUME_RETENTION = float(ENGINE_ENV("SPOT", "FIRST_LEG_MIN_VOLUME_RETENTION", "0.60"))
+FIRST_LEG_MIN_RESET_PCT = float(ENGINE_ENV("SPOT", "FIRST_LEG_MIN_RESET_PCT", "1.20"))
 
 # V19: صحة BTC متعددة الفريمات 1W/1D/4H/1H/15M/5M
 BTC_HEALTH_ENABLED = ENGINE_ENV("SPOT", "BTC_HEALTH_ENABLED", "1") == "1"
@@ -494,6 +507,88 @@ def wave_stage_context(candles: List[Dict], price: float, ema20_value: float, at
         "reset_depth_pct": reset_depth,
         "max_range_atr": max_range_atr,
         "rise_from_low_pct": rise_from_low,
+    }
+
+
+def first_leg_timing_context(
+    candles: List[Dict],
+    live_candle: Dict,
+    live_price: float,
+    atr_value: float,
+    current_volume_ratio: float,
+) -> Dict:
+    """
+    يحدد عمر الاختراق الحقيقي. العمر 0 = اختراق حي/آخر شمعة، 1 = الشمعة الثانية فقط.
+    بعد ذلك تعتبر الفرصة فائتة ما لم يحدث تصحيح فعلي يعيد بناء قاعدة جديدة.
+    """
+    default = {
+        "detected": False, "live_break": False, "age_bars": -1, "reference": 0.0,
+        "extension_pct": 0.0, "extension_atr": 0.0, "trigger_range_atr": 0.0,
+        "trigger_body_atr": 0.0, "volume_retention": 1.0, "reset_depth_pct": 0.0,
+        "exhaustion": False, "late": False,
+    }
+    if len(candles) < FIRST_LEG_REFERENCE_BARS + 5 or live_price <= 0 or atr_value <= 0:
+        return default
+
+    start = max(FIRST_LEG_REFERENCE_BARS + 1, len(candles) - FIRST_LEG_LOOKBACK)
+    trigger_idx = None
+    trigger_ref = 0.0
+    for i in range(start, len(candles)):
+        prior = candles[max(0, i - FIRST_LEG_REFERENCE_BARS):i-1]
+        if len(prior) < max(6, FIRST_LEG_REFERENCE_BARS // 2):
+            continue
+        ref = max(float(c["high"]) for c in prior)
+        c = candles[i]
+        if float(c["close"]) >= ref * 0.998 and float(c["close"]) > float(c["open"]):
+            trigger_idx, trigger_ref = i, ref
+            break
+
+    current_ref = max(float(c["high"]) for c in candles[-FIRST_LEG_REFERENCE_BARS:-1])
+    live_break = bool(
+        float(live_candle.get("close", live_price)) >= current_ref * 0.998
+        and float(live_candle.get("close", live_price)) > float(live_candle.get("open", live_price))
+    )
+    if trigger_idx is None and live_break:
+        trigger_idx = len(candles)
+        trigger_ref = current_ref
+
+    if trigger_idx is None or trigger_ref <= 0:
+        return default
+
+    age_bars = max(0, len(candles) - 1 - trigger_idx) if trigger_idx < len(candles) else 0
+    trigger = candles[trigger_idx] if trigger_idx < len(candles) else live_candle
+    trigger_range = float(trigger["high"]) - float(trigger["low"])
+    trigger_body = abs(float(trigger["close"]) - float(trigger["open"]))
+    extension_pct = pct_change(trigger_ref, live_price)
+    extension_atr = max(0.0, live_price - trigger_ref) / atr_value
+    trigger_volume = max(float(trigger.get("volume", 0.0)), 1e-12)
+    current_volume = float(live_candle.get("volume", 0.0)) if live_break else float(candles[-1].get("volume", 0.0))
+    raw_retention = current_volume / trigger_volume
+    volume_retention = max(raw_retention, current_volume_ratio / max(1.0, current_volume_ratio)) if live_break else raw_retention
+
+    post = candles[trigger_idx + 1:] if trigger_idx < len(candles) else []
+    reset_low = min([float(c["low"]) for c in post] + [live_price]) if post else live_price
+    reset_depth_pct = max(0.0, -pct_change(max(trigger_ref, float(trigger["high"])), reset_low))
+    rebuilt = reset_depth_pct >= FIRST_LEG_MIN_RESET_PCT
+    exhaustion = bool(
+        trigger_range / atr_value > FIRST_LEG_MAX_TRIGGER_RANGE_ATR
+        or trigger_body / atr_value > FIRST_LEG_MAX_TRIGGER_BODY_ATR
+    )
+    late = bool(
+        (age_bars > FIRST_LEG_MAX_CLOSED_BARS and not rebuilt)
+        or extension_pct > FIRST_LEG_MAX_EXTENSION_PCT
+        or extension_atr > FIRST_LEG_MAX_EXTENSION_ATR
+        or exhaustion
+        or (age_bars >= 1 and volume_retention < FIRST_LEG_MIN_VOLUME_RETENTION and not rebuilt)
+    )
+    return {
+        "detected": True, "live_break": live_break and trigger_idx == len(candles),
+        "age_bars": age_bars, "reference": trigger_ref,
+        "extension_pct": extension_pct, "extension_atr": extension_atr,
+        "trigger_range_atr": trigger_range / atr_value,
+        "trigger_body_atr": trigger_body / atr_value,
+        "volume_retention": volume_retention, "reset_depth_pct": reset_depth_pct,
+        "exhaustion": exhaustion, "rebuilt": rebuilt, "late": late,
     }
 
 
@@ -1327,6 +1422,31 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 or (wave_stage["blowoff"] and wave_stage["volume_decay"])
             )
         )
+        first_leg = first_leg_timing_context(
+            closed15, live15, live_price, atr15, max(live_vr15, vr15)
+        )
+        first_leg_rsi_hot = bool(r15 > FIRST_LEG_MAX_RSI_15M and not retest)
+        first_leg_late = bool(
+            FIRST_LEG_ONLY_ENABLED
+            and first_leg.get("detected", False)
+            and (first_leg.get("late", False) or first_leg_rsi_hot)
+            and not (live_early_break or live_structure_break or live_surge_break)
+        )
+        if first_leg_late:
+            log_rejection(symbol, "انتهت نافذة أول الموجة — ممنوع مطاردة الاختراق", {
+                "age_bars": int(first_leg.get("age_bars", -1)),
+                "max_age": FIRST_LEG_MAX_CLOSED_BARS,
+                "extension_pct": round(float(first_leg.get("extension_pct", 0)), 2),
+                "extension_atr": round(float(first_leg.get("extension_atr", 0)), 2),
+                "trigger_range_atr": round(float(first_leg.get("trigger_range_atr", 0)), 2),
+                "trigger_body_atr": round(float(first_leg.get("trigger_body_atr", 0)), 2),
+                "volume_retention": round(float(first_leg.get("volume_retention", 0)), 2),
+                "reset_depth_pct": round(float(first_leg.get("reset_depth_pct", 0)), 2),
+                "rsi15": round(float(r15), 2),
+                "exhaustion": bool(first_leg.get("exhaustion", False)),
+            })
+            return None
+
         surge_continuation = bool(
             SURGE_CONTINUATION_ENABLED
             and (live_surge_break or surge_break or continuation_structure)
@@ -1340,6 +1460,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             and r15 <= SURGE_MAX_RSI_15M
             and surge_extension_atr <= SURGE_MAX_EXTENSION_ATR
             and (live_surge_break or not chased_move)
+            and (not FIRST_LEG_ONLY_ENABLED or not first_leg.get("detected", False) or first_leg.get("age_bars", 99) <= FIRST_LEG_MAX_CLOSED_BARS)
             and not late_wave
             and (close_location(live15) if live_surge_break else close_location(candle15)) >= 0.45
             and not btc_flash_crash_early
@@ -1989,7 +2110,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"first_leg":first_leg,"first_leg_late":first_leg_late}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
