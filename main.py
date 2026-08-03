@@ -1,4 +1,4 @@
-# V38: smart market manager / trade tracking built on V36 first-leg engine
+# V39: on-demand full symbol analysis / smart market manager built on V36 first-leg engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -339,8 +339,10 @@ _adapter=HTTPAdapter(max_retries=_retry)
 SESSION.mount("https://",_adapter)
 SESSION.mount("http://",_adapter)
 SYMBOL_CACHE = {"symbols": [], "updated_at": 0.0}
+ALL_USDT_SYMBOL_CACHE = {"symbols": set(), "updated_at": 0.0}
 MARKET_CACHE = {"data": None, "updated_at": 0.0}
 SYMBOL_CACHE_LOCK = Lock()
+ALL_USDT_SYMBOL_CACHE_LOCK = Lock()
 MARKET_CACHE_LOCK = Lock()
 REJECTION_LOCK = Lock()
 
@@ -798,7 +800,13 @@ def telegram_command_loop() -> None:
                 elif cmd in ("/إحصائيات","/stats"):
                     send_message(performance_message())
                 elif cmd in ("/help","/مساعدة","/start"):
-                    send_message("الأوامر المتاحة:\n/السوق — حالة السوق وقرار الدخول\n/debug DIA — أسباب الرفض\n/صفقات — الصفقات المفتوحة\n/إحصائيات — نتائج المتابعة")
+                    send_message("الأوامر المتاحة:\n/السوق — حالة السوق وقرار الدخول\n/debug DIA — أسباب الرفض\n/صفقات — الصفقات المفتوحة\n/إحصائيات — نتائج المتابعة\n/BTC أو /BTCUSDT — تحليل شامل لأي زوج Binance Spot USDT")
+                elif cmd.startswith("/"):
+                    requested = normalize_symbol_command(cmd)
+                    if requested:
+                        send_message(symbol_full_report(requested))
+                    else:
+                        send_message("⚠️ الرمز غير موجود كزوج Binance Spot USDT. استخدم مثلًا /BTC أو /BTCUSDT.")
         except Exception as exc:
             log(f"Telegram command loop: {exc}")
             time.sleep(max(2.0,COMMAND_POLL_SECONDS))
@@ -846,6 +854,157 @@ def get_symbols() -> List[str]:
         SYMBOL_CACHE["symbols"] = fresh_symbols
         SYMBOL_CACHE["updated_at"] = now
         return list(SYMBOL_CACHE["symbols"])
+
+
+def get_all_binance_usdt_symbols() -> set:
+    """كل أزواج Binance Spot USDT المتاحة، بما فيها العملات التي لا تدخل ماسح السيولة."""
+    now = time.time()
+    with ALL_USDT_SYMBOL_CACHE_LOCK:
+        cached = ALL_USDT_SYMBOL_CACHE.get("symbols", set())
+        if cached and now - float(ALL_USDT_SYMBOL_CACHE.get("updated_at", 0.0)) < SYMBOL_REFRESH_MINUTES * 60:
+            return set(cached)
+    exchange = get_json("/api/v3/exchangeInfo", timeout=30)
+    symbols = {
+        str(item.get("symbol", "")).upper()
+        for item in exchange.get("symbols", [])
+        if item.get("status") == "TRADING"
+        and str(item.get("quoteAsset", "")).upper() == "USDT"
+        and item.get("isSpotTradingAllowed", True)
+    }
+    with ALL_USDT_SYMBOL_CACHE_LOCK:
+        ALL_USDT_SYMBOL_CACHE["symbols"] = set(symbols)
+        ALL_USDT_SYMBOL_CACHE["updated_at"] = now
+    return symbols
+
+
+def normalize_symbol_command(raw: str) -> Optional[str]:
+    """يقبل /BTC أو /BTCUSDT ويعيد BTCUSDT إن كان زوج Spot صالحًا."""
+    token = raw.strip().upper().replace("/", "").replace(" ", "")
+    if not token or token in {"START", "HELP", "MARKET", "DEBUG", "TRADES", "STATS"}:
+        return None
+    symbol = token if token.endswith("USDT") else token + "USDT"
+    return symbol if symbol in get_all_binance_usdt_symbols() else None
+
+
+def symbol_full_report(symbol: str) -> str:
+    """تحليل مباشر لأي زوج Binance Spot USDT، حتى لو لم يحقق شروط إرسال الإشارة."""
+    try:
+        market = market_context()
+        c5, c15, c1h, c4h, c1d, c1w = [
+            get_klines(symbol, interval, 260 if interval not in ("1d", "1w") else 220)
+            for interval in ("5m", "15m", "1h", "4h", "1d", "1w")
+        ]
+        closed5, closed15 = c5[:-1], c15[:-1]
+        if len(closed5) < 60 or len(closed15) < 60:
+            return f"⚠️ بيانات {symbol} غير كافية للتحليل الكامل."
+
+        price = float(c5[-1]["close"])
+        closes5 = [float(c["close"]) for c in closed5]
+        closes15 = [float(c["close"]) for c in closed15]
+        vols15 = [float(c["volume"]) for c in closed15]
+        e20_15 = ema(closes15, 20)[-1]
+        e50_15 = ema(closes15, 50)[-1]
+        r15 = rsi(closes15)[-1]
+        a15 = adx(closed15)
+        av15 = mean(vols15[-21:-1]) if len(vols15) >= 21 else mean(vols15)
+        vr15 = float(closed15[-1]["volume"]) / av15 if av15 else 0.0
+        live_vr15 = projected_volume_ratio(c15[-1], av15, 15 * 60)
+        atr15 = atr(closed15)
+
+        frames_input = {
+            "1w": adaptive_frame_snapshot(c1w, 35) if len(c1w) - 1 >= 35 else None,
+            "1d": adaptive_frame_snapshot(c1d, 50) if len(c1d) - 1 >= 50 else None,
+            "4h": frame_snapshot(c4h),
+            "1h": frame_snapshot(c1h),
+            "15m": compact_frame_snapshot(c15),
+            "5m": compact_frame_snapshot(c5),
+        }
+        mtf = multi_timeframe_alignment(frames_input)
+        btc_rise = float(market.get("btc", {}).get("rise_15m", 0.0))
+        coin_rise = pct_change(closed15[-2]["close"], price)
+        relative_strength = coin_rise - btc_rise
+        independence = coin_independence_score(
+            relative_strength, max(vr15, live_vr15), float(mtf["score"]),
+            float(market.get("btc_health_score", 50.0)), False
+        )
+        wave = wave_stage_context(closed15, price, float(e20_15 or price), atr15)
+        resistance_info = nearest_overhead_resistance(c1h[:-1], price, 120)
+        resistance_text = (
+            f"{fmt(float(resistance_info['level']))} ({float(resistance_info['distance_pct']):.2f}% فوق السعر)"
+            if resistance_info else "لا توجد مقاومة موثوقة قريبة"
+        )
+
+        accepted = analyze_symbol(symbol, market)
+        if accepted:
+            decision = f"✅ صالح حاليًا كنموذج {accepted.get('setup', accepted.get('mode', 'إشارة'))}"
+            levels = (
+                f"• دخول: {fmt(float(accepted['entry']))}\n"
+                f"• وقف: {fmt(float(accepted['stop']))}\n"
+                f"• TP1/TP2/TP3: {fmt(float(accepted['tp1']))} / {fmt(float(accepted['tp2']))} / {fmt(float(accepted['tp3']))}"
+            )
+        else:
+            blockers = []
+            if float(mtf["score"]) < 60: blockers.append("التوافق متعدد الفريمات ضعيف")
+            if r15 is not None and float(r15) > 72: blockers.append("RSI مرتفع ومطاردة محتملة")
+            if max(vr15, live_vr15) < 1.3: blockers.append("الحجم دون مستوى الانطلاقة")
+            if a15 < 16: blockers.append("ADX ضعيف")
+            if wave.get("late") or float(wave.get("progress", 0.0)) > LATE_MAX_WAVE_PROGRESS:
+                blockers.append("الحركة متقدمة وليست بداية موجة")
+            if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
+            decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
+            levels = "• المطلوب:\n" + "\n".join(f"  - {x}" for x in blockers[:5])
+
+        frame_lines = []
+        for tf in ("1w", "1d", "4h", "1h", "15m", "5m"):
+            value = float(mtf.get("frames", {}).get(tf, 50.0))
+            frame_lines.append(f"• {tf.upper()}: {value:.0f}/100")
+
+        env = market_environment_score(market)
+        stage = (
+            "بداية مبكرة 🌱" if float(wave.get("progress", 0.0)) <= 0.35
+            else "منتصف الموجة 🌊" if float(wave.get("progress", 0.0)) <= 0.70
+            else "متقدمة/مطاردة ⚠️"
+        )
+        trend = "صاعد" if price > float(e20_15 or price) > float(e50_15 or price) else "مختلط" if price > float(e20_15 or price) else "هابط"
+
+        return f"""📊 تحليل شامل — {symbol}
+
+💰 السعر الحالي
+• {fmt(price)}
+• اتجاه 15M: {trend}
+• مرحلة الموجة: {stage}
+
+📈 التحليل متعدد الفريمات
+{chr(10).join(frame_lines)}
+• التوافق العام: {float(mtf['score']):.1f}/100 — {mtf.get('label','غير متاح')}
+
+📊 الزخم والحجم
+• RSI 15M: {float(r15 or 0):.1f}
+• ADX 15M: {a15:.1f}
+• الحجم المغلق: ×{vr15:.2f}
+• الحجم الحي المتوقع: ×{live_vr15:.2f}
+• القوة النسبية أمام BTC: {relative_strength:+.2f}%
+• استقلال العملة: {independence}/100
+
+🧱 الهيكل
+• أقرب مقاومة: {resistance_text}
+• تقدم الموجة: {float(wave.get('progress',0))*100:.0f}%
+• إعادة كسر متأخرة: {'نعم' if wave.get('rebreak_without_reset') else 'لا'}
+• ضعف الحجم قرب القمة: {'نعم' if wave.get('volume_decay') else 'لا'}
+
+🌍 السوق
+• بيئة السوق: {env['score']:.1f}/100 — {env['label']}
+• صحة BTC: {float(market.get('btc_health_score',50)):.1f}/100
+• حجم الصفقة المقترح: {env['suggested_size']}
+
+🎯 القرار
+• {decision}
+{levels}
+
+⚠️ تحليل آلي وليس ضمانًا للربح."""
+    except Exception as exc:
+        log(f"Symbol report {symbol}: {exc}")
+        return f"تعذر تحليل {symbol}: {exc}"
 
 
 def ema(values: List[float], period: int) -> List[Optional[float]]:
@@ -2464,7 +2623,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V38 Smart Market Manager.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V39 Full Symbol Analyzer.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
