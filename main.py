@@ -1,10 +1,10 @@
-# V36: first-leg timing / hard anti-chase engine calibrated from the supplied
+# V38: smart market manager / trade tracking built on V36 first-leg engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
 # and keeps BTC independence only when the altcoin structure is genuinely early.
 import os, time, json
-from threading import Lock
+from threading import Lock, Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from statistics import mean, pstdev
@@ -278,6 +278,20 @@ ACCUMULATION_MAX_RISK_PCT = float(ENGINE_ENV("SPOT", "ACCUMULATION_MAX_RISK_PCT"
 
 MARKET_CACHE_SECONDS = int(ENGINE_ENV("SPOT", "MARKET_CACHE_SECONDS", "55"))
 TRACK_RESULTS = ENGINE_ENV("SPOT", "TRACK_RESULTS", "1") == "1"
+
+# V37: أوامر تيليجرام التفاعلية وتقارير السوق/التشخيص.
+COMMANDS_ENABLED = ENGINE_ENV("SPOT", "COMMANDS_ENABLED", "1") == "1"
+COMMAND_POLL_SECONDS = float(ENGINE_ENV("SPOT", "COMMAND_POLL_SECONDS", "2"))
+COMMAND_OFFSET_FILE = Path(ENGINE_ENV("SPOT", "COMMAND_OFFSET_FILE", "telegram_update_offset.json"))
+DEBUG_MAX_ROWS = int(ENGINE_ENV("SPOT", "DEBUG_MAX_ROWS", "3"))
+
+# V38: إدارة السوق والمتابعة الحية بدون تغيير استراتيجية الدخول الأساسية.
+MARKET_ENVIRONMENT_ENABLED = ENGINE_ENV("SPOT", "MARKET_ENVIRONMENT_ENABLED", "1") == "1"
+TRACKER_NOTIFICATIONS_ENABLED = ENGINE_ENV("SPOT", "TRACKER_NOTIFICATIONS_ENABLED", "1") == "1"
+TRACKER_NOTIFY_TP = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_TP", "1") == "1"
+TRACKER_NOTIFY_STOP = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_STOP", "1") == "1"
+TRACKER_NOTIFY_RECOVERY = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_RECOVERY", "0") == "1"
+TRACKER_RECOVERY_PCT = float(ENGINE_ENV("SPOT", "TRACKER_RECOVERY_PCT", "0.35"))
 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
@@ -590,6 +604,204 @@ def first_leg_timing_context(
         "volume_retention": volume_retention, "reset_depth_pct": reset_depth_pct,
         "exhaustion": exhaustion, "rebuilt": rebuilt, "late": late,
     }
+
+
+def coin_independence_score(relative_strength: float, volume_ratio_15m: float, mtf_score: float, btc_health_score: float, exceptional: bool = False) -> int:
+    """درجة تفسيرية 0..100 لاستقلال العملة عن BTC، وليست احتمال ربح."""
+    rel_points = max(0.0, min(45.0, relative_strength * 11.0))
+    vol_points = max(0.0, min(25.0, (volume_ratio_15m - 1.0) * 12.5))
+    mtf_points = max(0.0, min(20.0, (mtf_score - 45.0) * 0.55))
+    weak_btc_bonus = max(0.0, min(10.0, (45.0 - btc_health_score) * 0.30))
+    score = rel_points + vol_points + mtf_points + weak_btc_bonus + (5.0 if exceptional else 0.0)
+    return int(round(max(0.0, min(100.0, score))))
+
+
+def market_environment_score(market: Dict) -> Dict:
+    """درجة بيئة السوق 0..100 مشتقة من صحة BTC والزخم متعدد الفريمات."""
+    health = float(market.get("btc_health_score", 50.0))
+    frames = market.get("btc_health_frames", {}) or {}
+    btc = market.get("btc", {}) or {}
+    frame_score = (
+        float(frames.get("4h", 50)) * 0.30
+        + float(frames.get("1h", 50)) * 0.30
+        + float(frames.get("15m", 50)) * 0.25
+        + float(frames.get("5m", 50)) * 0.15
+    )
+    momentum = 50.0
+    momentum += max(-20.0, min(20.0, float(btc.get("rise_1h", 0.0)) * 18.0))
+    momentum += max(-15.0, min(15.0, float(btc.get("rise_15m", 0.0)) * 30.0))
+    momentum += max(-15.0, min(15.0, (float(btc.get("rsi15", 50.0)) - 50.0) * 0.75))
+    score = health * 0.50 + frame_score * 0.35 + max(0.0, min(100.0, momentum)) * 0.15
+    if market.get("btc_flash_crash", False):
+        score = min(score, 10.0)
+    score = max(0.0, min(100.0, score))
+    label = "ممتاز 🟢" if score >= 75 else "جيد 🟢" if score >= 60 else "حذر 🟡" if score >= 40 else "خطر 🟠" if score >= 20 else "خطر جدًا 🔴"
+    size = "100%" if score >= 75 else "75%" if score >= 60 else "50%" if score >= 40 else "25%" if score >= 20 else "0–15%"
+    return {"score": round(score, 1), "label": label, "suggested_size": size}
+
+
+def market_permission(market: Dict) -> Dict:
+    env = market_environment_score(market)
+    health = float(market.get("btc_health_score", 50.0))
+    frames = market.get("btc_health_frames", {}) or {}
+    btc = market.get("btc", {}) or {}
+    flash = bool(market.get("btc_flash_crash", False))
+    score = float(env["score"])
+    if flash or score < 20:
+        risk, permission, allowed, decision = "مرتفع جدًا 🔴", "قوة استثنائية فقط", "A+ مستقلة جدًا", "تجنب الدخول العادي"
+    elif score < 40:
+        risk, permission, allowed, decision = "مرتفع 🟠", "بحذر شديد", "A+ أو استقلال قوي", "انتظر إلا للفرص الاستثنائية"
+    elif score < 60:
+        risk, permission, allowed, decision = "متوسط 🟡", "بحذر", "A وA+ بشروط قوية", "انتقِ أفضل الإشارات فقط"
+    else:
+        risk, permission, allowed, decision = "منخفض 🟢", "مسموح", "A وA+", "الدخول مسموح مع إدارة المخاطر"
+    trend = "صاعد" if health >= 65 else "محايد" if health >= 45 else "هابط" if health >= 25 else "هابط بقوة"
+    reasons=[]
+    if float(frames.get("1h",50)) < 40: reasons.append("اتجاه BTC على 1H ضعيف")
+    if float(frames.get("15m",50)) < 40: reasons.append("زخم BTC على 15M ضعيف")
+    if float(btc.get("rsi15",50)) < 43: reasons.append("RSI BTC منخفض")
+    if float(btc.get("rise_1h",0)) < -0.5: reasons.append("ضغط هبوط خلال الساعة")
+    if float(frames.get("5m",50)) >= 70 and float(frames.get("15m",50)) < 40:
+        reasons.append("ارتداد 5M لم يتحول بعد إلى اتجاه 15M")
+    if not reasons: reasons.append("لا توجد إشارة خطر لحظية قوية")
+    return {
+        "health":health, "trend":trend, "risk":risk, "permission":permission,
+        "allowed":allowed, "decision":decision, "reasons":reasons,
+        "environment_score":env["score"], "environment_label":env["label"],
+        "suggested_size":env["suggested_size"],
+    }
+
+def market_report_message() -> str:
+    market = market_context()
+    p = market_permission(market)
+    btc = market.get("btc", {}) or {}
+    frames = market.get("btc_health_frames", {}) or {}
+    reasons = "\n".join(f"• {x}" for x in p["reasons"][:4])
+    return f"""📊 تقرير السوق الآن
+
+🌍 بيئة السوق
+• الدرجة: {p['environment_score']:.1f}/100 — {p['environment_label']}
+• حجم الصفقة المقترح: {p['suggested_size']}
+
+🪙 BTC
+• الصحة: {p['health']:.1f}/100 — {market.get('btc_health_label','غير متاح')}
+• الاتجاه: {p['trend']}
+• 4H/1H/15M/5M: {float(frames.get('4h',50)):.0f}/{float(frames.get('1h',50)):.0f}/{float(frames.get('15m',50)):.0f}/{float(frames.get('5m',50)):.0f}
+• تغير 1H: {float(btc.get('rise_1h',0)):+.2f}%
+• تغير 15M: {float(btc.get('rise_15m',0)):+.2f}%
+• RSI 15M: {float(btc.get('rsi15',0)):.1f}
+
+🛡️ قرار التداول
+• المخاطرة: {p['risk']}
+• السماح بالدخول: {p['permission']}
+• الإشارات المسموحة: {p['allowed']}
+• القرار النهائي: {p['decision']}
+
+الأسباب:
+{reasons}
+
+⚠️ تحليل آلي وليس ضمانًا للربح."""
+
+
+def debug_report_message(symbol: str) -> str:
+    symbol = symbol.upper().strip()
+    if symbol and not symbol.endswith("USDT"): symbol += "USDT"
+    rows=[]
+    try:
+        if REJECTION_LOG_FILE.exists():
+            with REJECTION_LOCK:
+                lines=REJECTION_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-3000:]
+            for line in reversed(lines):
+                try:
+                    row=json.loads(line)
+                except Exception:
+                    continue
+                if not symbol or str(row.get("symbol","")).upper()==symbol:
+                    rows.append(row)
+                    if len(rows)>=DEBUG_MAX_ROWS: break
+    except Exception as exc:
+        return f"تعذر قراءة سجل الرفض: {exc}"
+    if not rows:
+        return f"🔎 لا توجد حالات رفض حديثة مسجلة لـ {symbol or 'الرمز المطلوب'}."
+    chunks=[]
+    for row in rows:
+        details=row.get("details",{}) or {}
+        compact=[]
+        for k,v in list(details.items())[:8]: compact.append(f"• {k}: {v}")
+        chunks.append(f"❌ {row.get('symbol','')} — {row.get('reason','غير معروف')}\n"+"\n".join(compact))
+    return "🔎 آخر نتائج التشخيص\n\n"+"\n\n".join(chunks)
+
+
+def open_trades_message() -> str:
+    state = load_state()
+    rows = state.get("open_signals", {}) or {}
+    if not rows:
+        return "📭 لا توجد صفقات مفتوحة يتابعها البوت حاليًا."
+    chunks = []
+    for symbol, s in list(rows.items())[:12]:
+        entry = float(s.get("entry", 0))
+        reached = int(s.get("reached", 0))
+        chunks.append(
+            f"• {symbol}: دخول {fmt(entry)} | آخر هدف TP{reached if reached else 0} | "
+            f"النموذج {s.get('mode','غير معروف')}"
+        )
+    return "📌 الصفقات المفتوحة\n" + "\n".join(chunks)
+
+
+def performance_message() -> str:
+    state = load_state()
+    stats = state.get("stats", {}) or {}
+    tp1 = int(stats.get("tp1", 0)); tp2 = int(stats.get("tp2", 0))
+    tp3 = int(stats.get("tp3", 0)); stop = int(stats.get("stop", 0))
+    closed = tp3 + stop
+    win_rate = (tp3 / closed * 100.0) if closed else 0.0
+    return (
+        "📊 إحصائيات المتابعة\n"
+        f"• وصل TP1: {tp1}\n"
+        f"• وصل TP2: {tp2}\n"
+        f"• وصل TP3: {tp3}\n"
+        f"• ضرب الوقف: {stop}\n"
+        f"• نسبة اكتمال TP3 مقابل الوقف: {win_rate:.1f}%\n"
+        "ملاحظة: TP1 وTP2 مراحل وليست صفقات مستقلة."
+    )
+
+
+def _load_command_offset() -> int:
+    try: return int(json.loads(COMMAND_OFFSET_FILE.read_text(encoding="utf-8")).get("offset",0))
+    except Exception: return 0
+
+
+def _save_command_offset(offset: int) -> None:
+    try: COMMAND_OFFSET_FILE.write_text(json.dumps({"offset":offset}),encoding="utf-8")
+    except Exception as exc: log(f"Command offset save failed: {exc}")
+
+
+def telegram_command_loop() -> None:
+    if not COMMANDS_ENABLED: return
+    offset=_load_command_offset()
+    while True:
+        try:
+            r=SESSION.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates",params={"offset":offset,"timeout":20,"allowed_updates":["message"]},timeout=25)
+            r.raise_for_status()
+            for update in r.json().get("result",[]):
+                offset=max(offset,int(update.get("update_id",0))+1); _save_command_offset(offset)
+                msg=update.get("message",{}) or {}; chat=str((msg.get("chat",{}) or {}).get("id","")); text=str(msg.get("text","")).strip()
+                if chat != str(CHAT_ID): continue
+                cmd=text.split()[0].split("@")[0] if text else ""
+                if cmd in ("/السوق","/market"):
+                    send_message(market_report_message())
+                elif cmd in ("/debug","/تشخيص"):
+                    parts=text.split(maxsplit=1)
+                    send_message(debug_report_message(parts[1] if len(parts)>1 else ""))
+                elif cmd in ("/صفقات","/trades"):
+                    send_message(open_trades_message())
+                elif cmd in ("/إحصائيات","/stats"):
+                    send_message(performance_message())
+                elif cmd in ("/help","/مساعدة","/start"):
+                    send_message("الأوامر المتاحة:\n/السوق — حالة السوق وقرار الدخول\n/debug DIA — أسباب الرفض\n/صفقات — الصفقات المفتوحة\n/إحصائيات — نتائج المتابعة")
+        except Exception as exc:
+            log(f"Telegram command loop: {exc}")
+            time.sleep(max(2.0,COMMAND_POLL_SECONDS))
 
 
 def send_message(text: str) -> bool:
@@ -2110,7 +2322,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"first_leg":first_leg,"first_leg_late":first_leg_late}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"market_environment":market_environment_score(market),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"independence_score":coin_independence_score(rel, vr15, float(mtf["score"]), float(market.get("btc_health_score",50)), exceptional_strength),"first_leg":first_leg,"first_leg_late":first_leg_late}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -2147,12 +2359,15 @@ def signal_message(r: Dict) -> str:
 
 🌍 حالة السوق
 • السوق: {r['market_regime']}
+• بيئة السوق: {r.get('market_environment',{}).get('score',50):.1f}/100 — {r.get('market_environment',{}).get('label','محايد')}
+• حجم الصفقة المقترح: {r.get('market_environment',{}).get('suggested_size','50%')}
 • صحة BTC: {r.get('btc_health_score',50):.1f}/100 — {r.get('btc_health_label','غير متاح')}
 • BTC 4H/1H/15M/5M: {r.get('btc_health_frames',{}).get('4h',50):.0f}/{r.get('btc_health_frames',{}).get('1h',50):.0f}/{r.get('btc_health_frames',{}).get('15m',50):.0f}/{r.get('btc_health_frames',{}).get('5m',50):.0f}
 • BTC 1H: {r['btc_1h']:+.2f}%
 • BTC 15M: {r['btc_15m']:+.2f}%
 • RSI BTC: {r['btc_rsi15']:.1f}
 • القوة النسبية: {r['relative_strength']:+.2f}%
+• استقلال العملة عن BTC: {r.get('independence_score',0)}/100
 
 🎯 مستويات الصفقة
 • دخول: {fmt(r['entry'])}
@@ -2182,22 +2397,44 @@ def cooled(s,r): return r["candle_close"]-int(s.get("alerts",{}).get(r["symbol"]
 
 def track_open_signals(state: Dict) -> None:
     if not TRACK_RESULTS: return
-    op=state.setdefault("open_signals",{}); stats=state.setdefault("stats",{"tp1":0,"tp2":0,"tp3":0,"stop":0}); now=int(time.time()*1000)
+    op=state.setdefault("open_signals",{})
+    stats=state.setdefault("stats",{"tp1":0,"tp2":0,"tp3":0,"stop":0})
+    now=int(time.time()*1000)
     for symbol,signal in list(op.items()):
         try:
-            candles=get_klines(symbol,"5m",100)[:-1]; last=int(signal.get("last_checked",signal["time"])); rel=[c for c in candles if c["close_time"]>last]
+            candles=get_klines(symbol,"5m",100)[:-1]
+            last=int(signal.get("last_checked",signal["time"]))
+            rel=[c for c in candles if c["close_time"]>last]
             if not rel:
                 if now-int(signal["time"])>48*60*60*1000: del op[symbol]
                 continue
             reached=int(signal.get("reached",0)); closed=False
+            entry=float(signal["entry"]); stop=float(signal["stop"])
             for c in rel:
-                if c["low"]<=float(signal["stop"]): stats["stop"]+=1; del op[symbol]; closed=True; break
-                if reached<1 and c["high"]>=float(signal["tp1"]): stats["tp1"]+=1; reached=1
-                if reached<2 and c["high"]>=float(signal["tp2"]): stats["tp2"]+=1; reached=2
-                if reached<3 and c["high"]>=float(signal["tp3"]): stats["tp3"]+=1; del op[symbol]; closed=True; break
+                if c["low"]<=stop:
+                    stats["stop"]+=1
+                    if TRACKER_NOTIFICATIONS_ENABLED and TRACKER_NOTIFY_STOP:
+                        send_message(f"🛑 متابعة {symbol}\nتم لمس وقف الخسارة عند {fmt(stop)}.\nالدخول: {fmt(entry)}")
+                    del op[symbol]; closed=True; break
+                if reached<1 and c["high"]>=float(signal["tp1"]):
+                    stats["tp1"]+=1; reached=1
+                    if TRACKER_NOTIFICATIONS_ENABLED and TRACKER_NOTIFY_TP:
+                        send_message(f"✅ متابعة {symbol}\nتم تحقيق TP1 عند {fmt(float(signal['tp1']))}.")
+                if reached<2 and c["high"]>=float(signal["tp2"]):
+                    stats["tp2"]+=1; reached=2
+                    if TRACKER_NOTIFICATIONS_ENABLED and TRACKER_NOTIFY_TP:
+                        send_message(f"✅ متابعة {symbol}\nتم تحقيق TP2 عند {fmt(float(signal['tp2']))}.")
+                if reached<3 and c["high"]>=float(signal["tp3"]):
+                    stats["tp3"]+=1
+                    if TRACKER_NOTIFICATIONS_ENABLED and TRACKER_NOTIFY_TP:
+                        send_message(f"🏆 متابعة {symbol}\nتم تحقيق TP3 عند {fmt(float(signal['tp3']))}.")
+                    del op[symbol]; closed=True; break
                 signal["last_checked"]=c["close_time"]
-            if not closed: signal["reached"]=reached; signal["last_checked"]=rel[-1]["close_time"]
-        except Exception as exc: log(f"Track {symbol}: {exc}")
+            if not closed:
+                signal["reached"]=reached
+                signal["last_checked"]=rel[-1]["close_time"]
+        except Exception as exc:
+            log(f"Track {symbol}: {exc}")
 
 
 def scan(state: Dict) -> None:
@@ -2224,8 +2461,10 @@ def scan(state: Dict) -> None:
 
 def main() -> None:
     state=load_state();
+    if COMMANDS_ENABLED:
+        Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V33 Early-Wave Engine.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V38 Smart Market Manager.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
@@ -2240,3 +2479,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
