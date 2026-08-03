@@ -1,4 +1,4 @@
-# V40: on-demand full symbol analysis / smart market manager built on V36 first-leg engine
+# V41: unified final signal gate / on-demand analyzer built on V36 first-leg engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -292,6 +292,18 @@ TRACKER_NOTIFY_TP = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_TP", "1") == "1"
 TRACKER_NOTIFY_STOP = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_STOP", "1") == "1"
 TRACKER_NOTIFY_RECOVERY = ENGINE_ENV("SPOT", "TRACKER_NOTIFY_RECOVERY", "0") == "1"
 TRACKER_RECOVERY_PCT = float(ENGINE_ENV("SPOT", "TRACKER_RECOVERY_PCT", "0.35"))
+
+# V41: بوابة نهائية موحدة تمر بها جميع المسارات قبل إرسال A/A+.
+FINAL_SIGNAL_GATE_ENABLED = ENGINE_ENV("SPOT", "FINAL_SIGNAL_GATE_ENABLED", "1") == "1"
+FINAL_GATE_BLOCK_LATE_REBREAK = ENGINE_ENV("SPOT", "FINAL_GATE_BLOCK_LATE_REBREAK", "1") == "1"
+FINAL_GATE_USE_LIVE_VOLUME = ENGINE_ENV("SPOT", "FINAL_GATE_USE_LIVE_VOLUME", "1") == "1"
+FINAL_GATE_MIN_ADX_TREND_IGNITION = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_TREND_IGNITION", "12"))
+FINAL_GATE_MIN_ADX_SURGE = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_SURGE", "14"))
+FINAL_GATE_MIN_ADX_ACCUMULATION = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_ACCUMULATION", "16"))
+FINAL_GATE_MIN_ADX_RECLAIM = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_RECLAIM", "16"))
+FINAL_GATE_MIN_ADX_REVERSAL = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_REVERSAL", "18"))
+FINAL_GATE_MIN_ADX_PULLBACK = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_PULLBACK", "18"))
+FINAL_GATE_MIN_ADX_MOMENTUM = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_MOMENTUM", "25"))
 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
@@ -1621,6 +1633,99 @@ def prefilter_symbol(symbol: str) -> Optional[Tuple[str,float]]:
         log(f"Prefilter {symbol}: {exc}"); return None
 
 
+def final_signal_gate(
+    symbol: str,
+    mode: str,
+    adx_15m: float,
+    volume_ratio_15m: float,
+    live_volume_ratio_15m: float,
+    wave_stage: Dict,
+    first_leg: Dict,
+    relative_strength: float,
+    exceptional_strength: bool,
+) -> Tuple[bool, List[str], Dict]:
+    """حكم نهائي موحد يمنع اختلاف قرار المسارات عن تقرير /SYMBOL."""
+    if not FINAL_SIGNAL_GATE_ENABLED:
+        return True, [], {}
+
+    min_adx_map = {
+        "trend_ignition": FINAL_GATE_MIN_ADX_TREND_IGNITION,
+        "surge_continuation": FINAL_GATE_MIN_ADX_SURGE,
+        "accumulation": FINAL_GATE_MIN_ADX_ACCUMULATION,
+        "strong_reclaim": FINAL_GATE_MIN_ADX_RECLAIM,
+        "reversal": FINAL_GATE_MIN_ADX_REVERSAL,
+        "pullback": FINAL_GATE_MIN_ADX_PULLBACK,
+        "momentum": FINAL_GATE_MIN_ADX_MOMENTUM,
+        "balanced": 18.0,
+    }
+    min_volume_map = {
+        "trend_ignition": TREND_IGNITION_MIN_VOLUME_15M,
+        "surge_continuation": SURGE_MIN_VOLUME_15M,
+        "accumulation": ACCUMULATION_MIN_VOLUME_15M,
+        "strong_reclaim": STRONG_RECLAIM_MIN_VOLUME_15M,
+        "reversal": REVERSAL_MIN_VOLUME_15M,
+        "pullback": PULLBACK_A_MIN_VOLUME_15M,
+        "momentum": MOMENTUM_MIN_VOLUME_15M,
+        "balanced": MIN_15M_VOLUME_RATIO,
+    }
+
+    min_adx = float(min_adx_map.get(mode, 18.0))
+    min_volume = float(min_volume_map.get(mode, MIN_15M_VOLUME_RATIO))
+    effective_volume = (
+        max(float(volume_ratio_15m), float(live_volume_ratio_15m))
+        if FINAL_GATE_USE_LIVE_VOLUME
+        else float(volume_ratio_15m)
+    )
+
+    blockers: List[str] = []
+    if float(adx_15m) < min_adx:
+        blockers.append(f"ADX {adx_15m:.1f} أقل من حد المسار {min_adx:.1f}")
+
+    # الاستثناء الاستثنائي لا يتجاوز حجمًا شبه معدوم؛ فقط يخفف الحد قليلًا.
+    required_volume = min_volume * (0.85 if exceptional_strength else 1.0)
+    if effective_volume < required_volume:
+        blockers.append(
+            f"الحجم الفعال ×{effective_volume:.2f} أقل من المطلوب ×{required_volume:.2f}"
+        )
+
+    rebreak = bool(wave_stage.get("rebreak_without_reset", False))
+    rebuilt = bool(first_leg.get("rebuilt", False))
+    if (
+        FINAL_GATE_BLOCK_LATE_REBREAK
+        and rebreak
+        and not rebuilt
+        and mode not in ("strong_reclaim", "reversal", "pullback")
+    ):
+        blockers.append("إعادة كسر متأخرة بدون إعادة بناء قاعدة")
+
+    if bool(first_leg.get("late", False)) and not rebuilt:
+        blockers.append("نافذة الموجة الأولى انتهت")
+
+    # لا نمنع بسبب progress وحده؛ نمنع عند اقترانه بعلامة تأخر فعلية.
+    if (
+        float(wave_stage.get("progress", 0.0)) > 1.0
+        and (rebreak or bool(wave_stage.get("volume_decay", False)))
+        and mode not in ("strong_reclaim", "reversal", "pullback")
+    ):
+        blockers.append("الحركة متقدمة مع ضعف/إعادة كسر قرب القمة")
+
+    details = {
+        "mode": mode,
+        "adx": round(float(adx_15m), 2),
+        "min_adx": round(min_adx, 2),
+        "closed_volume": round(float(volume_ratio_15m), 2),
+        "live_volume": round(float(live_volume_ratio_15m), 2),
+        "effective_volume": round(effective_volume, 2),
+        "min_volume": round(required_volume, 2),
+        "wave_progress": round(float(wave_stage.get("progress", 0.0)), 3),
+        "rebreak_without_reset": rebreak,
+        "first_leg_late": bool(first_leg.get("late", False)),
+        "first_leg_rebuilt": rebuilt,
+        "relative_strength": round(float(relative_strength), 2),
+    }
+    return not blockers, blockers, details
+
+
 def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
     try:
         c5,c15,c1h,c4h=[get_klines(symbol,x,260) for x in ("5m","15m","1h","4h")]
@@ -2420,6 +2525,24 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         # V28: تأهيل A المبكر لحالات مثل COTI وDIA.
         # لا يخلق نمطًا جديدًا ولا يتجاوز فلاتر الأمان السابقة؛ فقط يمنع رفض
         # Trend Ignition / Exceptional Strength بسبب نقص محدود في السكور النهائي.
+        gate_ok, gate_blockers, gate_details = final_signal_gate(
+            symbol=symbol,
+            mode=mode,
+            adx_15m=a15,
+            volume_ratio_15m=vr15,
+            live_volume_ratio_15m=live_vr15,
+            wave_stage=wave_stage,
+            first_leg=first_leg,
+            relative_strength=rel,
+            exceptional_strength=exceptional_strength,
+        )
+        if not gate_ok:
+            log_rejection(symbol, "رفض البوابة النهائية الموحدة", {
+                **gate_details,
+                "blockers": gate_blockers,
+            })
+            return None
+
         score_gap = max(0, int(threshold) - int(score))
         strong_ignition_for_a = bool(
             mode == "trend_ignition"
@@ -2492,7 +2615,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"market_environment":market_environment_score(market),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"independence_score":coin_independence_score(rel, vr15, float(mtf["score"]), float(market.get("btc_health_score",50)), exceptional_strength),"first_leg":first_leg,"first_leg_late":first_leg_late}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"market_environment":market_environment_score(market),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"independence_score":coin_independence_score(rel, vr15, float(mtf["score"]), float(market.get("btc_health_score",50)), exceptional_strength),"first_leg":first_leg,"first_leg_late":first_leg_late,"final_gate_passed":True}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -2634,7 +2757,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V40 Advanced Symbol Analyzer.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V41 Unified Signal Gate.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
