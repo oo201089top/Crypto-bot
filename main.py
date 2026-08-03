@@ -1,4 +1,4 @@
-# V39: on-demand full symbol analysis / smart market manager built on V36 first-leg engine
+# V40: on-demand full symbol analysis / smart market manager built on V36 first-leg engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -885,6 +885,17 @@ def normalize_symbol_command(raw: str) -> Optional[str]:
     symbol = token if token.endswith("USDT") else token + "USDT"
     return symbol if symbol in get_all_binance_usdt_symbols() else None
 
+
+
+V40_REPORT_FEATURES = {
+    "support_levels": True,
+    "readiness_score": True,
+    "state_classification": True,
+    "activation_requirements": True,
+    "risk_reward_summary": True,
+    "explosion_probability": True,
+    "final_recommendation": True,
+}
 
 def symbol_full_report(symbol: str) -> str:
     """تحليل مباشر لأي زوج Binance Spot USDT، حتى لو لم يحقق شروط إرسال الإشارة."""
@@ -2623,7 +2634,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V39 Full Symbol Analyzer.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V40 Advanced Symbol Analyzer.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
