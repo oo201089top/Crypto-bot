@@ -1,4 +1,4 @@
-# V41: unified final signal gate / on-demand analyzer built on V36 first-leg engine
+# V42: strict unified decision gate / on-demand analyzer built on V36 first-leg engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -304,6 +304,12 @@ FINAL_GATE_MIN_ADX_RECLAIM = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_RECLAI
 FINAL_GATE_MIN_ADX_REVERSAL = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_REVERSAL", "18"))
 FINAL_GATE_MIN_ADX_PULLBACK = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_PULLBACK", "18"))
 FINAL_GATE_MIN_ADX_MOMENTUM = float(ENGINE_ENV("SPOT", "FINAL_GATE_MIN_ADX_MOMENTUM", "25"))
+
+# V42: حدود مشتركة بين تقرير /SYMBOL ومحرك إرسال الإشارات.
+FINAL_GATE_GLOBAL_MIN_ADX = float(ENGINE_ENV("SPOT", "FINAL_GATE_GLOBAL_MIN_ADX", "16"))
+FINAL_GATE_GLOBAL_MIN_VOLUME = float(ENGINE_ENV("SPOT", "FINAL_GATE_GLOBAL_MIN_VOLUME", "1.30"))
+FINAL_GATE_MAX_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "FINAL_GATE_MAX_WAVE_PROGRESS", "0.70"))
+FINAL_GATE_BLOCK_VOLUME_DECAY = ENGINE_ENV("SPOT", "FINAL_GATE_BLOCK_VOLUME_DECAY", "1") == "1"
 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
@@ -969,10 +975,16 @@ def symbol_full_report(symbol: str) -> str:
             blockers = []
             if float(mtf["score"]) < 60: blockers.append("التوافق متعدد الفريمات ضعيف")
             if r15 is not None and float(r15) > 72: blockers.append("RSI مرتفع ومطاردة محتملة")
-            if max(vr15, live_vr15) < 1.3: blockers.append("الحجم دون مستوى الانطلاقة")
-            if a15 < 16: blockers.append("ADX ضعيف")
-            if wave.get("late") or float(wave.get("progress", 0.0)) > LATE_MAX_WAVE_PROGRESS:
-                blockers.append("الحركة متقدمة وليست بداية موجة")
+            if max(vr15, live_vr15) < FINAL_GATE_GLOBAL_MIN_VOLUME:
+                blockers.append(f"الحجم دون المطلوب ×{FINAL_GATE_GLOBAL_MIN_VOLUME:.2f}")
+            if a15 < FINAL_GATE_GLOBAL_MIN_ADX:
+                blockers.append(f"ADX أقل من {FINAL_GATE_GLOBAL_MIN_ADX:.0f}")
+            if wave.get("late") or float(wave.get("progress", 0.0)) > FINAL_GATE_MAX_WAVE_PROGRESS:
+                blockers.append(
+                    f"الحركة متقدمة وتتجاوز {FINAL_GATE_MAX_WAVE_PROGRESS*100:.0f}% من الموجة"
+                )
+            if FINAL_GATE_BLOCK_VOLUME_DECAY and wave.get("volume_decay"):
+                blockers.append("ضعف حجم قرب القمة")
             if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
             decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
             levels = "• المطلوب:\n" + "\n".join(f"  - {x}" for x in blockers[:5])
@@ -1669,8 +1681,14 @@ def final_signal_gate(
         "balanced": MIN_15M_VOLUME_RATIO,
     }
 
-    min_adx = float(min_adx_map.get(mode, 18.0))
-    min_volume = float(min_volume_map.get(mode, MIN_15M_VOLUME_RATIO))
+    min_adx = max(
+        FINAL_GATE_GLOBAL_MIN_ADX,
+        float(min_adx_map.get(mode, 18.0)),
+    )
+    min_volume = max(
+        FINAL_GATE_GLOBAL_MIN_VOLUME,
+        float(min_volume_map.get(mode, MIN_15M_VOLUME_RATIO)),
+    )
     effective_volume = (
         max(float(volume_ratio_15m), float(live_volume_ratio_15m))
         if FINAL_GATE_USE_LIVE_VOLUME
@@ -1701,13 +1719,26 @@ def final_signal_gate(
     if bool(first_leg.get("late", False)) and not rebuilt:
         blockers.append("نافذة الموجة الأولى انتهت")
 
-    # لا نمنع بسبب progress وحده؛ نمنع عند اقترانه بعلامة تأخر فعلية.
+    wave_progress = float(wave_stage.get("progress", 0.0))
+    volume_decay = bool(wave_stage.get("volume_decay", False))
+
+    # كل مسارات الاختراق والزخم يجب أن تكون في بداية/منتصف الموجة.
+    # مسارات الارتداد فقط يسمح لها بالعمل بعد تقدم الحركة.
     if (
-        float(wave_stage.get("progress", 0.0)) > 1.0
-        and (rebreak or bool(wave_stage.get("volume_decay", False)))
+        wave_progress > FINAL_GATE_MAX_WAVE_PROGRESS
         and mode not in ("strong_reclaim", "reversal", "pullback")
     ):
-        blockers.append("الحركة متقدمة مع ضعف/إعادة كسر قرب القمة")
+        blockers.append(
+            f"الحركة متقدمة {wave_progress*100:.0f}% وتتجاوز الحد "
+            f"{FINAL_GATE_MAX_WAVE_PROGRESS*100:.0f}%"
+        )
+
+    if (
+        FINAL_GATE_BLOCK_VOLUME_DECAY
+        and volume_decay
+        and mode not in ("strong_reclaim", "reversal", "pullback")
+    ):
+        blockers.append("ضعف حجم قرب القمة")
 
     details = {
         "mode": mode,
@@ -1717,7 +1748,9 @@ def final_signal_gate(
         "live_volume": round(float(live_volume_ratio_15m), 2),
         "effective_volume": round(effective_volume, 2),
         "min_volume": round(required_volume, 2),
-        "wave_progress": round(float(wave_stage.get("progress", 0.0)), 3),
+        "wave_progress": round(wave_progress, 3),
+        "max_wave_progress": round(FINAL_GATE_MAX_WAVE_PROGRESS, 3),
+        "volume_decay": volume_decay,
         "rebreak_without_reset": rebreak,
         "first_leg_late": bool(first_leg.get("late", False)),
         "first_leg_rebuilt": rebuilt,
@@ -2757,7 +2790,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V41 Unified Signal Gate.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V42 Strict Unified Decision Gate.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
