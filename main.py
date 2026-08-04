@@ -1,4 +1,4 @@
-# V45.1 Hotfix: MTF-aware Edge Score + unified decision engine
+# V45.3 Final Fix: accurate blow-off/volume-decay classification + unified decision engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -334,6 +334,10 @@ EDGE_PENALTY_15M_5M_ZERO = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_15M_5M_ZERO", 
 EDGE_PENALTY_1H_LT_20 = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_1H_LT_20", "8"))
 EDGE_PENALTY_BTC_LT_50 = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_BTC_LT_50", "5"))
 EDGE_BLOCK_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "EDGE_BLOCK_WAVE_PROGRESS", "0.80"))
+EDGE_BLOWOFF_MIN_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "EDGE_BLOWOFF_MIN_WAVE_PROGRESS", "1.20"))
+EDGE_BLOWOFF_MIN_EMA_ATR = float(ENGINE_ENV("SPOT", "EDGE_BLOWOFF_MIN_EMA_ATR", "4.0"))
+EDGE_EXTREME_EMA_ATR = float(ENGINE_ENV("SPOT", "EDGE_EXTREME_EMA_ATR", "5.0"))
+EDGE_ACTIVE_VOLUME_RATIO = float(ENGINE_ENV("SPOT", "EDGE_ACTIVE_VOLUME_RATIO", "1.30"))
 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
@@ -513,6 +517,7 @@ def edge_score_context(
     ema_extension_atr: float,
     atr_value: float,
     volume_decay: bool,
+    volume_ratio: float = 0.0,
     mtf_score: float = 50.0,
     frame_scores: Optional[Dict] = None,
     btc_health_score: float = 50.0,
@@ -556,9 +561,28 @@ def edge_score_context(
     if float(btc_health_score) < 50:
         score -= EDGE_PENALTY_BTC_LT_50
         penalties.append(f"BTC دون 50 (-{EDGE_PENALTY_BTC_LT_50:.0f})")
-    if volume_decay:
+    active_volume = float(volume_ratio) >= EDGE_ACTIVE_VOLUME_RATIO
+    blowoff_move = bool(
+        wave_progress >= EDGE_BLOWOFF_MIN_WAVE_PROGRESS
+        and ema_extension_atr >= EDGE_BLOWOFF_MIN_EMA_ATR
+        and active_volume
+    )
+    extreme_ema_extension = bool(
+        ema_extension_atr >= EDGE_EXTREME_EMA_ATR
+        and not blowoff_move
+    )
+    true_volume_decay = bool(volume_decay and not blowoff_move)
+
+    if blowoff_move:
+        score -= 12.0
+        penalties.append("اندفاع سعري نهائي (Blow-off Move) (-12)")
+    elif true_volume_decay:
         score -= 12.0
         penalties.append("ضعف حجم قرب القمة (-12)")
+    elif extreme_ema_extension:
+        score -= 10.0
+        penalties.append(f"السعر بعيد جدًا عن EMA20 بمقدار {ema_extension_atr:.2f} ATR (-10)")
+
     if wave_progress > EDGE_BLOCK_WAVE_PROGRESS:
         score -= 15.0
         penalties.append("الموجة تجاوزت 80% (-15)")
@@ -583,6 +607,10 @@ def edge_score_context(
         "geometry_score": round(geometry_score, 1),
         "mtf_component": round(mtf_component, 1),
         "btc_health_score": round(float(btc_health_score), 1),
+        "volume_ratio": round(float(volume_ratio), 2),
+        "blowoff_move": blowoff_move,
+        "true_volume_decay": true_volume_decay,
+        "extreme_ema_extension": extreme_ema_extension,
         "penalties": penalties,
     }
 
@@ -1130,6 +1158,7 @@ def symbol_full_report(symbol: str) -> str:
             ema_extension_atr=report_ema_extension_atr,
             atr_value=atr15,
             volume_decay=bool(wave.get("volume_decay", False)),
+            volume_ratio=max(vr15, live_vr15),
             mtf_score=float(mtf["score"]),
             frame_scores=mtf.get("frames", {}),
             btc_health_score=float(market.get("btc_health_score", 50.0)),
@@ -1155,8 +1184,16 @@ def symbol_full_report(symbol: str) -> str:
                 blockers.append(
                     f"الحركة متقدمة وتتجاوز {FINAL_GATE_MAX_WAVE_PROGRESS*100:.0f}% من الموجة"
                 )
-            if FINAL_GATE_BLOCK_VOLUME_DECAY and wave.get("volume_decay"):
-                blockers.append("ضعف حجم قرب القمة")
+            if bool(edge.get("blowoff_move", False)):
+                blockers.append(
+                    f"اندفاع سعري نهائي؛ السعر ممتد {report_ema_extension_atr:.2f} ATR عن EMA20"
+                )
+            elif FINAL_GATE_BLOCK_VOLUME_DECAY and bool(edge.get("true_volume_decay", False)):
+                blockers.append("ضعف حجم فعلي قرب القمة")
+            elif bool(edge.get("extreme_ema_extension", False)):
+                blockers.append(
+                    f"السعر بعيد جدًا عن EMA20 بمقدار {report_ema_extension_atr:.2f} ATR"
+                )
             if EDGE_SCORE_ENABLED and float(edge["score"]) < EDGE_SCORE_HARD_BLOCK:
                 blockers.append(f"Edge Score منخفض {edge['score']}/100")
             if float(wave.get("progress", 0.0)) > EDGE_BLOCK_WAVE_PROGRESS:
@@ -1164,7 +1201,16 @@ def symbol_full_report(symbol: str) -> str:
             if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
             decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
             progress = float(wave.get("progress", 0.0))
-            if (price > float(e20_15 or price) > float(e50_15 or price)) and float(mtf["score"]) >= 55 and progress > FINAL_GATE_MAX_WAVE_PROGRESS:
+            if bool(edge.get("blowoff_move", False)):
+                recommendation = (
+                    "💡 التقييم: القوة موجودة لكن الدخول متأخر جدًا. انتظر تصحيحًا منظمًا 3–5% "
+                    "أو تكوين قاعدة سعرية جديدة قبل أي دخول."
+                )
+            elif bool(edge.get("extreme_ema_extension", False)):
+                recommendation = (
+                    "💡 التقييم: السعر منفصل عن متوسطه. انتظر عودة أقرب إلى EMA20 أو إعادة تجميع واضحة."
+                )
+            elif (price > float(e20_15 or price) > float(e50_15 or price)) and float(mtf["score"]) >= 55 and progress > FINAL_GATE_MAX_WAVE_PROGRESS:
                 recommendation = "💡 التقييم: فرصة جيدة للمتابعة، لكنها ليست مناسبة لفتح مركز جديد. انتظر إعادة تجميع أو كسرًا جديدًا بحجم مؤكد."
             elif (price > float(e20_15 or price) > float(e50_15 or price)) and max(vr15, live_vr15) < FINAL_GATE_GLOBAL_MIN_VOLUME:
                 recommendation = "💡 التقييم: الاتجاه مقبول، لكن لا يوجد طلب كافٍ الآن. راقب عودة الحجم قبل التفكير بالدخول."
@@ -1934,7 +1980,10 @@ def final_signal_gate(
         and volume_decay
         and mode not in ("strong_reclaim", "reversal", "pullback")
     ):
-        blockers.append("ضعف حجم قرب القمة")
+        if wave_progress >= EDGE_BLOWOFF_MIN_WAVE_PROGRESS and effective_volume >= EDGE_ACTIVE_VOLUME_RATIO:
+            blockers.append("اندفاع سعري نهائي بعد امتداد الموجة، وليس ضعف حجم حالي")
+        else:
+            blockers.append("ضعف حجم فعلي قرب القمة")
 
     details = {
         "mode": mode,
@@ -2852,6 +2901,7 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             ema_extension_atr=float(ema_extension_atr),
             atr_value=float(atr15),
             volume_decay=bool(wave_stage.get("volume_decay", False)),
+            volume_ratio=max(vr15, live_vr15),
             mtf_score=float(mtf["score"]),
             frame_scores=mtf.get("frames", {}),
             btc_health_score=float(market.get("btc_health_score", 50.0)),
@@ -2992,8 +3042,14 @@ def regression_validate_signal(candidate: Dict, market: Dict) -> Tuple[bool, Lis
         blockers.append("التوافق متعدد الفريمات أقل من 60")
     if float(candidate.get("wave_progress", 0.0)) > FINAL_GATE_MAX_WAVE_PROGRESS and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
         blockers.append("تقرير التحليل يصنف الحركة متقدمة/مطاردة")
-    if FINAL_GATE_BLOCK_VOLUME_DECAY and bool(wave.get("volume_decay", False)) and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
-        blockers.append("تقرير التحليل يرصد ضعف حجم قرب القمة")
+    edge_context = candidate.get("edge_context", {}) or {}
+    if str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
+        if bool(edge_context.get("blowoff_move", False)):
+            blockers.append("تقرير التحليل يرصد اندفاعًا سعريًا نهائيًا (Blow-off)")
+        elif FINAL_GATE_BLOCK_VOLUME_DECAY and bool(edge_context.get("true_volume_decay", False)):
+            blockers.append("تقرير التحليل يرصد ضعف حجم فعلي قرب القمة")
+        elif bool(edge_context.get("extreme_ema_extension", False)):
+            blockers.append("تقرير التحليل يرصد ابتعادًا مفرطًا عن EMA20")
     if EDGE_SCORE_ENABLED and float(candidate.get("edge_score", 0.0)) < EDGE_SCORE_HARD_BLOCK:
         blockers.append(f"Edge Score أقل من {EDGE_SCORE_HARD_BLOCK:.0f}")
     if EDGE_SCORE_ENABLED and float(candidate.get("edge_rr", 0.0)) < EDGE_SCORE_MIN_RR:
@@ -3159,7 +3215,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V45 Final MTF-Aware Edge Engine + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V45.3 Final Fix — Accurate Blow-off Classification + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
@@ -3174,16 +3230,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-# === V45.2 FINAL PATCH NOTES ===
-# Added:
-# - Final unified gate uses Edge Score + MTF + Market together.
-# - Reject if wave_progress >80%, RSI extreme, volume decay near highs.
-# - Regression validation before send.
-# - Rejection logging with reasons.
-# - Rejection digest support.
-# - Prevent monitored/delisting symbols (requires symbol metadata implementation).
-# - Report rejection reasons in /analysis.
