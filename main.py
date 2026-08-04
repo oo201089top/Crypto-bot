@@ -1,4 +1,4 @@
-# V45: MTF-aware Edge Score + unified decision engine
+# V45.1 Hotfix: MTF-aware Edge Score + unified decision engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -1130,8 +1130,8 @@ def symbol_full_report(symbol: str) -> str:
             ema_extension_atr=report_ema_extension_atr,
             atr_value=atr15,
             volume_decay=bool(wave.get("volume_decay", False)),
-            mtf_score=float(mtf_score),
-            frame_scores=mtf_scores,
+            mtf_score=float(mtf["score"]),
+            frame_scores=mtf.get("frames", {}),
             btc_health_score=float(market.get("btc_health_score", 50.0)),
         )
 
@@ -2852,8 +2852,8 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             ema_extension_atr=float(ema_extension_atr),
             atr_value=float(atr15),
             volume_decay=bool(wave_stage.get("volume_decay", False)),
-            mtf_score=float(mtf_score),
-            frame_scores=mtf_scores,
+            mtf_score=float(mtf["score"]),
+            frame_scores=mtf.get("frames", {}),
             btc_health_score=float(market.get("btc_health_score", 50.0)),
         )
         edge_wave_block = (
