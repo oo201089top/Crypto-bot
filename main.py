@@ -1,4 +1,4 @@
-# V42: strict unified decision gate / on-demand analyzer built on V36 first-leg engine
+# V43: rejection intelligence + regression validation / unified decision engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -310,6 +310,14 @@ FINAL_GATE_GLOBAL_MIN_ADX = float(ENGINE_ENV("SPOT", "FINAL_GATE_GLOBAL_MIN_ADX"
 FINAL_GATE_GLOBAL_MIN_VOLUME = float(ENGINE_ENV("SPOT", "FINAL_GATE_GLOBAL_MIN_VOLUME", "1.30"))
 FINAL_GATE_MAX_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "FINAL_GATE_MAX_WAVE_PROGRESS", "0.70"))
 FINAL_GATE_BLOCK_VOLUME_DECAY = ENGINE_ENV("SPOT", "FINAL_GATE_BLOCK_VOLUME_DECAY", "1") == "1"
+
+# V43: مراجعة تلقائية قبل الإرسال وتقارير الرفض.
+REGRESSION_VALIDATION_ENABLED = ENGINE_ENV("SPOT", "REGRESSION_VALIDATION_ENABLED", "1") == "1"
+REGRESSION_REANALYZE_ENABLED = ENGINE_ENV("SPOT", "REGRESSION_REANALYZE_ENABLED", "1") == "1"
+REGRESSION_MAX_ENTRY_DRIFT_PCT = float(ENGINE_ENV("SPOT", "REGRESSION_MAX_ENTRY_DRIFT_PCT", "0.80"))
+REGRESSION_ERROR_FILE = Path(ENGINE_ENV("SPOT", "REGRESSION_ERROR_FILE", "regression_errors.jsonl"))
+REJECTION_DIGEST_ENABLED = ENGINE_ENV("SPOT", "REJECTION_DIGEST_ENABLED", "1") == "1"
+REJECTION_DIGEST_MAX_ROWS = int(ENGINE_ENV("SPOT", "REJECTION_DIGEST_MAX_ROWS", "5"))
 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
@@ -813,12 +821,14 @@ def telegram_command_loop() -> None:
                 elif cmd in ("/debug","/تشخيص"):
                     parts=text.split(maxsplit=1)
                     send_message(debug_report_message(parts[1] if len(parts)>1 else ""))
+                elif cmd in ("/مرفوضات","/rejections"):
+                    send_message(debug_report_message(""))
                 elif cmd in ("/صفقات","/trades"):
                     send_message(open_trades_message())
                 elif cmd in ("/إحصائيات","/stats"):
                     send_message(performance_message())
                 elif cmd in ("/help","/مساعدة","/start"):
-                    send_message("الأوامر المتاحة:\n/السوق — حالة السوق وقرار الدخول\n/debug DIA — أسباب الرفض\n/صفقات — الصفقات المفتوحة\n/إحصائيات — نتائج المتابعة\n/BTC أو /BTCUSDT — تحليل شامل لأي زوج Binance Spot USDT")
+                    send_message("الأوامر المتاحة:\n/السوق — حالة السوق وقرار الدخول\n/debug DIA — أسباب رفض عملة\n/مرفوضات — آخر الإشارات غير المرسلة\n/صفقات — الصفقات المفتوحة\n/إحصائيات — نتائج المتابعة\n/BTC أو /BTCUSDT — تحليل شامل لأي زوج Binance Spot USDT")
                 elif cmd.startswith("/"):
                     requested = normalize_symbol_command(cmd)
                     if requested:
@@ -987,7 +997,14 @@ def symbol_full_report(symbol: str) -> str:
                 blockers.append("ضعف حجم قرب القمة")
             if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
             decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
-            levels = "• المطلوب:\n" + "\n".join(f"  - {x}" for x in blockers[:5])
+            progress = float(wave.get("progress", 0.0))
+            if (price > float(e20_15 or price) > float(e50_15 or price)) and float(mtf["score"]) >= 55 and progress > FINAL_GATE_MAX_WAVE_PROGRESS:
+                recommendation = "💡 التقييم: فرصة جيدة للمتابعة، لكنها ليست مناسبة لفتح مركز جديد. انتظر إعادة تجميع أو كسرًا جديدًا بحجم مؤكد."
+            elif (price > float(e20_15 or price) > float(e50_15 or price)) and max(vr15, live_vr15) < FINAL_GATE_GLOBAL_MIN_VOLUME:
+                recommendation = "💡 التقييم: الاتجاه مقبول، لكن لا يوجد طلب كافٍ الآن. راقب عودة الحجم قبل التفكير بالدخول."
+            else:
+                recommendation = "💡 التقييم: لا توجد أفضلية دخول واضحة حاليًا؛ انتظر تحسن الشروط بدل مطاردة السعر."
+            levels = "• المطلوب:\n" + "\n".join(f"  - {x}" for x in blockers[:5]) + "\n\n" + recommendation
 
         frame_lines = []
         for tf in ("1w", "1d", "4h", "1h", "15m", "5m"):
@@ -2718,6 +2735,97 @@ def load_state():
 
 def save_state(s): STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding="utf-8")
 
+
+def _append_jsonl(path: Path, row: Dict) -> None:
+    try:
+        with REJECTION_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log(f"JSONL write error {path}: {exc}")
+
+
+def regression_validate_signal(candidate: Dict, market: Dict) -> Tuple[bool, List[str], Dict]:
+    """يعيد فحص الإشارة قبل الإرسال بنفس بوابة القرار وبلقطة تحليل ثانية."""
+    if not REGRESSION_VALIDATION_ENABLED:
+        return True, [], {"enabled": False}
+
+    symbol = str(candidate.get("symbol", ""))
+    blockers: List[str] = []
+    wave = candidate.get("wave_stage", {}) or {}
+    first_leg = candidate.get("first_leg", {}) or {}
+
+    gate_ok, gate_blockers, gate_details = final_signal_gate(
+        symbol=symbol,
+        mode=str(candidate.get("mode", "balanced")),
+        adx_15m=float(candidate.get("adx", 0.0)),
+        volume_ratio_15m=float(candidate.get("volume_ratio", 0.0)),
+        live_volume_ratio_15m=float(candidate.get("live_volume_ratio_15m", 0.0)),
+        wave_stage=wave,
+        first_leg=first_leg,
+        relative_strength=float(candidate.get("relative_strength", 0.0)),
+        exceptional_strength=bool(candidate.get("exceptional_strength", False)),
+    )
+    if not gate_ok:
+        blockers.extend(gate_blockers)
+
+    # نفس القواعد الظاهرة في /SYMBOL، حتى لا يختلف العرض عن قرار الإرسال.
+    if float(candidate.get("mtf_score", 0.0)) < 60:
+        blockers.append("التوافق متعدد الفريمات أقل من 60")
+    if float(candidate.get("wave_progress", 0.0)) > FINAL_GATE_MAX_WAVE_PROGRESS and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
+        blockers.append("تقرير التحليل يصنف الحركة متقدمة/مطاردة")
+    if FINAL_GATE_BLOCK_VOLUME_DECAY and bool(wave.get("volume_decay", False)) and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
+        blockers.append("تقرير التحليل يرصد ضعف حجم قرب القمة")
+
+    recheck = None
+    if REGRESSION_REANALYZE_ENABLED and not blockers:
+        try:
+            recheck = analyze_symbol(symbol, market)
+        except Exception as exc:
+            blockers.append(f"فشل إعادة التحليل: {exc}")
+        if recheck is None and not blockers:
+            blockers.append("إعادة التحليل بنفس المحرك لم تعد تقبل الإشارة")
+        elif recheck is not None:
+            original_entry = float(candidate.get("entry", 0.0))
+            recheck_entry = float(recheck.get("entry", 0.0))
+            drift = abs(recheck_entry / original_entry - 1.0) * 100 if original_entry > 0 else 999.0
+            if drift > REGRESSION_MAX_ENTRY_DRIFT_PCT:
+                blockers.append(f"تغير سعر الدخول أثناء المراجعة {drift:.2f}%")
+
+    # إزالة التكرار مع الحفاظ على الترتيب.
+    blockers = list(dict.fromkeys(blockers))
+    details = {
+        **gate_details,
+        "symbol": symbol,
+        "candidate_mode": candidate.get("mode"),
+        "candidate_score": candidate.get("score"),
+        "candidate_mtf": candidate.get("mtf_score"),
+        "reanalyzed": bool(REGRESSION_REANALYZE_ENABLED),
+        "recheck_mode": recheck.get("mode") if recheck else None,
+        "blockers": blockers,
+    }
+    if blockers:
+        row = {"time": int(time.time()*1000), "symbol": symbol, "reason": "Regression validation failed", "details": details}
+        _append_jsonl(REGRESSION_ERROR_FILE, row)
+        log_rejection(symbol, "فشل اختبار الاتساق قبل الإرسال", details)
+    return not blockers, blockers, details
+
+
+def rejection_digest_message(rows: List[Dict]) -> str:
+    if not rows:
+        return ""
+    chunks=[]
+    for row in rows[:REJECTION_DIGEST_MAX_ROWS]:
+        reasons=row.get("reasons",[]) or [row.get("reason","سبب غير معروف")]
+        chunks.append(
+            f"❌ {row.get('symbol','')} — لم تُرسل\n" +
+            "\n".join(f"• {x}" for x in reasons[:4])
+        )
+    extra=max(0,len(rows)-REJECTION_DIGEST_MAX_ROWS)
+    tail=f"\n\n• وهناك {extra} حالات إضافية في {REJECTION_LOG_FILE}." if extra else ""
+    return "🧪 تقرير الإشارات غير المرسلة\n\n"+"\n\n".join(chunks)+tail
+
+
 def cooled(s,r): return r["candle_close"]-int(s.get("alerts",{}).get(r["symbol"],0))>=COOLDOWN_MINUTES*60*1000
 
 
@@ -2765,24 +2873,57 @@ def track_open_signals(state: Dict) -> None:
 
 def scan(state: Dict) -> None:
     track_open_signals(state); market=market_context(); symbols=get_symbols(); ranked=[]
+    rejected_rows=[]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for f in as_completed([pool.submit(prefilter_symbol,s) for s in symbols]):
-            x=f.result()
+            try:
+                x=f.result()
+            except Exception as exc:
+                log(f"Prefilter error: {exc}"); continue
             if x: ranked.append(x)
     ranked.sort(key=lambda x:x[1],reverse=True); shortlist=[s for s,_ in ranked[:PREFILTER_LIMIT]]; results=[]
     with ThreadPoolExecutor(max_workers=max(4,MAX_WORKERS//2)) as pool:
-        for f in as_completed([pool.submit(analyze_symbol,s,market) for s in shortlist]):
-            x=f.result()
-            if x and cooled(state,x): results.append(x)
+        future_map={pool.submit(analyze_symbol,s,market):s for s in shortlist}
+        for f in as_completed(future_map):
+            symbol=future_map[f]
+            try:
+                x=f.result()
+            except Exception as exc:
+                log_rejection(symbol,"خطأ أثناء التحليل",{"error":str(exc)})
+                continue
+            if not x:
+                continue
+            if not cooled(state,x):
+                reason="فترة التهدئة ما زالت فعالة"
+                log_rejection(x["symbol"],reason,{"candle_close":x.get("candle_close")})
+                rejected_rows.append({"symbol":x["symbol"],"reasons":[reason]})
+                continue
+            results.append(x)
     results.sort(key=lambda x:(7 if x.get("mode")=="surge_continuation" else 6 if x.get("mode")=="trend_ignition" else 5 if x.get("mode")=="strong_reclaim" else 4 if x.get("mode")=="pullback" else 3 if x.get("mode")=="accumulation" else 2 if x.get("mode")=="momentum" else 1 if x.get("mode")=="reversal" else 0,x["score"],x["volume_ratio"]),reverse=True)
     sent=0
     for r in results[:MAX_ALERTS_PER_SCAN]:
+        valid, blockers, details = regression_validate_signal(r, market)
+        if not valid:
+            rejected_rows.append({"symbol":r["symbol"],"reasons":blockers})
+            continue
         if not send_message(signal_message(r)):
+            reason="فشل إرسال الرسالة إلى تيليجرام"
+            log_rejection(r["symbol"],reason,{})
+            rejected_rows.append({"symbol":r["symbol"],"reasons":[reason]})
             continue
         state.setdefault("alerts",{})[r["symbol"]]=r["candle_close"]
         state.setdefault("open_signals",{})[r["symbol"]]={"time":r["candle_close"],"last_checked":r["candle_close"],"entry":r["entry"],"stop":r["stop"],"tp1":r["tp1"],"tp2":r["tp2"],"tp3":r["tp3"],"reached":0,"mode":r.get("mode","balanced")}
         sent+=1; time.sleep(0.3)
-    save_state(state); log(f"Scan finished | market={market.get('regime')} | universe={len(symbols)} | shortlist={len(shortlist)} | candidates={len(results)} | sent={sent}")
+
+    # المرشحون الزائدون عن حد الإرسال يُسجلون بوضوح.
+    for r in results[MAX_ALERTS_PER_SCAN:]:
+        reason=f"تجاوز حد الإرسال في الدورة ({MAX_ALERTS_PER_SCAN})"
+        log_rejection(r["symbol"],reason,{"score":r.get("score"),"mode":r.get("mode")})
+        rejected_rows.append({"symbol":r["symbol"],"reasons":[reason]})
+
+    if REJECTION_DIGEST_ENABLED and rejected_rows:
+        send_message(rejection_digest_message(rejected_rows))
+    save_state(state); log(f"Scan finished | market={market.get('regime')} | universe={len(symbols)} | shortlist={len(shortlist)} | candidates={len(results)} | rejected={len(rejected_rows)} | sent={sent}")
 
 
 def main() -> None:
@@ -2790,7 +2931,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V42 Strict Unified Decision Gate.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V43 Rejection Intelligence + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
