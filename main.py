@@ -1,4 +1,4 @@
-# V43: rejection intelligence + regression validation / unified decision engine
+# V44: Edge Score + rejection intelligence + regression validation / unified decision engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -319,6 +319,13 @@ REGRESSION_ERROR_FILE = Path(ENGINE_ENV("SPOT", "REGRESSION_ERROR_FILE", "regres
 REJECTION_DIGEST_ENABLED = ENGINE_ENV("SPOT", "REJECTION_DIGEST_ENABLED", "1") == "1"
 REJECTION_DIGEST_MAX_ROWS = int(ENGINE_ENV("SPOT", "REJECTION_DIGEST_MAX_ROWS", "5"))
 
+# V44: ميزة الدخول الإحصائية — مساحة الربح مقابل المخاطرة وتقدم الموجة.
+EDGE_SCORE_ENABLED = ENGINE_ENV("SPOT", "EDGE_SCORE_ENABLED", "1") == "1"
+EDGE_SCORE_HARD_BLOCK = float(ENGINE_ENV("SPOT", "EDGE_SCORE_HARD_BLOCK", "40"))
+EDGE_SCORE_A_MIN = float(ENGINE_ENV("SPOT", "EDGE_SCORE_A_MIN", "60"))
+EDGE_SCORE_A_PLUS_MIN = float(ENGINE_ENV("SPOT", "EDGE_SCORE_A_PLUS_MIN", "80"))
+EDGE_SCORE_MIN_RR = float(ENGINE_ENV("SPOT", "EDGE_SCORE_MIN_RR", "1.25"))
+
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
 MTF_SCORE_IMPACT = float(ENGINE_ENV("SPOT", "MTF_SCORE_IMPACT", "0.20"))
@@ -448,6 +455,97 @@ def nearest_overhead_resistance(candles: List[Dict], price: float, lookback: int
 
     return min(valid, key=lambda x: x["distance_pct"]) if valid else None
 
+
+
+
+def nearest_support_level(candles: List[Dict], price: float, lookback: int = 100) -> Optional[Dict]:
+    """أقرب دعم موثوق أسفل السعر من قيعان محورية متكررة."""
+    if price <= 0 or len(candles) < 10:
+        return None
+    sample = candles[-lookback:]
+    levels: List[float] = []
+    w = max(1, RESISTANCE_SWING_WINDOW)
+    for i in range(w, len(sample) - w):
+        low = float(sample[i]["low"])
+        neighbors = sample[i-w:i] + sample[i+1:i+w+1]
+        if low <= min(float(c["low"]) for c in neighbors):
+            distance_pct = max(0.0, -pct_change(price, low))
+            if 0 < distance_pct <= RESISTANCE_MAX_DISTANCE_PCT:
+                levels.append(low)
+    if not levels:
+        return None
+    levels.sort()
+    clusters: List[List[float]] = []
+    for level in levels:
+        placed = False
+        for cluster in clusters:
+            center = mean(cluster)
+            if abs(level / center - 1) * 100 <= RESISTANCE_CLUSTER_TOLERANCE_PCT:
+                cluster.append(level)
+                placed = True
+                break
+        if not placed:
+            clusters.append([level])
+    valid = []
+    for cluster in clusters:
+        level = mean(cluster)
+        distance_pct = max(0.0, -pct_change(price, level))
+        if 0 < distance_pct <= RESISTANCE_MAX_DISTANCE_PCT:
+            valid.append({"level": level, "distance_pct": distance_pct, "touches": len(cluster)})
+    return min(valid, key=lambda x: x["distance_pct"]) if valid else None
+
+
+def edge_score_context(
+    price: float,
+    stop: float,
+    resistance: Optional[Dict],
+    support: Optional[Dict],
+    wave_progress: float,
+    ema_extension_atr: float,
+    atr_value: float,
+    volume_decay: bool,
+) -> Dict:
+    """درجة 0..100 لجودة نقطة الدخول، وليست احتمال ربح."""
+    if price <= 0:
+        return {"score": 0, "label": "ضعيف جدًا 🔴", "rr": 0.0}
+
+    risk_pct = max(0.01, (price - stop) / price * 100) if 0 < stop < price else 4.0
+    reward_pct = (
+        float(resistance.get("distance_pct", 0.0))
+        if resistance else max(2.5, risk_pct * 1.8)
+    )
+    support_gap_pct = (
+        float(support.get("distance_pct", risk_pct))
+        if support else risk_pct
+    )
+    rr = reward_pct / max(risk_pct, 0.01)
+
+    rr_points = max(0.0, min(35.0, rr / 2.5 * 35.0))
+    room_points = max(0.0, min(20.0, reward_pct / 5.0 * 20.0))
+    support_points = max(0.0, min(15.0, 15.0 - abs(support_gap_pct - risk_pct) * 4.0))
+    wave_points = max(0.0, min(20.0, (1.0 - min(1.0, wave_progress)) * 20.0))
+    extension_points = max(0.0, min(10.0, 10.0 - max(0.0, ema_extension_atr - 0.5) * 4.0))
+    score = rr_points + room_points + support_points + wave_points + extension_points
+    if volume_decay:
+        score -= 12.0
+    score = int(round(max(0.0, min(100.0, score))))
+    label = (
+        "ممتاز 🟢" if score >= EDGE_SCORE_A_PLUS_MIN
+        else "جيد 🟢" if score >= EDGE_SCORE_A_MIN
+        else "انتظار 🟡" if score >= EDGE_SCORE_HARD_BLOCK
+        else "ضعيف 🔴"
+    )
+    return {
+        "score": score,
+        "label": label,
+        "rr": round(rr, 2),
+        "risk_pct": round(risk_pct, 2),
+        "reward_pct": round(reward_pct, 2),
+        "support_gap_pct": round(support_gap_pct, 2),
+        "wave_progress": round(wave_progress, 3),
+        "ema_extension_atr": round(float(ema_extension_atr), 2),
+        "atr_pct": round((atr_value / price * 100) if atr_value > 0 else 0.0, 2),
+    }
 
 
 def higher_low_structure(candles: List[Dict], lookback: int = 18) -> bool:
@@ -972,6 +1070,28 @@ def symbol_full_report(symbol: str) -> str:
             f"{fmt(float(resistance_info['level']))} ({float(resistance_info['distance_pct']):.2f}% فوق السعر)"
             if resistance_info else "لا توجد مقاومة موثوقة قريبة"
         )
+        support_info = nearest_support_level(c1h[:-1], price, 120)
+        support_text = (
+            f"{fmt(float(support_info['level']))} ({float(support_info['distance_pct']):.2f}% تحت السعر)"
+            if support_info else "لا يوجد دعم موثوق قريب"
+        )
+        report_stop = (
+            float(support_info["level"]) * 0.995
+            if support_info else max(0.0, price - 1.5 * atr15)
+        )
+        report_ema_extension_atr = (
+            max(0.0, price - float(e20_15 or price)) / atr15 if atr15 > 0 else 0.0
+        )
+        edge = edge_score_context(
+            price=price,
+            stop=report_stop,
+            resistance=resistance_info,
+            support=support_info,
+            wave_progress=float(wave.get("progress", 0.0)),
+            ema_extension_atr=report_ema_extension_atr,
+            atr_value=atr15,
+            volume_decay=bool(wave.get("volume_decay", False)),
+        )
 
         accepted = analyze_symbol(symbol, market)
         if accepted:
@@ -995,6 +1115,8 @@ def symbol_full_report(symbol: str) -> str:
                 )
             if FINAL_GATE_BLOCK_VOLUME_DECAY and wave.get("volume_decay"):
                 blockers.append("ضعف حجم قرب القمة")
+            if EDGE_SCORE_ENABLED and float(edge["score"]) < EDGE_SCORE_HARD_BLOCK:
+                blockers.append(f"Edge Score منخفض {edge['score']}/100")
             if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
             decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
             progress = float(wave.get("progress", 0.0))
@@ -1040,9 +1162,19 @@ def symbol_full_report(symbol: str) -> str:
 
 🧱 الهيكل
 • أقرب مقاومة: {resistance_text}
+• أقرب دعم: {support_text}
 • تقدم الموجة: {float(wave.get('progress',0))*100:.0f}%
 • إعادة كسر متأخرة: {'نعم' if wave.get('rebreak_without_reset') else 'لا'}
 • ضعف الحجم قرب القمة: {'نعم' if wave.get('volume_decay') else 'لا'}
+
+🎯 Edge Score — ميزة الدخول
+• الدرجة: {edge['score']}/100 — {edge['label']}
+• العائد/المخاطرة: {edge['rr']:.2f}
+• الربح المتاح حتى المقاومة: {edge['reward_pct']:.2f}%
+• المخاطرة الفنية: {edge['risk_pct']:.2f}%
+• بعد الدعم: {edge['support_gap_pct']:.2f}%
+• امتداد EMA20: {edge['ema_extension_atr']:.2f} ATR
+• ATR الحالي: {edge['atr_pct']:.2f}% من السعر
 
 🌍 السوق
 • بيئة السوق: {env['score']:.1f}/100 — {env['label']}
@@ -2661,11 +2793,35 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
                 "stop": stop,
             })
             return None
+
+        signal_resistance = overhead or higher_overhead
+        signal_support = nearest_support_level(c1h[:-1], price, 120)
+        edge = edge_score_context(
+            price=price,
+            stop=stop,
+            resistance=signal_resistance,
+            support=signal_support,
+            wave_progress=float(wave_stage.get("progress", 0.0)),
+            ema_extension_atr=float(ema_extension_atr),
+            atr_value=float(atr15),
+            volume_decay=bool(wave_stage.get("volume_decay", False)),
+        )
+        if EDGE_SCORE_ENABLED and (
+            float(edge["score"]) < EDGE_SCORE_HARD_BLOCK
+            or float(edge["rr"]) < EDGE_SCORE_MIN_RR
+        ):
+            log_rejection(symbol, "Edge Score منخفض", {
+                **edge,
+                "required_score": EDGE_SCORE_HARD_BLOCK,
+                "required_rr": EDGE_SCORE_MIN_RR,
+            })
+            return None
+
         final_score = min(score, 99)
         quality, quality_stars = signal_quality(final_score, mtf["score"], mode, launch_mode, vr15, mtf.get("frames", {}))
         if early_a_qualified or mode == "strong_reclaim":
             quality, quality_stars = "A", "⭐⭐⭐⭐"
-        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"market_environment":market_environment_score(market),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"independence_score":coin_independence_score(rel, vr15, float(mtf["score"]), float(market.get("btc_health_score",50)), exceptional_strength),"first_leg":first_leg,"first_leg_late":first_leg_late,"final_gate_passed":True}
+        return {"symbol":symbol,"entry":price,"stop":stop,"tp1":price+1.5*risk,"tp2":price+2.2*risk,"tp3":price+3*risk,"risk_pct":risk/price*100,"score":final_score,"quality":quality,"quality_stars":quality_stars,"volume_ratio":vr15,"recent_volume_ratio_15m":recent_vr15,"recent_volume_ratio_5m":recent_vr5,"rsi":r15,"adx":a15,"setup":setup,"mode":mode,"reasons":reasons[:8],"candle_close":candle5["close_time"],"market_regime":market.get("regime","غير متاح"),"market_environment":market_environment_score(market),"btc_1h":float(market.get("btc",{}).get("rise_1h",0)),"btc_15m":float(market.get("btc",{}).get("rise_15m",0)),"btc_rsi15":float(market.get("btc",{}).get("rsi15",0)),"btc_health_score":float(market.get("btc_health_score",50)),"btc_health_label":market.get("btc_health_label","غير متاح"),"btc_health_frames":market.get("btc_health_frames",{}),"relative_strength":rel,"mtf_score":mtf["score"],"mtf_label":mtf["label"],"mtf_adjustment":mtf["adjustment"],"mtf_frames":mtf["frames"],"mtf_weights":mtf.get("weights",{}),"launch_mode":launch_mode,"exceptional_strength":exceptional_strength,"surge_continuation":surge_continuation,"trend_ignition":trend_ignition,"strong_reclaim":strong_reclaim,"btc_override":btc_override,"btc_extreme_override":btc_extreme_override,"btc_flash_crash":btc_flash_crash,"early_a_qualified":early_a_qualified,"ti_structure":ti_structure or {},"early_wave_triggered":early_wave_triggered,"live_volume_ratio_15m":live_vr15,"live_volume_ratio_5m":live_vr5,"breakout_extension_pct":breakout_extension_pct,"ema_extension_atr":ema_extension_atr,"wave_progress":float(wave_stage.get("progress",0.0)),"late_wave":late_wave,"wave_stage":wave_stage,"independence_score":coin_independence_score(rel, vr15, float(mtf["score"]), float(market.get("btc_health_score",50)), exceptional_strength),"first_leg":first_leg,"first_leg_late":first_leg_late,"edge_score":edge["score"],"edge_label":edge["label"],"edge_rr":edge["rr"],"edge_context":edge,"final_gate_passed":True}
     except Exception as exc:
         log(f"Analyze {symbol}: {exc}"); return None
 
@@ -2718,6 +2874,10 @@ def signal_message(r: Dict) -> str:
 • TP1: {fmt(r['tp1'])}
 • TP2: {fmt(r['tp2'])}
 • TP3: {fmt(r['tp3'])}
+
+🎯 Edge Score
+• الميزة: {r.get('edge_score',0)}/100 — {r.get('edge_label','غير متاح')}
+• العائد/المخاطرة: {r.get('edge_rr',0):.2f}
 
 📊 المؤشرات
 • RSI: {r['rsi']:.1f}
@@ -2776,6 +2936,10 @@ def regression_validate_signal(candidate: Dict, market: Dict) -> Tuple[bool, Lis
         blockers.append("تقرير التحليل يصنف الحركة متقدمة/مطاردة")
     if FINAL_GATE_BLOCK_VOLUME_DECAY and bool(wave.get("volume_decay", False)) and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback"):
         blockers.append("تقرير التحليل يرصد ضعف حجم قرب القمة")
+    if EDGE_SCORE_ENABLED and float(candidate.get("edge_score", 0.0)) < EDGE_SCORE_HARD_BLOCK:
+        blockers.append(f"Edge Score أقل من {EDGE_SCORE_HARD_BLOCK:.0f}")
+    if EDGE_SCORE_ENABLED and float(candidate.get("edge_rr", 0.0)) < EDGE_SCORE_MIN_RR:
+        blockers.append(f"نسبة العائد/المخاطرة أقل من {EDGE_SCORE_MIN_RR:.2f}")
 
     recheck = None
     if REGRESSION_REANALYZE_ENABLED and not blockers:
@@ -2931,7 +3095,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V43 Rejection Intelligence + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V44 Edge Score Decision Engine + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
