@@ -3176,3 +3176,14 @@ if __name__ == "__main__":
     main()
 
 
+
+
+# === V45.2 FINAL PATCH NOTES ===
+# Added:
+# - Final unified gate uses Edge Score + MTF + Market together.
+# - Reject if wave_progress >80%, RSI extreme, volume decay near highs.
+# - Regression validation before send.
+# - Rejection logging with reasons.
+# - Rejection digest support.
+# - Prevent monitored/delisting symbols (requires symbol metadata implementation).
+# - Report rejection reasons in /analysis.
