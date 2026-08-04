@@ -1,4 +1,4 @@
-# V44: Edge Score + rejection intelligence + regression validation / unified decision engine
+# V45: MTF-aware Edge Score + unified decision engine
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -326,6 +326,15 @@ EDGE_SCORE_A_MIN = float(ENGINE_ENV("SPOT", "EDGE_SCORE_A_MIN", "60"))
 EDGE_SCORE_A_PLUS_MIN = float(ENGINE_ENV("SPOT", "EDGE_SCORE_A_PLUS_MIN", "80"))
 EDGE_SCORE_MIN_RR = float(ENGINE_ENV("SPOT", "EDGE_SCORE_MIN_RR", "1.25"))
 
+# V45: دمج الاتجاه والسوق داخل Edge Score بدل الاعتماد الهندسي فقط.
+EDGE_MTF_WEIGHT = float(ENGINE_ENV("SPOT", "EDGE_MTF_WEIGHT", "0.40"))
+EDGE_GEOMETRY_WEIGHT = float(ENGINE_ENV("SPOT", "EDGE_GEOMETRY_WEIGHT", "0.60"))
+EDGE_PENALTY_MTF_LT_30 = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_MTF_LT_30", "12"))
+EDGE_PENALTY_15M_5M_ZERO = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_15M_5M_ZERO", "10"))
+EDGE_PENALTY_1H_LT_20 = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_1H_LT_20", "8"))
+EDGE_PENALTY_BTC_LT_50 = float(ENGINE_ENV("SPOT", "EDGE_PENALTY_BTC_LT_50", "5"))
+EDGE_BLOCK_WAVE_PROGRESS = float(ENGINE_ENV("SPOT", "EDGE_BLOCK_WAVE_PROGRESS", "0.80"))
+
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
 MTF_SCORE_IMPACT = float(ENGINE_ENV("SPOT", "MTF_SCORE_IMPACT", "0.20"))
@@ -504,6 +513,9 @@ def edge_score_context(
     ema_extension_atr: float,
     atr_value: float,
     volume_decay: bool,
+    mtf_score: float = 50.0,
+    frame_scores: Optional[Dict] = None,
+    btc_health_score: float = 50.0,
 ) -> Dict:
     """درجة 0..100 لجودة نقطة الدخول، وليست احتمال ربح."""
     if price <= 0:
@@ -525,9 +537,32 @@ def edge_score_context(
     support_points = max(0.0, min(15.0, 15.0 - abs(support_gap_pct - risk_pct) * 4.0))
     wave_points = max(0.0, min(20.0, (1.0 - min(1.0, wave_progress)) * 20.0))
     extension_points = max(0.0, min(10.0, 10.0 - max(0.0, ema_extension_atr - 0.5) * 4.0))
-    score = rr_points + room_points + support_points + wave_points + extension_points
+
+    geometry_score = rr_points + room_points + support_points + wave_points + extension_points
+    mtf_component = max(0.0, min(100.0, float(mtf_score)))
+    score = geometry_score * EDGE_GEOMETRY_WEIGHT + mtf_component * EDGE_MTF_WEIGHT
+
+    penalties = []
+    frames = frame_scores or {}
+    if mtf_component < 30:
+        score -= EDGE_PENALTY_MTF_LT_30
+        penalties.append(f"MTF أقل من 30 (-{EDGE_PENALTY_MTF_LT_30:.0f})")
+    if float(frames.get("15m", 50)) <= 0 and float(frames.get("5m", 50)) <= 0:
+        score -= EDGE_PENALTY_15M_5M_ZERO
+        penalties.append(f"15M و5M صفريتان (-{EDGE_PENALTY_15M_5M_ZERO:.0f})")
+    if float(frames.get("1h", 50)) < 20:
+        score -= EDGE_PENALTY_1H_LT_20
+        penalties.append(f"1H ضعيف جدًا (-{EDGE_PENALTY_1H_LT_20:.0f})")
+    if float(btc_health_score) < 50:
+        score -= EDGE_PENALTY_BTC_LT_50
+        penalties.append(f"BTC دون 50 (-{EDGE_PENALTY_BTC_LT_50:.0f})")
     if volume_decay:
         score -= 12.0
+        penalties.append("ضعف حجم قرب القمة (-12)")
+    if wave_progress > EDGE_BLOCK_WAVE_PROGRESS:
+        score -= 15.0
+        penalties.append("الموجة تجاوزت 80% (-15)")
+
     score = int(round(max(0.0, min(100.0, score))))
     label = (
         "ممتاز 🟢" if score >= EDGE_SCORE_A_PLUS_MIN
@@ -545,6 +580,10 @@ def edge_score_context(
         "wave_progress": round(wave_progress, 3),
         "ema_extension_atr": round(float(ema_extension_atr), 2),
         "atr_pct": round((atr_value / price * 100) if atr_value > 0 else 0.0, 2),
+        "geometry_score": round(geometry_score, 1),
+        "mtf_component": round(mtf_component, 1),
+        "btc_health_score": round(float(btc_health_score), 1),
+        "penalties": penalties,
     }
 
 
@@ -1091,6 +1130,9 @@ def symbol_full_report(symbol: str) -> str:
             ema_extension_atr=report_ema_extension_atr,
             atr_value=atr15,
             volume_decay=bool(wave.get("volume_decay", False)),
+            mtf_score=float(mtf_score),
+            frame_scores=mtf_scores,
+            btc_health_score=float(market.get("btc_health_score", 50.0)),
         )
 
         accepted = analyze_symbol(symbol, market)
@@ -1117,6 +1159,8 @@ def symbol_full_report(symbol: str) -> str:
                 blockers.append("ضعف حجم قرب القمة")
             if EDGE_SCORE_ENABLED and float(edge["score"]) < EDGE_SCORE_HARD_BLOCK:
                 blockers.append(f"Edge Score منخفض {edge['score']}/100")
+            if float(wave.get("progress", 0.0)) > EDGE_BLOCK_WAVE_PROGRESS:
+                blockers.append("الموجة تجاوزت 80% ولم تُعد بناء قاعدة جديدة")
             if not blockers: blockers.append("لم تكتمل شروط أحد نماذج A/A+ حتى الآن")
             decision = "⏳ لا توجد إشارة دخول مكتملة الآن"
             progress = float(wave.get("progress", 0.0))
@@ -1175,6 +1219,9 @@ def symbol_full_report(symbol: str) -> str:
 • بعد الدعم: {edge['support_gap_pct']:.2f}%
 • امتداد EMA20: {edge['ema_extension_atr']:.2f} ATR
 • ATR الحالي: {edge['atr_pct']:.2f}% من السعر
+• الجودة الهندسية: {edge['geometry_score']:.1f}/100
+• توافق الاتجاه داخل Edge: {edge['mtf_component']:.1f}/100
+• عقوبات الاتجاه/السوق: {', '.join(edge.get('penalties', [])) or 'لا توجد'}
 
 🌍 السوق
 • بيئة السوق: {env['score']:.1f}/100 — {env['label']}
@@ -2805,15 +2852,26 @@ def analyze_symbol(symbol: str, market: Dict) -> Optional[Dict]:
             ema_extension_atr=float(ema_extension_atr),
             atr_value=float(atr15),
             volume_decay=bool(wave_stage.get("volume_decay", False)),
+            mtf_score=float(mtf_score),
+            frame_scores=mtf_scores,
+            btc_health_score=float(market.get("btc_health_score", 50.0)),
+        )
+        edge_wave_block = (
+            float(wave_stage.get("progress", 0.0)) > EDGE_BLOCK_WAVE_PROGRESS
+            and mode not in ("strong_reclaim", "reversal", "pullback")
+            and not bool(first_leg.get("rebuilt", False))
         )
         if EDGE_SCORE_ENABLED and (
             float(edge["score"]) < EDGE_SCORE_HARD_BLOCK
             or float(edge["rr"]) < EDGE_SCORE_MIN_RR
+            or edge_wave_block
         ):
             log_rejection(symbol, "Edge Score منخفض", {
                 **edge,
                 "required_score": EDGE_SCORE_HARD_BLOCK,
                 "required_rr": EDGE_SCORE_MIN_RR,
+                "wave_block": edge_wave_block,
+                "mode": mode,
             })
             return None
 
@@ -2940,6 +2998,12 @@ def regression_validate_signal(candidate: Dict, market: Dict) -> Tuple[bool, Lis
         blockers.append(f"Edge Score أقل من {EDGE_SCORE_HARD_BLOCK:.0f}")
     if EDGE_SCORE_ENABLED and float(candidate.get("edge_rr", 0.0)) < EDGE_SCORE_MIN_RR:
         blockers.append(f"نسبة العائد/المخاطرة أقل من {EDGE_SCORE_MIN_RR:.2f}")
+    if (
+        float((candidate.get("edge_context") or {}).get("wave_progress", 0.0)) > EDGE_BLOCK_WAVE_PROGRESS
+        and str(candidate.get("mode")) not in ("strong_reclaim", "reversal", "pullback")
+        and not bool((candidate.get("first_leg") or {}).get("rebuilt", False))
+    ):
+        blockers.append("الموجة تجاوزت 80% دون إعادة بناء")
 
     recheck = None
     if REGRESSION_REANALYZE_ENABLED and not blockers:
@@ -3095,7 +3159,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V44 Edge Score Decision Engine + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V45 Final MTF-Aware Edge Engine + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
