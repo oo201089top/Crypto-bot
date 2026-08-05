@@ -1,4 +1,4 @@
-# V45.3 Final Fix: accurate blow-off/volume-decay classification + unified decision engine
+# V45.4 Final UX + Intraday MTF + Decision Intelligence
 # EPIC, HOME, PROM, NEIRO, EUL, UAI, COLLECT, IRYS, MYX, SCRT, ORDI, KAITO,
 # RIF, ESP, ROSE, WLD and HEI examples.
 # Keeps A/A+ only, catches the first leg, rejects late blow-off/re-breakout entries,
@@ -342,7 +342,8 @@ EDGE_ACTIVE_VOLUME_RATIO = float(ENGINE_ENV("SPOT", "EDGE_ACTIVE_VOLUME_RATIO", 
 # تقييم الاتجاه متعدد الفريمات — أوزان وليست شروط منع قاطعة
 MTF_ENABLED = ENGINE_ENV("SPOT", "MTF_ENABLED", "1") == "1"
 MTF_SCORE_IMPACT = float(ENGINE_ENV("SPOT", "MTF_SCORE_IMPACT", "0.20"))
-MTF_WEIGHTS = {"1w": 10, "1d": 20, "4h": 25, "1h": 20, "15m": 20, "5m": 5}
+# V45.4: أوزان إنترادي لأن البوت يولد إشارات شراء Spot على 15m، لا صفقات Swing أسبوعية.
+MTF_WEIGHTS = {"1w": 2, "1d": 8, "4h": 20, "1h": 30, "15m": 30, "5m": 10}
 MTF_NEW_COIN_WEEKLY_BARS = int(ENGINE_ENV("SPOT", "MTF_NEW_COIN_WEEKLY_BARS", "60"))
 MTF_NEW_COIN_DAILY_BARS = int(ENGINE_ENV("SPOT", "MTF_NEW_COIN_DAILY_BARS", "120"))
 HOT_RSI_15M = float(ENGINE_ENV("SPOT", "HOT_RSI_15M", "75"))
@@ -941,6 +942,50 @@ def open_trades_message() -> str:
     return "📌 الصفقات المفتوحة\n" + "\n".join(chunks)
 
 
+def rejection_statistics() -> Dict:
+    """إحصائيات رفض عملية من السجل: اليوم، آخر 50، وأكثر الأسباب تكرارًا."""
+    result = {"today": 0, "last50": 0, "top": []}
+    try:
+        if not REJECTION_LOG_FILE.exists():
+            return result
+        with REJECTION_LOCK:
+            lines = REJECTION_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-5000:]
+        now = time.localtime()
+        today_key = (now.tm_year, now.tm_yday)
+        reasons = {}
+        valid_rows = []
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            valid_rows.append(row)
+            ts = float(row.get("time", 0)) / 1000.0
+            if ts > 0:
+                lt = time.localtime(ts)
+                if (lt.tm_year, lt.tm_yday) == today_key:
+                    result["today"] += 1
+            reason = str(row.get("reason", "غير معروف"))
+            reasons[reason] = reasons.get(reason, 0) + 1
+        result["last50"] = min(50, len(valid_rows))
+        result["top"] = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
+    except Exception as exc:
+        log(f"Rejection statistics error: {exc}")
+    return result
+
+
+def decision_confidence(edge_score: float, mtf_score: float, blocker_count: int, accepted: bool) -> int:
+    """ثقة في القرار نفسه، وليست احتمال ربح الصفقة."""
+    edge_score = max(0.0, min(100.0, float(edge_score)))
+    mtf_score = max(0.0, min(100.0, float(mtf_score)))
+    if accepted:
+        raw = 45.0 + edge_score * 0.35 + mtf_score * 0.20
+    else:
+        distance_from_entry = abs(edge_score - EDGE_SCORE_HARD_BLOCK)
+        raw = 55.0 + min(25.0, distance_from_entry * 0.8) + min(15.0, blocker_count * 3.0)
+    return int(round(max(50.0, min(98.0, raw))))
+
+
 def performance_message() -> str:
     state = load_state()
     stats = state.get("stats", {}) or {}
@@ -948,6 +993,8 @@ def performance_message() -> str:
     tp3 = int(stats.get("tp3", 0)); stop = int(stats.get("stop", 0))
     closed = tp3 + stop
     win_rate = (tp3 / closed * 100.0) if closed else 0.0
+    rejection = rejection_statistics()
+    top_reasons = "\n".join(f"  - {reason}: {count}" for reason, count in rejection.get("top", [])) or "  - لا توجد بيانات كافية"
     return (
         "📊 إحصائيات المتابعة\n"
         f"• وصل TP1: {tp1}\n"
@@ -955,7 +1002,11 @@ def performance_message() -> str:
         f"• وصل TP3: {tp3}\n"
         f"• ضرب الوقف: {stop}\n"
         f"• نسبة اكتمال TP3 مقابل الوقف: {win_rate:.1f}%\n"
-        "ملاحظة: TP1 وTP2 مراحل وليست صفقات مستقلة."
+        f"• الإشارات المرفوضة اليوم: {rejection.get('today', 0)}\n"
+        f"• حجم عينة الرفض الأخيرة: {rejection.get('last50', 0)}\n"
+        "• أكثر أسباب الرفض تكرارًا:\n"
+        f"{top_reasons}\n"
+        "ملاحظة: TP1 وTP2 مراحل وليستا صفقتين مستقلتين."
     )
 
 
@@ -1177,7 +1228,7 @@ def symbol_full_report(symbol: str) -> str:
             if float(mtf["score"]) < 60: blockers.append("التوافق متعدد الفريمات ضعيف")
             if r15 is not None and float(r15) > 72: blockers.append("RSI مرتفع ومطاردة محتملة")
             if max(vr15, live_vr15) < FINAL_GATE_GLOBAL_MIN_VOLUME:
-                blockers.append(f"الحجم دون المطلوب ×{FINAL_GATE_GLOBAL_MIN_VOLUME:.2f}")
+                blockers.append("الحجم لا يؤكد استمرار الاختراق حتى الآن")
             if a15 < FINAL_GATE_GLOBAL_MIN_ADX:
                 blockers.append(f"ADX أقل من {FINAL_GATE_GLOBAL_MIN_ADX:.0f}")
             if wave.get("late") or float(wave.get("progress", 0.0)) > FINAL_GATE_MAX_WAVE_PROGRESS:
@@ -1211,12 +1262,20 @@ def symbol_full_report(symbol: str) -> str:
                     "💡 التقييم: السعر منفصل عن متوسطه. انتظر عودة أقرب إلى EMA20 أو إعادة تجميع واضحة."
                 )
             elif (price > float(e20_15 or price) > float(e50_15 or price)) and float(mtf["score"]) >= 55 and progress > FINAL_GATE_MAX_WAVE_PROGRESS:
-                recommendation = "💡 التقييم: فرصة جيدة للمتابعة، لكنها ليست مناسبة لفتح مركز جديد. انتظر إعادة تجميع أو كسرًا جديدًا بحجم مؤكد."
+                recommendation = "💡 التقييم: فرصة جيدة للمتابعة، لكنها ليست مناسبة لفتح صفقة شراء Spot الآن. انتظر إعادة تجميع أو كسرًا جديدًا بحجم مؤكد."
             elif (price > float(e20_15 or price) > float(e50_15 or price)) and max(vr15, live_vr15) < FINAL_GATE_GLOBAL_MIN_VOLUME:
-                recommendation = "💡 التقييم: الاتجاه مقبول، لكن لا يوجد طلب كافٍ الآن. راقب عودة الحجم قبل التفكير بالدخول."
+                recommendation = "💡 التقييم: الاتجاه مقبول، لكن الحجم لا يؤكد استمرار الاختراق. انتظر إغلاقًا فوق المقاومة بحجم أقوى أو إعادة اختبار ناجحة للدعم."
             else:
-                recommendation = "💡 التقييم: لا توجد أفضلية دخول واضحة حاليًا؛ انتظر تحسن الشروط بدل مطاردة السعر."
+                recommendation = "💡 التقييم: لا توجد أفضلية واضحة لصفقة شراء Spot حاليًا. انتظر تحسن الاتجاه والحجم أو إعادة اختبار فني ناجحة."
             levels = "• المطلوب:\n" + "\n".join(f"  - {x}" for x in blockers[:5]) + "\n\n" + recommendation
+
+        confidence = decision_confidence(
+            float(edge.get("score", 0.0)),
+            float(mtf.get("score", 50.0)),
+            0 if accepted else len(blockers),
+            bool(accepted),
+        )
+        confidence_label = "مرتفعة 🟢" if confidence >= 80 else "متوسطة 🟡" if confidence >= 65 else "محدودة 🔴"
 
         frame_lines = []
         for tf in ("1w", "1d", "4h", "1h", "15m", "5m"):
@@ -1276,6 +1335,7 @@ def symbol_full_report(symbol: str) -> str:
 
 🎯 القرار
 • {decision}
+• ثقة البوت في القرار: {confidence}% — {confidence_label}
 {levels}
 
 ⚠️ تحليل آلي وليس ضمانًا للربح."""
@@ -3215,7 +3275,7 @@ def main() -> None:
     if COMMANDS_ENABLED:
         Thread(target=telegram_command_loop, daemon=True, name="telegram-commands").start()
     try:
-        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V45.3 Final Fix — Accurate Blow-off Classification + Regression Validation.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
+        send_message("✅ تم تشغيل بوت إشارات الشراء للسبوت V45.4 Final — Intraday MTF + Decision Confidence + Smart Rejection Reports.\nالمسار الأول: دخول متوازن وإعادة اختبار.\nالمسار الثاني: زخم قوي لالتقاط الانطلاقات.\nالمسار الثالث: ارتداد ذكي بعد الهبوط.\nالمسار الرابع: تجميع مبكر قبل الانطلاقة.\nالمسار الخامس: Trend Pullback داخل اتجاه صاعد.\nتم تفعيل جودة A+/A فقط مع محرك بنية السعر Trend Ignition V3.\nتم ربط جودة Trend Pullback بحجم 15m لمنع A+ عند ضعف السيولة.\nتم تفعيل صحة BTC متعددة الفريمات ومنع Pullback أثناء ضعف السوق.\nتم تفعيل استثناء القوة الاستثنائية لالتقاط العملات المستقلة عن BTC دون تجاوز Hard Block.\nتم الإبقاء على حماية BTC متعددة الفريمات وجميع مسارات V17.\nتم تفعيل /السوق و /debug و /صفقات و /إحصائيات، ودرجة بيئة السوق واستقلال العملة عن BTC.\nإشارات فقط — بدون تداول تلقائي وبدون شورت وبدون WATCH.")
     except Exception as exc:
         log(f"Startup message failed: {exc}")
     while True:
