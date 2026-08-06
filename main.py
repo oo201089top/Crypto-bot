@@ -13,7 +13,7 @@ AI Spot Trader — Paper Trading V2
 - إشعارات تيليجرام للدخول والتعزيز والبيع.
 - قاعدة بيانات SQLite كاملة.
 - استبعاد العملات الكبيرة.
-- استهداف العملات المدرجة منذ 2025.
+- استهداف العملات المدرجة منذ 2021.
 - قائمة حظر للعملات تحت Monitoring أو Delisting.
 """
 
@@ -51,7 +51,7 @@ FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "1000000"))
 MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "80"))
-MIN_LISTING_YEAR = int(os.getenv("MIN_LISTING_YEAR", "2025"))
+MIN_LISTING_YEAR = int(os.getenv("MIN_LISTING_YEAR", "2021"))
 MIN_ENTRY_SCORE = float(os.getenv("MIN_ENTRY_SCORE", "78"))
 MIN_REBOUND_SCORE = float(os.getenv("MIN_REBOUND_SCORE", "72"))
 AVERAGE_COOLDOWN_MINUTES = int(os.getenv("AVERAGE_COOLDOWN_MINUTES", "45"))
