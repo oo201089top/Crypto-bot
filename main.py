@@ -1188,7 +1188,7 @@ def scan_for_entry(market_score: float) -> None:
                     market_score,
                     0,
                     "REJECT",
-                    "العملة مدرجة قبل 2025",
+                    f"العملة مدرجة قبل {MIN_LISTING_YEAR}",
                     {"min_listing_year": MIN_LISTING_YEAR},
                 )
                 continue
