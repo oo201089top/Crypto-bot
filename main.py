@@ -48,16 +48,23 @@ MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
-MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "1000000"))
-MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "80"))
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
+MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "200"))
 MIN_LISTING_YEAR = int(os.getenv("MIN_LISTING_YEAR", "2021"))
-MIN_ENTRY_SCORE = float(os.getenv("MIN_ENTRY_SCORE", "78"))
-MIN_REBOUND_SCORE = float(os.getenv("MIN_REBOUND_SCORE", "72"))
+MIN_ENTRY_SCORE = float(os.getenv("MIN_ENTRY_SCORE", "72"))
+MIN_REBOUND_SCORE = float(os.getenv("MIN_REBOUND_SCORE", "68"))
 AVERAGE_COOLDOWN_MINUTES = int(os.getenv("AVERAGE_COOLDOWN_MINUTES", "45"))
 COMMAND_POLL_SECONDS = float(os.getenv("COMMAND_POLL_SECONDS", "2"))
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") == "1"
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "paper_trader_telegram_offset.json")
+
+# التعلم الذاتي من نتائج Paper Trading
+LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "1") == "1"
+LEARNING_MIN_TRADES = int(os.getenv("LEARNING_MIN_TRADES", "8"))
+LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "40"))
+LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
+
 
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDS"}
 EXCLUDED_MAJORS = {
@@ -135,6 +142,26 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS learning_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    trade_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    pnl REAL NOT NULL,
+    won INTEGER NOT NULL,
+    market_score REAL NOT NULL,
+    coin_score REAL NOT NULL,
+    rsi_15m REAL NOT NULL,
+    volume_5m REAL NOT NULL,
+    volume_15m REAL NOT NULL,
+    trend_5m REAL NOT NULL,
+    trend_15m REAL NOT NULL,
+    trend_1h REAL NOT NULL,
+    structure_score REAL NOT NULL,
+    extension_atr REAL NOT NULL,
+    payload TEXT NOT NULL
 );
 """
 
@@ -399,6 +426,72 @@ class Database:
                 ),
             )
 
+    def get_first_buy_payload(self, trade_id: int) -> Dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload FROM fills
+                WHERE trade_id=? AND side='BUY'
+                ORDER BY id ASC LIMIT 1
+                """,
+                (trade_id,),
+            ).fetchone()
+            if not row:
+                return {}
+            try:
+                return json.loads(row["payload"])
+            except Exception:
+                return {}
+
+    def add_learning_snapshot(
+        self,
+        trade_id: int,
+        symbol: str,
+        pnl: float,
+        market_score: float,
+        coin_score: float,
+        payload: Dict,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO learning_snapshots(
+                    ts,trade_id,symbol,pnl,won,market_score,coin_score,
+                    rsi_15m,volume_5m,volume_15m,trend_5m,trend_15m,trend_1h,
+                    structure_score,extension_atr,payload
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    utc_now(),
+                    trade_id,
+                    symbol,
+                    pnl,
+                    1 if pnl > 0 else 0,
+                    market_score,
+                    coin_score,
+                    float(payload.get("rsi_15m", 0) or 0),
+                    float(payload.get("volume_5m", 0) or 0),
+                    float(payload.get("volume_15m", 0) or 0),
+                    float(payload.get("trend_5m", 0) or 0),
+                    float(payload.get("trend_15m", 0) or 0),
+                    float(payload.get("trend_1h", 0) or 0),
+                    float(payload.get("structure_score", 0) or 0),
+                    float(payload.get("extension_atr", 0) or 0),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+
+    def recent_learning(self, limit: int):
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM learning_snapshots
+                ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
 
 # =========================
 # Binance Public API
@@ -597,7 +690,7 @@ def analyze_symbol(
 
     entry_ok = bool(
         market_score >= 58
-        and coin_score >= MIN_ENTRY_SCORE
+        and coin_score >= learner.effective_entry_score()
         and rsi_15m < 72
         and extension_atr < 2.0
         and max(volume_5m, volume_15m) >= 1.05
@@ -643,6 +736,8 @@ def analyze_symbol(
     )
 
     payload = {
+        "market_score": round(market_score, 1),
+        "coin_score": round(coin_score, 1),
         "rsi_15m": round(rsi_15m, 2),
         "volume_5m": round(volume_5m, 2),
         "volume_15m": round(volume_15m, 2),
@@ -665,6 +760,65 @@ def analyze_symbol(
         payload=payload,
         candle_time=int(candles_15m[-1]["open_time"]),
     )
+
+
+class AdaptiveLearner:
+    """
+    تعلم محافظ: لا يغير إدارة رأس المال أو عدد الدفعات.
+    فقط يعدل حد تقييم الدخول بعد وجود سجل كافٍ من الصفقات الوهمية.
+    """
+
+    def __init__(self, database: Database):
+        self.db = database
+
+    def effective_entry_score(self) -> float:
+        if not LEARNING_ENABLED:
+            return MIN_ENTRY_SCORE
+
+        rows = self.db.recent_learning(LEARNING_WINDOW)
+        if len(rows) < LEARNING_MIN_TRADES:
+            return MIN_ENTRY_SCORE
+
+        wins = [r for r in rows if int(r["won"]) == 1]
+        losses = [r for r in rows if int(r["won"]) == 0]
+        win_rate = len(wins) / len(rows)
+
+        adjust = 0.0
+
+        # إذا كانت النتائج ضعيفة، يرفع صرامة الدخول.
+        if win_rate < 0.45:
+            adjust += min(LEARNING_MAX_ADJUST, (0.45 - win_rate) * 20)
+
+        # إذا كانت النتائج قوية ومستقرة، يسمح بهامش بسيط فقط.
+        elif win_rate > 0.70 and len(wins) >= LEARNING_MIN_TRADES // 2:
+            adjust -= min(3.0, (win_rate - 0.70) * 10)
+
+        # مقارنة متوسط جودة الصفقات الرابحة والخاسرة.
+        if wins and losses:
+            avg_win_score = mean(float(r["coin_score"]) for r in wins)
+            avg_loss_score = mean(float(r["coin_score"]) for r in losses)
+            if avg_win_score > avg_loss_score + 4:
+                adjust += min(2.0, (avg_win_score - avg_loss_score) / 10)
+
+        return round(max(66.0, min(82.0, MIN_ENTRY_SCORE + adjust)), 1)
+
+    def record_closed_trade(self, position, pnl: float) -> None:
+        if not LEARNING_ENABLED:
+            return
+
+        trade_id = int(position["id"])
+        payload = self.db.get_first_buy_payload(trade_id)
+        if not payload:
+            return
+
+        self.db.add_learning_snapshot(
+            trade_id=trade_id,
+            symbol=str(position["symbol"]),
+            pnl=float(pnl),
+            market_score=float(payload.get("market_score", 0) or 0),
+            coin_score=float(payload.get("coin_score", 0) or 0),
+            payload=payload,
+        )
 
 
 # =========================
@@ -905,7 +1059,7 @@ class TelegramCommands:
                 )
             except Exception as exc:
                 trade_text = f"تعذر قراءة الصفقة: {exc}"
-        return f"🤖 حالة البوت: {state}\n\n{trade_text}"
+        return f"🤖 حالة البوت: {state}\n• حد الدخول المتعلم: {learner.effective_entry_score():.1f}/100\n\n{trade_text}"
 
     def _stats_text(self) -> str:
         row = db.trade_stats()
@@ -1001,6 +1155,7 @@ broker = PaperBroker(db)
 notifier = Notifier(db)
 universe = Universe(api, db)
 commands = TelegramCommands()
+learner = AdaptiveLearner(db)
 
 
 def get_market_score() -> float:
@@ -1127,6 +1282,7 @@ def manage_open_position(market_score: float) -> bool:
             realized,
             "تحقق هدف +10$ الصافي",
         )
+        learner.record_closed_trade(position, realized)
         return True
 
     analysis = get_analysis(symbol, market_score)
@@ -1154,6 +1310,7 @@ def manage_open_position(market_score: float) -> bool:
             realized,
             "خروج إنقاذ عند استعادة رأس المال",
         )
+        learner.record_closed_trade(position, realized)
         return True
 
     # التعزيز فقط بعد ارتداد حقيقي، وعلى شمعة جديدة، وبعد فترة انتظار.
@@ -1231,7 +1388,7 @@ def scan_for_entry(market_score: float) -> None:
 
 
 def run_forever() -> None:
-    print("AI Spot Trader — Paper Trading V2 started", flush=True)
+    print(f"AI Spot Trader — Paper Trading V2 started | learned entry={learner.effective_entry_score():.1f}", flush=True)
     notifier.send_once(
         "STARTUP:V2",
         "🤖 AI Spot Trader V2 بدأ العمل\n\n🧪 Paper Trading فقط — لا توجد أموال حقيقية.",
