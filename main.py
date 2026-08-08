@@ -762,6 +762,27 @@ def analyze_symbol(
     )
 
 
+def entry_rejection_reasons(analysis: Analysis) -> List[str]:
+    reasons: List[str] = []
+    learned_min = learner.effective_entry_score()
+    p = analysis.payload
+
+    if analysis.market_score < 58:
+        reasons.append(f"السوق {analysis.market_score:.1f}<58")
+    if analysis.coin_score < learned_min:
+        reasons.append(f"التقييم {analysis.coin_score:.1f}<{learned_min:.1f}")
+    if float(p.get("rsi_15m", 0)) >= 72:
+        reasons.append(f"RSI {float(p.get('rsi_15m', 0)):.1f} مرتفع")
+    if float(p.get("extension_atr", 0)) >= 2.0:
+        reasons.append(f"بعيدة عن EMA ({float(p.get('extension_atr', 0)):.2f} ATR)")
+    if max(float(p.get("volume_5m", 0)), float(p.get("volume_15m", 0))) < 1.05:
+        reasons.append(
+            f"الحجم ضعيف {max(float(p.get('volume_5m', 0)), float(p.get('volume_15m', 0))):.2f}x"
+        )
+
+    return reasons or ["مؤهلة للدخول"]
+
+
 class AdaptiveLearner:
     """
     تعلم محافظ: لا يغير إدارة رأس المال أو عدد الدفعات.
@@ -1073,6 +1094,68 @@ class TelegramCommands:
             f"• متوسط الصفقة: {row['avg_pnl']:+.2f} USDT"
         )
 
+    def _scan_text(self) -> str:
+        try:
+            market_score = get_market_score()
+            learned_min = learner.effective_entry_score()
+            candidates = universe.candidates()
+            checked = 0
+            rejected_year = 0
+            errors = 0
+            rows = []
+
+            for symbol, quote_volume in candidates:
+                try:
+                    if not universe.listing_year_ok(symbol):
+                        rejected_year += 1
+                        continue
+
+                    analysis = get_analysis(symbol, market_score)
+                    checked += 1
+                    reasons = entry_rejection_reasons(analysis)
+                    rows.append(
+                        (
+                            analysis.coin_score,
+                            symbol,
+                            analysis,
+                            reasons,
+                            quote_volume,
+                        )
+                    )
+                except Exception:
+                    errors += 1
+
+            rows.sort(key=lambda item: item[0], reverse=True)
+            top = rows[:10]
+
+            lines = [
+                "🔎 تشخيص الفحص الحالي",
+                "",
+                f"• تقييم السوق: {market_score:.1f}/100",
+                f"• حد الدخول المتعلم: {learned_min:.1f}/100",
+                f"• مرشحو السيولة: {len(candidates)}",
+                f"• تم تحليلهم: {checked}",
+                f"• مرفوضون بسبب سنة الإدراج: {rejected_year}",
+                f"• أخطاء API/تحليل: {errors}",
+                "",
+                "🏆 أفضل 10 عملات حاليًا:",
+            ]
+
+            if not top:
+                lines.append("لا توجد عملات قابلة للتحليل الآن.")
+            else:
+                for i, (_score, symbol, analysis, reasons, quote_volume) in enumerate(top, 1):
+                    status = "✅ دخول" if analysis.entry_ok else "⏳ انتظار"
+                    reason_text = "، ".join(reasons[:3])
+                    lines.append(
+                        f"{i}) {symbol} — {analysis.coin_score:.1f}/100 — {status}\n"
+                        f"   {reason_text}"
+                    )
+
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"تعذر تنفيذ /scan: {exc}"
+
     def handle(self, text: str) -> None:
         raw = text.strip()
         if not raw:
@@ -1086,6 +1169,7 @@ class TelegramCommands:
                 "/status أو /الحالة\n"
                 "/trade أو /الصفقة\n"
                 "/stats أو /الإحصائيات\n"
+                "/scan أو /فحص\n"
                 "/pause أو /إيقاف\n"
                 "/resume أو /تشغيل\n"
                 "/exclude SYMBOL السبب\n"
@@ -1096,6 +1180,8 @@ class TelegramCommands:
             self._reply(self._status_text())
         elif command in {"/stats", "/الإحصائيات"}:
             self._reply(self._stats_text())
+        elif command in {"/scan", "/فحص"}:
+            self._reply(self._scan_text())
         elif command in {"/pause", "/إيقاف"}:
             db.set_runtime("paused", "1")
             self._reply("⏸️ تم إيقاف فتح الصفقات والتعزيزات مؤقتًا. متابعة الصفقة الحالية مستمرة.")
