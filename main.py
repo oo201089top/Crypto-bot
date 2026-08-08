@@ -65,6 +65,11 @@ LEARNING_MIN_TRADES = int(os.getenv("LEARNING_MIN_TRADES", "8"))
 LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "40"))
 LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
 
+# فلتر السوق المرن
+MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
+EXCEPTIONAL_MARKET_FLOOR = float(os.getenv("EXCEPTIONAL_MARKET_FLOOR", "48"))
+EXCEPTIONAL_COIN_SCORE = float(os.getenv("EXCEPTIONAL_COIN_SCORE", "90"))
+
 
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDS"}
 EXCLUDED_MAJORS = {
@@ -688,8 +693,16 @@ def analyze_symbol(
         + structure_score * 0.15
     )
 
+    market_ok = bool(
+        market_score >= MIN_MARKET_SCORE
+        or (
+            market_score >= EXCEPTIONAL_MARKET_FLOOR
+            and coin_score >= EXCEPTIONAL_COIN_SCORE
+        )
+    )
+
     entry_ok = bool(
-        market_score >= 58
+        market_ok
         and coin_score >= learner.effective_entry_score()
         and rsi_15m < 72
         and extension_atr < 2.0
@@ -737,6 +750,7 @@ def analyze_symbol(
 
     payload = {
         "market_score": round(market_score, 1),
+        "market_ok": market_ok,
         "coin_score": round(coin_score, 1),
         "rsi_15m": round(rsi_15m, 2),
         "volume_5m": round(volume_5m, 2),
@@ -767,8 +781,22 @@ def entry_rejection_reasons(analysis: Analysis) -> List[str]:
     learned_min = learner.effective_entry_score()
     p = analysis.payload
 
-    if analysis.market_score < 58:
-        reasons.append(f"السوق {analysis.market_score:.1f}<58")
+    market_ok = bool(
+        analysis.market_score >= MIN_MARKET_SCORE
+        or (
+            analysis.market_score >= EXCEPTIONAL_MARKET_FLOOR
+            and analysis.coin_score >= EXCEPTIONAL_COIN_SCORE
+        )
+    )
+    if not market_ok:
+        if analysis.coin_score >= EXCEPTIONAL_COIN_SCORE:
+            reasons.append(
+                f"السوق {analysis.market_score:.1f}<{EXCEPTIONAL_MARKET_FLOOR:.0f} حتى للاستثنائية"
+            )
+        else:
+            reasons.append(
+                f"السوق {analysis.market_score:.1f}<{MIN_MARKET_SCORE:.0f}"
+            )
     if analysis.coin_score < learned_min:
         reasons.append(f"التقييم {analysis.coin_score:.1f}<{learned_min:.1f}")
     if float(p.get("rsi_15m", 0)) >= 72:
@@ -1132,6 +1160,8 @@ class TelegramCommands:
                 "🔎 تشخيص الفحص الحالي",
                 "",
                 f"• تقييم السوق: {market_score:.1f}/100",
+                f"• حد السوق الطبيعي: {MIN_MARKET_SCORE:.0f}/100",
+                f"• استثناء القوة: {EXCEPTIONAL_COIN_SCORE:.0f}+ مع سوق {EXCEPTIONAL_MARKET_FLOOR:.0f}+",
                 f"• حد الدخول المتعلم: {learned_min:.1f}/100",
                 f"• مرشحو السيولة: {len(candidates)}",
                 f"• تم تحليلهم: {checked}",
@@ -1474,7 +1504,7 @@ def scan_for_entry(market_score: float) -> None:
 
 
 def run_forever() -> None:
-    print(f"AI Spot Trader — Paper Trading V2 started | learned entry={learner.effective_entry_score():.1f}", flush=True)
+    print(f"AI Spot Trader — Paper Trading V2 started | learned entry={learner.effective_entry_score():.1f} | market={MIN_MARKET_SCORE:.0f} exceptional={EXCEPTIONAL_MARKET_FLOOR:.0f}/{EXCEPTIONAL_COIN_SCORE:.0f}", flush=True)
     notifier.send_once(
         "STARTUP:V2",
         "🤖 AI Spot Trader V2 بدأ العمل\n\n🧪 Paper Trading فقط — لا توجد أموال حقيقية.",
