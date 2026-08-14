@@ -55,6 +55,10 @@ MIN_LISTING_YEAR = int(os.getenv("MIN_LISTING_YEAR", "2021"))
 MIN_ENTRY_SCORE = float(os.getenv("MIN_ENTRY_SCORE", "72"))
 MIN_REBOUND_SCORE = float(os.getenv("MIN_REBOUND_SCORE", "68"))
 AVERAGE_COOLDOWN_MINUTES = int(os.getenv("AVERAGE_COOLDOWN_MINUTES", "45"))
+POST_EXIT_COOLDOWN_MINUTES = int(os.getenv("POST_EXIT_COOLDOWN_MINUTES", "60"))
+MIN_AVERAGE_DROP_PCT = float(os.getenv("MIN_AVERAGE_DROP_PCT", "2.0"))
+MIN_AVERAGE_REBOUND_SCORE = float(os.getenv("MIN_AVERAGE_REBOUND_SCORE", "74"))
+MIN_AVERAGE_COIN_SCORE = float(os.getenv("MIN_AVERAGE_COIN_SCORE", "55"))
 COMMAND_POLL_SECONDS = float(os.getenv("COMMAND_POLL_SECONDS", "2"))
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") == "1"
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "paper_trader_telegram_offset.json")
@@ -69,6 +73,16 @@ LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
 MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
 EXCEPTIONAL_MARKET_FLOOR = float(os.getenv("EXCEPTIONAL_MARKET_FLOOR", "48"))
 EXCEPTIONAL_COIN_SCORE = float(os.getenv("EXCEPTIONAL_COIN_SCORE", "90"))
+
+# حماية Binance وتقليل الضغط على API
+BINANCE_MAX_RETRIES = int(os.getenv("BINANCE_MAX_RETRIES", "5"))
+BINANCE_BACKOFF_BASE = float(os.getenv("BINANCE_BACKOFF_BASE", "1.5"))
+MAX_ANALYZE_PER_CYCLE = int(os.getenv("MAX_ANALYZE_PER_CYCLE", "60"))
+KLINE_CACHE_5M_SECONDS = int(os.getenv("KLINE_CACHE_5M_SECONDS", "45"))
+KLINE_CACHE_15M_SECONDS = int(os.getenv("KLINE_CACHE_15M_SECONDS", "90"))
+KLINE_CACHE_1H_SECONDS = int(os.getenv("KLINE_CACHE_1H_SECONDS", "240"))
+EXCHANGE_INFO_CACHE_SECONDS = int(os.getenv("EXCHANGE_INFO_CACHE_SECONDS", "300"))
+TICKER_24H_CACHE_SECONDS = int(os.getenv("TICKER_24H_CACHE_SECONDS", "30"))
 
 
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDS"}
@@ -505,26 +519,101 @@ class Database:
 class BinancePublic:
     def __init__(self):
         self.session = requests.Session()
+        self._cache: Dict[str, tuple] = {}
+
+    def _cache_get(self, key: str, ttl: int):
+        item = self._cache.get(key)
+        if not item:
+            return None
+        saved_at, value = item
+        if time.time() - saved_at <= ttl:
+            return value
+        self._cache.pop(key, None)
+        return None
+
+    def _cache_set(self, key: str, value):
+        self._cache[key] = (time.time(), value)
+        return value
 
     def get(self, path: str, params: Optional[Dict] = None):
-        response = self.session.get(
-            BINANCE_BASE.rstrip("/") + path,
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()
+        last_error = None
+
+        for attempt in range(BINANCE_MAX_RETRIES):
+            try:
+                response = self.session.get(
+                    BINANCE_BASE.rstrip("/") + path,
+                    params=params,
+                    timeout=20,
+                )
+
+                if response.status_code in {418, 429}:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        wait_seconds = float(retry_after) if retry_after else 0.0
+                    except (TypeError, ValueError):
+                        wait_seconds = 0.0
+
+                    if wait_seconds <= 0:
+                        wait_seconds = BINANCE_BACKOFF_BASE * (2 ** attempt)
+
+                    print(
+                        f"Binance rate limit {response.status_code}; "
+                        f"backoff {wait_seconds:.1f}s",
+                        flush=True,
+                    )
+                    time.sleep(min(wait_seconds, 60))
+                    last_error = RuntimeError(
+                        f"Binance rate limit {response.status_code}"
+                    )
+                    continue
+
+                if 500 <= response.status_code < 600:
+                    wait_seconds = BINANCE_BACKOFF_BASE * (2 ** attempt)
+                    time.sleep(min(wait_seconds, 30))
+                    last_error = RuntimeError(
+                        f"Binance server error {response.status_code}"
+                    )
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= BINANCE_MAX_RETRIES - 1:
+                    break
+                wait_seconds = BINANCE_BACKOFF_BASE * (2 ** attempt)
+                time.sleep(min(wait_seconds, 30))
+
+        raise RuntimeError(f"تعذر الاتصال بـ Binance بعد عدة محاولات: {last_error}")
 
     def exchange_info(self):
-        return self.get("/api/v3/exchangeInfo")
+        key = "exchange_info"
+        cached = self._cache_get(key, EXCHANGE_INFO_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        return self._cache_set(key, self.get("/api/v3/exchangeInfo"))
 
     def tickers_24h(self):
-        return self.get("/api/v3/ticker/24hr")
+        key = "tickers_24h"
+        cached = self._cache_get(key, TICKER_24H_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        return self._cache_set(key, self.get("/api/v3/ticker/24hr"))
 
     def price(self, symbol: str) -> float:
         return float(
             self.get("/api/v3/ticker/price", {"symbol": symbol})["price"]
         )
+
+    def _kline_ttl(self, interval: str) -> int:
+        if interval == "5m":
+            return KLINE_CACHE_5M_SECONDS
+        if interval == "15m":
+            return KLINE_CACHE_15M_SECONDS
+        if interval == "1h":
+            return KLINE_CACHE_1H_SECONDS
+        return 300
 
     def klines(
         self,
@@ -533,6 +622,12 @@ class BinancePublic:
         limit: int = 200,
         start_time: Optional[int] = None,
     ) -> List[Dict]:
+        cache_key = f"k:{symbol}:{interval}:{limit}:{start_time}"
+        ttl = 86400 if start_time == 0 else self._kline_ttl(interval)
+        cached = self._cache_get(cache_key, ttl)
+        if cached is not None:
+            return cached
+
         params: Dict = {
             "symbol": symbol,
             "interval": interval,
@@ -554,7 +649,8 @@ class BinancePublic:
                     "close_time": int(row[6]),
                 }
             )
-        return result
+
+        return self._cache_set(cache_key, result)
 
     def listing_year(self, symbol: str) -> int:
         rows = self.klines(symbol, "1d", limit=1, start_time=0)
@@ -624,13 +720,15 @@ def volume_ratio(candles: List[Dict], lookback: int = 20) -> float:
 
 
 def trend_score(values: List[float], fast: int = 9, slow: int = 21) -> float:
-    if len(values) < slow + 3:
+    # تقييم تدريجي أكثر ثباتًا: اتجاه EMA + زخم قصير، مع تقليل حساسية القفزات اللحظية.
+    if len(values) < slow + 6:
         return 50.0
     fast_ema = ema(values, fast)
     slow_ema = ema(values, slow)
-    distance = (fast_ema / slow_ema - 1) * 100 if slow_ema else 0
-    recent = values[-1] / values[-4] - 1
-    return max(0.0, min(100.0, 50 + distance * 12 + recent * 600))
+    distance_pct = (fast_ema / slow_ema - 1) * 100 if slow_ema else 0.0
+    momentum_pct = (values[-1] / values[-6] - 1) * 100 if values[-6] else 0.0
+    score = 50.0 + distance_pct * 10.0 + momentum_pct * 7.0
+    return max(0.0, min(100.0, score))
 
 
 # =========================
@@ -662,6 +760,7 @@ def analyze_symbol(
     candles_15m: List[Dict],
     candles_1h: List[Dict],
     market_score: float,
+    learned_entry_score: float,
 ) -> Analysis:
     price = candles_15m[-1]["close"]
     closes_5m = [c["close"] for c in candles_5m]
@@ -679,11 +778,21 @@ def analyze_symbol(
     ema20 = ema(closes_15m, 20)
     extension_atr = (price - ema20) / atr_15m if atr_15m > 0 else 0
 
-    structure_score = (
-        100.0
-        if ema(closes_15m, 9) > ema(closes_15m, 21) and price > ema20
-        else 35.0
-    )
+    # بنية تدريجية بدل 100/35 الثنائية؛ تكافئ ترتيب المتوسطات وموقع السعر بدون قفزة حادة.
+    ema9 = ema(closes_15m, 9)
+    ema21 = ema(closes_15m, 21)
+    structure_score = 50.0
+    if ema9 > ema21:
+        structure_score += 25.0
+    else:
+        structure_score -= 15.0
+    if price > ema20:
+        structure_score += 20.0
+    else:
+        structure_score -= 10.0
+    if ema21:
+        structure_score += max(-10.0, min(10.0, (ema9 / ema21 - 1) * 500.0))
+    structure_score = max(0.0, min(100.0, structure_score))
 
     coin_score = (
         trend_5m * 0.15
@@ -703,7 +812,7 @@ def analyze_symbol(
 
     entry_ok = bool(
         market_ok
-        and coin_score >= learner.effective_entry_score()
+        and coin_score >= learned_entry_score
         and rsi_15m < 72
         and extension_atr < 2.0
         and max(volume_5m, volume_15m) >= 1.05
@@ -776,9 +885,8 @@ def analyze_symbol(
     )
 
 
-def entry_rejection_reasons(analysis: Analysis) -> List[str]:
+def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]:
     reasons: List[str] = []
-    learned_min = learner.effective_entry_score()
     p = analysis.payload
 
     market_ok = bool(
@@ -959,6 +1067,7 @@ class PaperBroker:
             payload,
         )
         self.db.close_trade(int(position["id"]), pnl, reason)
+        self.db.set_runtime("last_exit_at", utc_now())
         return pnl
 
 
@@ -1012,6 +1121,7 @@ class Universe:
         self.api = api
         self.db = database
         self.listing_year_cache: Dict[str, int] = {}
+        self.scan_cursor = 0
 
     def candidates(self):
         exchange_info = self.api.exchange_info()
@@ -1045,6 +1155,23 @@ class Universe:
         rows.sort(key=lambda item: item[1], reverse=True)
         return rows[:MAX_SYMBOLS_PER_SCAN]
 
+    def scan_batch(self):
+        candidates = self.candidates()
+        if not candidates:
+            return []
+
+        batch_size = min(MAX_ANALYZE_PER_CYCLE, len(candidates))
+        start = self.scan_cursor % len(candidates)
+        end = start + batch_size
+
+        if end <= len(candidates):
+            batch = candidates[start:end]
+        else:
+            batch = candidates[start:] + candidates[: end - len(candidates)]
+
+        self.scan_cursor = (start + batch_size) % len(candidates)
+        return batch
+
     def listing_year_ok(self, symbol: str) -> bool:
         if symbol not in self.listing_year_cache:
             try:
@@ -1061,7 +1188,19 @@ class Universe:
 # =========================
 
 class TelegramCommands:
-    def __init__(self):
+    def __init__(
+        self,
+        database: Database,
+        api_client: BinancePublic,
+        paper_broker: PaperBroker,
+        universe_obj: Universe,
+        learner_obj: AdaptiveLearner,
+    ):
+        self.db = database
+        self.api = api_client
+        self.broker = paper_broker
+        self.universe = universe_obj
+        self.learner = learner_obj
         self.offset = self._load_offset()
 
     def _load_offset(self) -> int:
@@ -1089,15 +1228,15 @@ class TelegramCommands:
         )
 
     def _status_text(self) -> str:
-        position = broker.position()
+        position = self.broker.position()
         state = "متوقف مؤقتًا ⏸️" if bot_paused() else "يعمل 🟢"
         if not position:
             trade_text = "لا توجد صفقة مفتوحة."
         else:
             try:
-                price = api.price(str(position["symbol"]))
-                pnl = broker.pnl(position, price)
-                target = broker.target_price(position, TARGET_NET_PROFIT)
+                price = self.api.price(str(position["symbol"]))
+                pnl = self.broker.pnl(position, price)
+                target = self.broker.target_price(position, TARGET_NET_PROFIT)
                 trade_text = (
                     f"الصفقة: {position['symbol']}\n"
                     f"الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
@@ -1108,10 +1247,35 @@ class TelegramCommands:
                 )
             except Exception as exc:
                 trade_text = f"تعذر قراءة الصفقة: {exc}"
-        return f"🤖 حالة البوت: {state}\n• حد الدخول المتعلم: {learner.effective_entry_score():.1f}/100\n\n{trade_text}"
+        cooldown = "نعم" if post_exit_cooldown_active() else "لا"
+        return f"🤖 حالة البوت: {state}\n• حد الدخول المتعلم: {self.learner.effective_entry_score():.1f}/100\n• انتظار بعد آخر بيع: {cooldown}\n\n{trade_text}"
 
     def _stats_text(self) -> str:
-        row = db.trade_stats()
+        row = self.db.trade_stats()
+        position = self.broker.position()
+
+        if position:
+            try:
+                current_price = self.api.price(str(position["symbol"]))
+                current_pnl = self.broker.pnl(position, current_price)
+                pnl_label = "الربح الحالي" if current_pnl >= 0 else "الخسارة الحالية"
+                open_text = (
+                    f"\n\n🟢 الصفقات المفتوحة: 1\n"
+                    f"• العملة: {position['symbol']}\n"
+                    f"• الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
+                    f"• المستخدم: {position['total_cost']:.2f} USDT\n"
+                    f"• متوسط الدخول: {position['avg_price']:.8f}\n"
+                    f"• السعر الحالي: {current_price:.8f}\n"
+                    f"• {pnl_label}: {current_pnl:+.2f} USDT"
+                )
+            except Exception as exc:
+                open_text = (
+                    f"\n\n🟢 الصفقات المفتوحة: 1\n"
+                    f"• تعذر قراءة تفاصيل الصفقة: {exc}"
+                )
+        else:
+            open_text = "\n\n⚪ الصفقات المفتوحة: 0"
+
         return (
             "📊 إحصائيات Paper Trading\n\n"
             f"• الصفقات المغلقة: {row['total']}\n"
@@ -1120,13 +1284,14 @@ class TelegramCommands:
             f"• الخاسرة: {row['losses']}\n"
             f"• صافي الربح: {row['net_pnl']:+.2f} USDT\n"
             f"• متوسط الصفقة: {row['avg_pnl']:+.2f} USDT"
+            + open_text
         )
 
     def _scan_text(self) -> str:
         try:
             market_score = get_market_score()
-            learned_min = learner.effective_entry_score()
-            candidates = universe.candidates()
+            learned_min = self.learner.effective_entry_score()
+            candidates = self.universe.candidates()
             checked = 0
             rejected_year = 0
             errors = 0
@@ -1134,13 +1299,13 @@ class TelegramCommands:
 
             for symbol, quote_volume in candidates:
                 try:
-                    if not universe.listing_year_ok(symbol):
+                    if not self.universe.listing_year_ok(symbol):
                         rejected_year += 1
                         continue
 
                     analysis = get_analysis(symbol, market_score)
                     checked += 1
-                    reasons = entry_rejection_reasons(analysis)
+                    reasons = entry_rejection_reasons(analysis, learned_min)
                     rows.append(
                         (
                             analysis.coin_score,
@@ -1193,18 +1358,19 @@ class TelegramCommands:
         parts = raw.split()
         command = parts[0].lower().replace("@", " @").split()[0]
 
-        if command in {"/start", "/help", "/مساعدة"}:
+        if command in {"/help", "/مساعدة"}:
             self._reply(
-                "أوامر البوت:\n"
-                "/status أو /الحالة\n"
-                "/trade أو /الصفقة\n"
-                "/stats أو /الإحصائيات\n"
-                "/scan أو /فحص\n"
-                "/pause أو /إيقاف\n"
-                "/resume أو /تشغيل\n"
-                "/exclude SYMBOL السبب\n"
-                "/include SYMBOL\n"
-                "/excluded"
+                "📋 جميع أوامر البوت\n\n"
+                "▶️ /start أو /resume أو /تشغيل — تشغيل الدخول والتعزيز\n"
+                "⏸️ /stop أو /pause أو /إيقاف — إيقاف الدخول والتعزيز مؤقتًا مع استمرار متابعة الصفقة المفتوحة والخروج الآمن\n"
+                "🤖 /status أو /الحالة — عرض حالة البوت والصفقة الحالية\n"
+                "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
+                "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
+                "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
+                "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
+                "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
+                "📃 /excluded — عرض العملات المستبعدة\n"
+                "❓ /help أو /مساعدة — عرض جميع الأوامر"
             )
         elif command in {"/status", "/الحالة", "/trade", "/الصفقة"}:
             self._reply(self._status_text())
@@ -1212,29 +1378,29 @@ class TelegramCommands:
             self._reply(self._stats_text())
         elif command in {"/scan", "/فحص"}:
             self._reply(self._scan_text())
-        elif command in {"/pause", "/إيقاف"}:
-            db.set_runtime("paused", "1")
-            self._reply("⏸️ تم إيقاف فتح الصفقات والتعزيزات مؤقتًا. متابعة الصفقة الحالية مستمرة.")
-        elif command in {"/resume", "/تشغيل"}:
-            db.set_runtime("paused", "0")
-            self._reply("▶️ تم استئناف البوت.")
+        elif command in {"/start", "/resume", "/تشغيل"}:
+            self.db.set_runtime("paused", "0")
+            self._reply("▶️ تم تشغيل البوت واستئناف الدخول والتعزيز.")
+        elif command in {"/pause", "/stop", "/إيقاف"}:
+            self.db.set_runtime("paused", "1")
+            self._reply("⏸️ تم إيقاف الدخول والتعزيز. متابعة الصفقة المفتوحة والخروج الآمن مستمران.")
         elif command == "/exclude":
             if len(parts) < 2:
                 self._reply("الاستخدام: /exclude ABCUSDT Monitoring")
                 return
             symbol = parts[1].upper()
             reason = " ".join(parts[2:]).strip() or "Monitoring/Delisting"
-            db.set_excluded(symbol, reason, "telegram")
+            self.db.set_excluded(symbol, reason, "telegram")
             self._reply(f"🚫 تم استبعاد {symbol}\nالسبب: {reason}")
         elif command == "/include":
             if len(parts) < 2:
                 self._reply("الاستخدام: /include ABCUSDT")
                 return
             symbol = parts[1].upper()
-            db.remove_excluded(symbol)
+            self.db.remove_excluded(symbol)
             self._reply(f"✅ أزيل {symbol} من قائمة الاستبعاد.")
         elif command == "/excluded":
-            rows = db.list_excluded()
+            rows = self.db.list_excluded()
             if not rows:
                 self._reply("قائمة الاستبعاد فارغة.")
             else:
@@ -1270,8 +1436,8 @@ api = BinancePublic()
 broker = PaperBroker(db)
 notifier = Notifier(db)
 universe = Universe(api, db)
-commands = TelegramCommands()
 learner = AdaptiveLearner(db)
+commands = TelegramCommands(db, api, broker, universe, learner)
 
 
 def get_market_score() -> float:
@@ -1288,6 +1454,7 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         api.klines(symbol, "15m", limit=160),
         api.klines(symbol, "1h", limit=140),
         market_score,
+        learner.effective_entry_score(),
     )
     analysis.payload["candle_time"] = analysis.candle_time
     return analysis
@@ -1297,16 +1464,44 @@ def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
     title = "🟡 تعزيز وهمي" if averaging else "🟢 دخول وهمي"
     target = broker.target_price(position, TARGET_NET_PROFIT)
 
+    fill_price = float(analysis.price)
+    fill_fee = TRANCHE_SIZE * FEE_RATE
+    fill_qty = (TRANCHE_SIZE - fill_fee) / fill_price
+    total_qty = float(position["total_qty"])
+    base_asset = str(position["symbol"]).removesuffix("USDT")
+
+    if averaging:
+        trade_details = (
+            f"• قيمة التعزيز: {TRANCHE_SIZE:.2f} USDT\n"
+            f"• سعر التعزيز: {fill_price:.8f}\n"
+            f"• كمية التعزيز: {fill_qty:.8f} {base_asset}\n"
+            f"• إجمالي الكمية: {total_qty:.8f} {base_asset}\n"
+            f"• عدد الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
+            f"• متوسط الدخول الجديد: {position['avg_price']:.8f}\n"
+            f"• إجمالي المستخدم: {position['total_cost']:.2f} USDT\n"
+            f"• هدف +10$ الصافي: {target:.8f}\n"
+            f"• تقييم السوق: {analysis.market_score:.1f}/100\n"
+            f"• تقييم العملة: {analysis.coin_score:.1f}/100\n"
+            f"• تقييم الارتداد: {float(analysis.payload.get('rebound_score', 0)):.1f}/100\n"
+            f"• السبب: {analysis.reason}"
+        )
+    else:
+        trade_details = (
+            f"• الدفعة: {TRANCHE_SIZE:.2f} USDT\n"
+            f"• سعر الدخول: {fill_price:.8f}\n"
+            f"• كمية العملة: {fill_qty:.8f} {base_asset}\n"
+            f"• إجمالي الكمية: {total_qty:.8f} {base_asset}\n"
+            f"• عدد الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
+            f"• إجمالي المستخدم: {position['total_cost']:.2f} USDT\n"
+            f"• هدف +10$ الصافي: {target:.8f}\n"
+            f"• تقييم السوق: {analysis.market_score:.1f}/100\n"
+            f"• تقييم العملة: {analysis.coin_score:.1f}/100\n"
+            f"• السبب: {analysis.reason}"
+        )
+
     message = f"""{title} — {position['symbol']}
 
-• الدفعة: {TRANCHE_SIZE:.2f} USDT
-• عدد الدفعات: {position['tranches']}/{MAX_TRANCHES}
-• متوسط الدخول: {position['avg_price']:.8f}
-• إجمالي المستخدم: {position['total_cost']:.2f} USDT
-• هدف +10$ الصافي: {target:.8f}
-• تقييم السوق: {analysis.market_score:.1f}/100
-• تقييم العملة: {analysis.coin_score:.1f}/100
-• السبب: {analysis.reason}
+{trade_details}
 
 🧪 Paper Trading — لا توجد أموال حقيقية."""
 
@@ -1316,6 +1511,9 @@ def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
         {
             "trade_id": int(position["id"]),
             "tranches": int(position["tranches"]),
+            "fill_price": fill_price,
+            "fill_qty": fill_qty,
+            "total_qty": total_qty,
         },
     )
 
@@ -1352,9 +1550,32 @@ def bot_paused() -> bool:
     return db.get_runtime("paused", "0") == "1"
 
 
+def post_exit_cooldown_active() -> bool:
+    last_exit_at = db.get_runtime("last_exit_at", "")
+    if not last_exit_at:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last_exit_at)
+        age_minutes = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+        return age_minutes < POST_EXIT_COOLDOWN_MINUTES
+    except ValueError:
+        return False
+
+
 def averaging_allowed(position, analysis: Analysis) -> bool:
     last_candle = int(position["last_buy_candle_time"] or 0)
     if analysis.candle_time and analysis.candle_time == last_candle:
+        return False
+
+    avg_price = float(position["avg_price"] or 0)
+    if avg_price <= 0:
+        return False
+    drop_pct = max(0.0, (avg_price - analysis.price) / avg_price * 100.0)
+    if drop_pct < MIN_AVERAGE_DROP_PCT:
+        return False
+    if analysis.coin_score < MIN_AVERAGE_COIN_SCORE:
+        return False
+    if float(analysis.payload.get("rebound_score", 0) or 0) < MIN_AVERAGE_REBOUND_SCORE:
         return False
 
     last_buy_at = position["last_buy_at"]
@@ -1449,11 +1670,11 @@ def manage_open_position(market_score: float) -> bool:
 
 
 def scan_for_entry(market_score: float) -> None:
-    if bot_paused():
+    if bot_paused() or post_exit_cooldown_active():
         return
     best: Optional[Analysis] = None
 
-    for symbol, _quote_volume in universe.candidates():
+    for symbol, _quote_volume in universe.scan_batch():
         try:
             if not universe.listing_year_ok(symbol):
                 db.add_analysis(
@@ -1501,6 +1722,12 @@ def scan_for_entry(market_score: float) -> None:
             best.payload,
         )
         send_buy_message(position, best, averaging=False)
+    else:
+        print(
+            f"Scan complete: no entry | batch={MAX_ANALYZE_PER_CYCLE} | "
+            f"market={market_score:.1f}",
+            flush=True,
+        )
 
 
 def run_forever() -> None:
