@@ -1,6 +1,6 @@
 
 """
-AI Spot Trader — Paper Trading V2
+AI Spot Trader — Paper Trading V3
 
 مشروع مستقل عن بوت الإشارات:
 - تداول وهمي فقط.
@@ -9,12 +9,12 @@ AI Spot Trader — Paper Trading V2
 - 4 دفعات × 250 USDT.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد.
 - خروج عند +10 USDT صافي بعد الرسوم.
-- بعد التعزيز: خروج إنقاذ عند التعادل الصافي.
+- بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ وإلا Rescue عند صافي موجب بعد الرسوم.
 - إشعارات تيليجرام للدخول والتعزيز والبيع.
 - قاعدة بيانات SQLite كاملة.
 - استبعاد العملات الكبيرة.
 - استهداف العملات المدرجة منذ 2021.
-- قائمة حظر للعملات تحت Monitoring أو Delisting.
+- منع تلقائي للعملات تحت Monitoring أو Delisting مع قائمة حظر يدوية إضافية.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import mean
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Set
 
 import requests
 
@@ -40,13 +40,48 @@ import requests
 BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "paper_trader.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
 
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 TRANCHE_SIZE = float(os.getenv("TRANCHE_SIZE", "250"))
 MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
+STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "V3")
+RESCUE_NET_BUFFER = float(os.getenv("RESCUE_NET_BUFFER", "0.50"))
+
+# دخول مبكر / منع مطاردة العملات بعد الانطلاق
+ENTRY_RSI_MIN = float(os.getenv("ENTRY_RSI_MIN", "46"))
+ENTRY_RSI_MAX = float(os.getenv("ENTRY_RSI_MAX", "63"))
+MAX_ENTRY_EXTENSION_ATR = float(os.getenv("MAX_ENTRY_EXTENSION_ATR", "0.85"))
+MAX_ENTRY_CHANGE_1H_PCT = float(os.getenv("MAX_ENTRY_CHANGE_1H_PCT", "5.0"))
+MAX_ENTRY_CHANGE_15M_PCT = float(os.getenv("MAX_ENTRY_CHANGE_15M_PCT", "2.2"))
+BREAKOUT_NEAR_PCT = float(os.getenv("BREAKOUT_NEAR_PCT", "3.0"))
+BREAKOUT_MAX_ABOVE_PCT = float(os.getenv("BREAKOUT_MAX_ABOVE_PCT", "0.8"))
+MIN_VOLUME_BUILD = float(os.getenv("MIN_VOLUME_BUILD", "1.00"))
+
+# أمان السوق: BTC + BTC Dominance
+BTC_MIN_TREND_SCORE = float(os.getenv("BTC_MIN_TREND_SCORE", "55"))
+BTC_MAX_DOMINANCE = float(os.getenv("BTC_MAX_DOMINANCE", "62.0"))
+BTC_MAX_DOMINANCE_RISE_1H = float(os.getenv("BTC_MAX_DOMINANCE_RISE_1H", "0.30"))
+COINGECKO_GLOBAL_URL = os.getenv("COINGECKO_GLOBAL_URL", "https://api.coingecko.com/api/v3/global")
+MARKET_CONTEXT_CACHE_SECONDS = int(os.getenv("MARKET_CONTEXT_CACHE_SECONDS", "300"))
+
+# التعزيز الذكي ووضع الإنقاذ
+SMART_AVERAGE_MIN_REBOUND = float(os.getenv("SMART_AVERAGE_MIN_REBOUND", "80"))
+SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "60"))
+RESCUE_COIN_SCORE = float(os.getenv("RESCUE_COIN_SCORE", "48"))
+RESCUE_TREND_15M = float(os.getenv("RESCUE_TREND_15M", "43"))
+RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
+
+# حماية Monitoring / Delisting من Binance
+RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
+
+# إنشاء مجلد التخزين الدائم عند الحاجة (Railway Volume: /app/data)
+for _persistent_path in (DATABASE_PATH, TELEGRAM_OFFSET_FILE):
+    _persistent_dir = os.path.dirname(_persistent_path)
+    if _persistent_dir:
+        os.makedirs(_persistent_dir, exist_ok=True)
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
@@ -61,12 +96,12 @@ MIN_AVERAGE_REBOUND_SCORE = float(os.getenv("MIN_AVERAGE_REBOUND_SCORE", "74"))
 MIN_AVERAGE_COIN_SCORE = float(os.getenv("MIN_AVERAGE_COIN_SCORE", "55"))
 COMMAND_POLL_SECONDS = float(os.getenv("COMMAND_POLL_SECONDS", "2"))
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") == "1"
-TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "paper_trader_telegram_offset.json")
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "/app/data/paper_trader_telegram_offset.json")
 
 # التعلم الذاتي من نتائج Paper Trading
 LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "1") == "1"
 LEARNING_MIN_TRADES = int(os.getenv("LEARNING_MIN_TRADES", "8"))
-LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "40"))
+LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "500"))
 LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
 
 # فلتر السوق المرن
@@ -125,7 +160,10 @@ CREATE TABLE IF NOT EXISTS trades (
     max_unrealized_pnl REAL NOT NULL DEFAULT 0,
     min_unrealized_pnl REAL NOT NULL DEFAULT 0,
     last_buy_at TEXT,
-    last_buy_candle_time INTEGER NOT NULL DEFAULT 0
+    last_buy_candle_time INTEGER NOT NULL DEFAULT 0,
+    strategy_version TEXT NOT NULL DEFAULT 'V2',
+    rescue_mode INTEGER NOT NULL DEFAULT 0,
+    rescue_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS fills (
@@ -180,6 +218,32 @@ CREATE TABLE IF NOT EXISTS learning_snapshots (
     trend_1h REAL NOT NULL,
     structure_score REAL NOT NULL,
     extension_atr REAL NOT NULL,
+    strategy_version TEXT NOT NULL DEFAULT 'V2',
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    btc_price REAL NOT NULL,
+    btc_trend_score REAL NOT NULL,
+    btc_change_1h REAL NOT NULL,
+    btc_dominance REAL,
+    btc_dominance_change_1h REAL,
+    market_safe INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trade_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    trade_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    price REAL,
+    pnl REAL,
     payload TEXT NOT NULL
 );
 """
@@ -201,6 +265,15 @@ class Database:
                 conn.execute(
                     "ALTER TABLE trades ADD COLUMN last_buy_candle_time INTEGER NOT NULL DEFAULT 0"
                 )
+            if "strategy_version" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN strategy_version TEXT NOT NULL DEFAULT 'V2'")
+            if "rescue_mode" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN rescue_mode INTEGER NOT NULL DEFAULT 0")
+            if "rescue_reason" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN rescue_reason TEXT")
+            learning_columns = {row["name"] for row in conn.execute("PRAGMA table_info(learning_snapshots)")}
+            if "strategy_version" not in learning_columns:
+                conn.execute("ALTER TABLE learning_snapshots ADD COLUMN strategy_version TEXT NOT NULL DEFAULT 'V2'")
 
     @contextmanager
     def connect(self):
@@ -248,8 +321,8 @@ class Database:
     def create_trade(self, symbol: str) -> int:
         with self.connect() as conn:
             cur = conn.execute(
-                "INSERT INTO trades(symbol,status,opened_at) VALUES(?,'OPEN',?)",
-                (symbol, utc_now()),
+                "INSERT INTO trades(symbol,status,opened_at,strategy_version) VALUES(?,'OPEN',?,?)",
+                (symbol, utc_now(), STRATEGY_VERSION),
             )
             return int(cur.lastrowid)
 
@@ -405,6 +478,67 @@ class Database:
                 (utc_now(), int(candle_time), trade_id),
             )
 
+    def set_rescue_mode(self, trade_id: int, reason: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE trades SET rescue_mode=1,rescue_reason=? WHERE id=?",
+                (reason, trade_id),
+            )
+
+    def add_trade_event(
+        self,
+        trade_id: int,
+        symbol: str,
+        event_type: str,
+        price: Optional[float],
+        pnl: Optional[float],
+        payload: Dict,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_events(ts,trade_id,symbol,strategy_version,event_type,price,pnl,payload)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    utc_now(), trade_id, symbol, STRATEGY_VERSION, event_type,
+                    price, pnl, json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+
+    def add_market_snapshot(self, context: Dict) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO market_snapshots(
+                    ts,strategy_version,btc_price,btc_trend_score,btc_change_1h,
+                    btc_dominance,btc_dominance_change_1h,market_safe,payload
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    utc_now(), STRATEGY_VERSION,
+                    float(context.get("btc_price", 0) or 0),
+                    float(context.get("btc_trend_score", 0) or 0),
+                    float(context.get("btc_change_1h", 0) or 0),
+                    context.get("btc_dominance"),
+                    context.get("btc_dominance_change_1h"),
+                    int(bool(context.get("market_safe"))),
+                    json.dumps(context, ensure_ascii=False),
+                ),
+            )
+
+    def dominance_about_an_hour_ago(self) -> Optional[float]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT btc_dominance FROM market_snapshots
+                WHERE btc_dominance IS NOT NULL
+                  AND julianday(ts) <= julianday('now','-45 minutes')
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            return float(row["btc_dominance"]) if row and row["btc_dominance"] is not None else None
+
     def trade_stats(self):
         with self.connect() as conn:
             return conn.execute(
@@ -424,7 +558,7 @@ class Database:
         with self.connect() as conn:
             return (
                 conn.execute(
-                    "SELECT 1 FROM notifications WHERE event_key=?",
+                    "SELECT 1 FROM notifications WHERE event_key=? AND sent=1",
                     (event_key,),
                 ).fetchone()
                 is not None
@@ -434,8 +568,10 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO notifications(ts,event_key,sent,payload)
+                INSERT INTO notifications(ts,event_key,sent,payload)
                 VALUES (?,?,?,?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    ts=excluded.ts, sent=excluded.sent, payload=excluded.payload
                 """,
                 (
                     utc_now(),
@@ -477,9 +613,9 @@ class Database:
                 INSERT INTO learning_snapshots(
                     ts,trade_id,symbol,pnl,won,market_score,coin_score,
                     rsi_15m,volume_5m,volume_15m,trend_5m,trend_15m,trend_1h,
-                    structure_score,extension_atr,payload
+                    structure_score,extension_atr,strategy_version,payload
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     utc_now(),
@@ -497,12 +633,22 @@ class Database:
                     float(payload.get("trend_1h", 0) or 0),
                     float(payload.get("structure_score", 0) or 0),
                     float(payload.get("extension_atr", 0) or 0),
+                    str(payload.get("strategy_version", STRATEGY_VERSION)),
                     json.dumps(payload, ensure_ascii=False),
                 ),
             )
 
-    def recent_learning(self, limit: int):
+    def recent_learning(self, limit: int, strategy_version: Optional[str] = None):
         with self.connect() as conn:
+            if strategy_version:
+                return conn.execute(
+                    """
+                    SELECT * FROM learning_snapshots
+                    WHERE strategy_version=?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (strategy_version, limit),
+                ).fetchall()
             return conn.execute(
                 """
                 SELECT * FROM learning_snapshots
@@ -586,6 +732,79 @@ class BinancePublic:
                 time.sleep(min(wait_seconds, 30))
 
         raise RuntimeError(f"تعذر الاتصال بـ Binance بعد عدة محاولات: {last_error}")
+
+    def get_absolute(self, url: str, params: Optional[Dict] = None):
+        last_error = None
+        for attempt in range(BINANCE_MAX_RETRIES):
+            try:
+                response = self.session.get(url, params=params, timeout=20)
+                if response.status_code in {418, 429} or 500 <= response.status_code < 600:
+                    wait_seconds = BINANCE_BACKOFF_BASE * (2 ** attempt)
+                    time.sleep(min(wait_seconds, 30))
+                    last_error = RuntimeError(f"HTTP {response.status_code}")
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= BINANCE_MAX_RETRIES - 1:
+                    break
+                time.sleep(min(BINANCE_BACKOFF_BASE * (2 ** attempt), 30))
+        raise RuntimeError(f"تعذر الاتصال بالمصدر الخارجي: {last_error}")
+
+    def spot_asset_tags(self, tag: str = "Monitoring") -> Set[str]:
+        key = f"spot_asset_tags:{tag.lower()}"
+        cached = self._cache_get(key, RISK_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        try:
+            data = self.get("/sapi/v1/spot/asset/tags", {"tag": tag})
+        except Exception as exc:
+            print(f"تعذر تحديث Spot Asset Tags: {exc}", flush=True)
+            return self._cache_set(key, set())
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        assets: Set[str] = set()
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, str):
+                    assets.add(row.upper())
+                elif isinstance(row, dict):
+                    value = row.get("asset") or row.get("symbol") or row.get("coin")
+                    if value:
+                        assets.add(str(value).upper())
+        return self._cache_set(key, assets)
+
+    def delist_symbols(self) -> Set[str]:
+        key = "spot_delist_schedule"
+        cached = self._cache_get(key, RISK_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        try:
+            data = self.get("/sapi/v1/spot/delist-schedule")
+        except Exception as exc:
+            print(f"تعذر تحديث Delist Schedule: {exc}", flush=True)
+            return self._cache_set(key, set())
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        symbols: Set[str] = set()
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                vals = row.get("symbols") or row.get("symbol") or []
+                if isinstance(vals, str):
+                    vals = [vals]
+                for value in vals:
+                    symbols.add(str(value).upper())
+        return self._cache_set(key, symbols)
+
+    def btc_dominance(self) -> float:
+        key = "btc_dominance"
+        cached = self._cache_get(key, MARKET_CONTEXT_CACHE_SECONDS)
+        if cached is not None:
+            return float(cached)
+        data = self.get_absolute(COINGECKO_GLOBAL_URL)
+        value = float(data["data"]["market_cap_percentage"]["btc"])
+        return float(self._cache_set(key, value))
 
     def exchange_info(self):
         key = "exchange_info"
@@ -748,6 +967,24 @@ class Analysis:
     candle_time: int
 
 
+@dataclass
+class MarketContext:
+    score: float
+    btc_price: float
+    btc_trend_score: float
+    btc_change_1h: float
+    btc_dominance: Optional[float]
+    btc_dominance_change_1h: Optional[float]
+    market_safe: bool
+    reason: str
+
+
+def pct_change(new: float, old: float) -> float:
+    if not old:
+        return 0.0
+    return (new / old - 1.0) * 100.0
+
+
 def calculate_market_score(btc_15m: List[Dict], btc_1h: List[Dict]) -> float:
     score_15m = trend_score([c["close"] for c in btc_15m])
     score_1h = trend_score([c["close"] for c in btc_1h])
@@ -773,6 +1010,15 @@ def analyze_symbol(
     trend_5m = trend_score(closes_5m)
     trend_15m = trend_score(closes_15m)
     trend_1h = trend_score(closes_1h)
+
+    change_15m_pct = pct_change(price, closes_15m[-2]) if len(closes_15m) >= 2 else 0.0
+    change_1h_pct = pct_change(closes_5m[-1], closes_5m[-13]) if len(closes_5m) >= 13 else 0.0
+    recent_high = max(c["high"] for c in candles_15m[-21:-1]) if len(candles_15m) >= 22 else price
+    distance_to_breakout_pct = pct_change(recent_high, price)
+    breakout_position_ok = (-BREAKOUT_MAX_ABOVE_PCT <= distance_to_breakout_pct <= BREAKOUT_NEAR_PCT)
+    recent_volumes = [c["volume"] for c in candles_5m[-7:-1]]
+    older_volumes = [c["volume"] for c in candles_5m[-19:-7]]
+    volume_build = (mean(recent_volumes) / mean(older_volumes)) if recent_volumes and older_volumes and mean(older_volumes) > 0 else 0.0
 
     atr_15m = atr(candles_15m)
     ema20 = ema(closes_15m, 20)
@@ -813,9 +1059,13 @@ def analyze_symbol(
     entry_ok = bool(
         market_ok
         and coin_score >= learned_entry_score
-        and rsi_15m < 72
-        and extension_atr < 2.0
-        and max(volume_5m, volume_15m) >= 1.05
+        and ENTRY_RSI_MIN <= rsi_15m <= ENTRY_RSI_MAX
+        and -0.75 <= extension_atr <= MAX_ENTRY_EXTENSION_ATR
+        and change_1h_pct <= MAX_ENTRY_CHANGE_1H_PCT
+        and change_15m_pct <= MAX_ENTRY_CHANGE_15M_PCT
+        and breakout_position_ok
+        and volume_build >= MIN_VOLUME_BUILD
+        and max(volume_5m, volume_15m) >= 1.00
     )
 
     # ارتداد حقيقي:
@@ -870,6 +1120,12 @@ def analyze_symbol(
         "structure_score": round(structure_score, 1),
         "extension_atr": round(extension_atr, 2),
         "rebound_score": round(rebound_score, 1),
+        "change_15m_pct": round(change_15m_pct, 2),
+        "change_1h_pct": round(change_1h_pct, 2),
+        "recent_high": recent_high,
+        "distance_to_breakout_pct": round(distance_to_breakout_pct, 2),
+        "volume_build": round(volume_build, 2),
+        "strategy_version": STRATEGY_VERSION,
     }
 
     return Analysis(
@@ -907,14 +1163,21 @@ def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]
             )
     if analysis.coin_score < learned_min:
         reasons.append(f"التقييم {analysis.coin_score:.1f}<{learned_min:.1f}")
-    if float(p.get("rsi_15m", 0)) >= 72:
-        reasons.append(f"RSI {float(p.get('rsi_15m', 0)):.1f} مرتفع")
-    if float(p.get("extension_atr", 0)) >= 2.0:
-        reasons.append(f"بعيدة عن EMA ({float(p.get('extension_atr', 0)):.2f} ATR)")
-    if max(float(p.get("volume_5m", 0)), float(p.get("volume_15m", 0))) < 1.05:
-        reasons.append(
-            f"الحجم ضعيف {max(float(p.get('volume_5m', 0)), float(p.get('volume_15m', 0))):.2f}x"
-        )
+    rsi_value = float(p.get("rsi_15m", 0))
+    if not (ENTRY_RSI_MIN <= rsi_value <= ENTRY_RSI_MAX):
+        reasons.append(f"RSI {rsi_value:.1f} خارج نطاق الدخول المبكر")
+    ext = float(p.get("extension_atr", 0))
+    if not (-0.75 <= ext <= MAX_ENTRY_EXTENSION_ATR):
+        reasons.append(f"امتداد غير مناسب عن EMA ({ext:.2f} ATR)")
+    if float(p.get("change_1h_pct", 0)) > MAX_ENTRY_CHANGE_1H_PCT:
+        reasons.append(f"ارتفعت {float(p.get('change_1h_pct', 0)):.1f}% خلال ساعة")
+    if float(p.get("change_15m_pct", 0)) > MAX_ENTRY_CHANGE_15M_PCT:
+        reasons.append(f"شمعة 15m ممتدة {float(p.get('change_15m_pct', 0)):.1f}%")
+    dist = float(p.get("distance_to_breakout_pct", 999))
+    if not (-BREAKOUT_MAX_ABOVE_PCT <= dist <= BREAKOUT_NEAR_PCT):
+        reasons.append(f"ليست في منطقة ما قبل الاختراق ({dist:.1f}%)")
+    if float(p.get("volume_build", 0)) < MIN_VOLUME_BUILD:
+        reasons.append(f"تجميع الحجم غير كافٍ {float(p.get('volume_build', 0)):.2f}x")
 
     return reasons or ["مؤهلة للدخول"]
 
@@ -932,7 +1195,7 @@ class AdaptiveLearner:
         if not LEARNING_ENABLED:
             return MIN_ENTRY_SCORE
 
-        rows = self.db.recent_learning(LEARNING_WINDOW)
+        rows = self.db.recent_learning(LEARNING_WINDOW, STRATEGY_VERSION)
         if len(rows) < LEARNING_MIN_TRADES:
             return MIN_ENTRY_SCORE
 
@@ -1030,7 +1293,12 @@ class PaperBroker:
             trade_id,
             int(payload.get("candle_time", payload.get("open_time", 0)) or 0),
         )
-        return self.position()
+        updated = self.position()
+        self.db.add_trade_event(
+            trade_id, symbol, "BUY", price, self.pnl(updated, price) if updated else None,
+            {**payload, "reason": reason, "tranches": int(updated["tranches"]) if updated else 0},
+        )
+        return updated
 
     def pnl(self, position, price: float) -> float:
         gross_value = float(position["total_qty"]) * price
@@ -1067,6 +1335,10 @@ class PaperBroker:
             payload,
         )
         self.db.close_trade(int(position["id"]), pnl, reason)
+        self.db.add_trade_event(
+            int(position["id"]), str(position["symbol"]), "SELL", price, pnl,
+            {**payload, "reason": reason},
+        )
         self.db.set_runtime("last_exit_at", utc_now())
         return pnl
 
@@ -1123,6 +1395,27 @@ class Universe:
         self.listing_year_cache: Dict[str, int] = {}
         self.scan_cursor = 0
 
+    def risk_reason(self, symbol: str) -> Optional[str]:
+        manual = self.db.is_excluded(symbol)
+        if manual:
+            return f"قائمة الحظر: {manual}"
+
+        base = symbol.upper().removesuffix("USDT")
+        try:
+            monitoring = self.api.spot_asset_tags("Monitoring")
+            if base in monitoring or symbol.upper() in monitoring:
+                return "Binance Monitoring Tag"
+        except Exception:
+            pass
+
+        try:
+            delisting = self.api.delist_symbols()
+            if symbol.upper() in delisting or base in delisting:
+                return "Binance Delisting Schedule"
+        except Exception:
+            pass
+        return None
+
     def candidates(self):
         exchange_info = self.api.exchange_info()
 
@@ -1143,7 +1436,7 @@ class Universe:
             if symbol not in tradable:
                 continue
 
-            if self.db.is_excluded(symbol):
+            if self.risk_reason(symbol):
                 continue
 
             quote_volume = float(ticker.get("quoteVolume", 0))
@@ -1243,7 +1536,8 @@ class TelegramCommands:
                     f"المستخدم: {position['total_cost']:.2f} USDT\n"
                     f"المتوسط: {position['avg_price']:.8f}\n"
                     f"الربح الحالي: {pnl:+.2f} USDT\n"
-                    f"هدف +10$: {target:.8f}"
+                    f"هدف +10$: {target:.8f}\n"
+                    f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}"
                 )
             except Exception as exc:
                 trade_text = f"تعذر قراءة الصفقة: {exc}"
@@ -1440,11 +1734,65 @@ learner = AdaptiveLearner(db)
 commands = TelegramCommands(db, api, broker, universe, learner)
 
 
-def get_market_score() -> float:
-    return calculate_market_score(
-        api.klines("BTCUSDT", "15m", limit=120),
-        api.klines("BTCUSDT", "1h", limit=120),
+_market_context_cache: Optional[Tuple[float, MarketContext]] = None
+
+def get_market_context() -> MarketContext:
+    global _market_context_cache
+    if _market_context_cache and time.time() - _market_context_cache[0] <= MARKET_CONTEXT_CACHE_SECONDS:
+        return _market_context_cache[1]
+
+    btc_15m = api.klines("BTCUSDT", "15m", limit=120)
+    btc_1h = api.klines("BTCUSDT", "1h", limit=120)
+    score = calculate_market_score(btc_15m, btc_1h)
+    btc_price = float(btc_15m[-1]["close"])
+    btc_trend = trend_score([c["close"] for c in btc_1h])
+    btc_change_1h = pct_change(btc_15m[-1]["close"], btc_15m[-5]["close"]) if len(btc_15m) >= 5 else 0.0
+
+    dominance: Optional[float] = None
+    dominance_change: Optional[float] = None
+    dominance_error = ""
+    try:
+        dominance = api.btc_dominance()
+        previous = db.dominance_about_an_hour_ago()
+        dominance_change = dominance - previous if previous is not None else 0.0
+    except Exception as exc:
+        dominance_error = str(exc)
+
+    btc_ok = btc_trend >= BTC_MIN_TREND_SCORE and btc_change_1h >= -0.20
+    dominance_ok = (
+        dominance is not None
+        and dominance <= BTC_MAX_DOMINANCE
+        and (dominance_change is None or dominance_change <= BTC_MAX_DOMINANCE_RISE_1H)
     )
+    market_safe = bool(btc_ok and dominance_ok)
+
+    reasons = []
+    if not btc_ok:
+        reasons.append(f"BTC غير آمن: trend={btc_trend:.1f}, 1h={btc_change_1h:+.2f}%")
+    if dominance is None:
+        reasons.append(f"تعذر قراءة BTC.D: {dominance_error}")
+    elif dominance > BTC_MAX_DOMINANCE:
+        reasons.append(f"BTC.D مرتفعة {dominance:.2f}%")
+    elif dominance_change is not None and dominance_change > BTC_MAX_DOMINANCE_RISE_1H:
+        reasons.append(f"BTC.D ترتفع +{dominance_change:.2f} نقطة/ساعة")
+    reason = "السوق آمن نسبيًا للألتكوين" if market_safe else " | ".join(reasons)
+
+    context = MarketContext(
+        score=score, btc_price=btc_price, btc_trend_score=btc_trend,
+        btc_change_1h=btc_change_1h, btc_dominance=dominance,
+        btc_dominance_change_1h=dominance_change, market_safe=market_safe, reason=reason,
+    )
+    db.add_market_snapshot({
+        "btc_price": btc_price, "btc_trend_score": btc_trend, "btc_change_1h": btc_change_1h,
+        "btc_dominance": dominance, "btc_dominance_change_1h": dominance_change,
+        "market_safe": market_safe, "market_score": score, "reason": reason,
+    })
+    _market_context_cache = (time.time(), context)
+    return context
+
+
+def get_market_score() -> float:
+    return get_market_context().score
 
 
 def get_analysis(symbol: str, market_score: float) -> Analysis:
@@ -1457,6 +1805,19 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         learner.effective_entry_score(),
     )
     analysis.payload["candle_time"] = analysis.candle_time
+    market = get_market_context()
+    analysis.payload.update({
+        "market_safe": market.market_safe,
+        "btc_price": market.btc_price,
+        "btc_trend_score": round(market.btc_trend_score, 1),
+        "btc_change_1h": round(market.btc_change_1h, 2),
+        "btc_dominance": market.btc_dominance,
+        "btc_dominance_change_1h": market.btc_dominance_change_1h,
+        "market_reason": market.reason,
+        "strategy_version": STRATEGY_VERSION,
+    })
+    # أمان السوق شرط إلزامي للدخول الأول في V3.
+    analysis.entry_ok = bool(analysis.entry_ok and market.market_safe)
     return analysis
 
 
@@ -1571,11 +1932,20 @@ def averaging_allowed(position, analysis: Analysis) -> bool:
     if avg_price <= 0:
         return False
     drop_pct = max(0.0, (avg_price - analysis.price) / avg_price * 100.0)
-    if drop_pct < MIN_AVERAGE_DROP_PCT:
+    # كل تعزيز لاحق يحتاج خصمًا أعمق من المتوسط الجديد حتى لا تتكدس الدفعات في نفس المنطقة.
+    required_drop = MIN_AVERAGE_DROP_PCT + max(0, int(position["tranches"]) - 1) * 1.25
+    if drop_pct < required_drop:
         return False
-    if analysis.coin_score < MIN_AVERAGE_COIN_SCORE:
+    if analysis.coin_score < max(MIN_AVERAGE_COIN_SCORE, SMART_AVERAGE_MIN_COIN_SCORE):
         return False
-    if float(analysis.payload.get("rebound_score", 0) or 0) < MIN_AVERAGE_REBOUND_SCORE:
+    if float(analysis.payload.get("rebound_score", 0) or 0) < max(MIN_AVERAGE_REBOUND_SCORE, SMART_AVERAGE_MIN_REBOUND):
+        return False
+    if not bool(analysis.payload.get("market_safe", False)):
+        return False
+    # لا نعزز أثناء سقوط قوي على الساعة؛ نريد ارتدادًا حقيقيًا لا سكينًا ساقطًا.
+    if float(analysis.payload.get("trend_1h", 0) or 0) < 45:
+        return False
+    if not (32 <= float(analysis.payload.get("rsi_15m", 50) or 50) <= 64):
         return False
 
     last_buy_at = position["last_buy_at"]
@@ -1591,6 +1961,27 @@ def averaging_allowed(position, analysis: Analysis) -> bool:
             pass
 
     return True
+
+
+def rescue_reason_for(position, analysis: Analysis) -> Optional[str]:
+    reasons = []
+    risk = universe.risk_reason(str(position["symbol"]))
+    if risk:
+        reasons.append(risk)
+    market_safe = bool(analysis.payload.get("market_safe", False))
+    dominance_available = analysis.payload.get("btc_dominance") is not None
+    trend15 = float(analysis.payload.get("trend_15m", 50) or 50)
+    trend1h = float(analysis.payload.get("trend_1h", 50) or 50)
+    weak_coin = analysis.coin_score < RESCUE_COIN_SCORE
+    weak_structure = trend15 < RESCUE_TREND_15M and trend1h < RESCUE_TREND_1H
+    # لا نحول الصفقة إلى إنقاذ بسبب انقطاع مصدر BTC.D فقط. نحتاج ضعفًا فعليًا في العملة/السوق.
+    if dominance_available and not market_safe and analysis.coin_score < 55:
+        reasons.append("السوق لم يعد آمنًا مع ضعف العملة")
+    if weak_coin:
+        reasons.append(f"تقييم العملة هبط إلى {analysis.coin_score:.1f}")
+    if weak_structure:
+        reasons.append("اتجاه 15m و1h ضعيف معًا")
+    return " | ".join(reasons) if reasons else None
 
 
 def manage_open_position(market_score: float) -> bool:
@@ -1633,26 +2024,30 @@ def manage_open_position(market_score: float) -> bool:
         analysis.payload,
     )
 
-    # بعد التعزيز: خروج إنقاذ عند استعادة رأس المال الصافي قبل إضافة دفعة جديدة.
-    if int(position["tranches"]) >= 2 and pnl >= 0:
-        realized = broker.sell_all(
-            position,
-            current_price,
-            "خروج إنقاذ عند استعادة رأس المال",
-            {"pnl": pnl},
+    # لا نخرج عند التعادل لمجرد أن هناك تعزيزًا. نستمر نحو +10$ ما دام السيناريو سليمًا.
+    # إذا ضعفت العملة/السوق أو أصبحت تحت Monitoring/Delisting نثبت وضع الإنقاذ.
+    rescue_reason = rescue_reason_for(position, analysis)
+    if not int(position["rescue_mode"] or 0) and rescue_reason:
+        db.set_rescue_mode(int(position["id"]), rescue_reason)
+        db.add_trade_event(
+            int(position["id"]), symbol, "RESCUE_MODE", current_price, pnl,
+            {"reason": rescue_reason, **analysis.payload},
         )
-        send_sell_message(
-            position,
-            current_price,
-            realized,
-            "خروج إنقاذ عند استعادة رأس المال",
-        )
+        position = broker.position()
+
+    # وضع الإنقاذ: لا بيع بخسارة؛ الخروج فقط بصافي موجب بعد كل الرسوم.
+    if int(position["rescue_mode"] or 0) and pnl >= RESCUE_NET_BUFFER:
+        reason = f"خروج إنقاذ بصافي {RESCUE_NET_BUFFER:.2f}$ بعد الرسوم"
+        realized = broker.sell_all(position, current_price, reason, {"pnl": pnl})
+        send_sell_message(position, current_price, realized, reason)
         learner.record_closed_trade(position, realized)
         return True
 
     # التعزيز فقط بعد ارتداد حقيقي، وعلى شمعة جديدة، وبعد فترة انتظار.
+    # عند دخول وضع الإنقاذ نتوقف عن إضافة رأس مال جديد.
     if (
         int(position["tranches"]) < MAX_TRANCHES
+        and not int(position["rescue_mode"] or 0)
         and analysis.rebound_ok
         and not bot_paused()
         and averaging_allowed(position, analysis)
@@ -1715,10 +2110,20 @@ def scan_for_entry(market_score: float) -> None:
             )
 
     if best:
+        # فحص أخير لحظة التنفيذ: لا Monitoring/Delisting ولا سوق غير آمن.
+        risk = universe.risk_reason(best.symbol)
+        market = get_market_context()
+        if risk:
+            db.add_analysis(best.symbol, market_score, best.coin_score, "BLOCK", risk, best.payload)
+            print(f"Entry blocked {best.symbol}: {risk}", flush=True)
+            return
+        if not market.market_safe:
+            print(f"Entry blocked: market unsafe | {market.reason}", flush=True)
+            return
         position = broker.buy(
             best.symbol,
             best.price,
-            "دخول أول عالي الجودة",
+            "دخول مبكر قبل الانطلاق — V3",
             best.payload,
         )
         send_buy_message(position, best, averaging=False)
@@ -1731,11 +2136,15 @@ def scan_for_entry(market_score: float) -> None:
 
 
 def run_forever() -> None:
-    print(f"AI Spot Trader — Paper Trading V2 started | learned entry={learner.effective_entry_score():.1f} | market={MIN_MARKET_SCORE:.0f} exceptional={EXCEPTIONAL_MARKET_FLOOR:.0f}/{EXCEPTIONAL_COIN_SCORE:.0f}", flush=True)
+    print(
+        f"AI Spot Trader — Paper Trading {STRATEGY_VERSION} started | "
+        f"learned entry={learner.effective_entry_score():.1f}",
+        flush=True,
+    )
     notifier.send_once(
-        "STARTUP:V2",
-        "🤖 AI Spot Trader V2 بدأ العمل\n\n🧪 Paper Trading فقط — لا توجد أموال حقيقية.",
-        {"version": "V2"},
+        f"STARTUP:{STRATEGY_VERSION}",
+        f"🤖 AI Spot Trader {STRATEGY_VERSION} بدأ العمل\n\n🧪 Paper Trading فقط — لا توجد أموال حقيقية.",
+        {"version": STRATEGY_VERSION},
     )
 
     while True:
@@ -1743,7 +2152,8 @@ def run_forever() -> None:
 
         try:
             commands.poll_once()
-            current_market_score = get_market_score()
+            market_context = get_market_context()
+            current_market_score = market_context.score
 
             if not manage_open_position(current_market_score):
                 scan_for_entry(current_market_score)
