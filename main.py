@@ -76,6 +76,9 @@ RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
 
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
+# هذه المسارات غير موثقة حاليًا ضمن Binance Spot API العام وتعيد HTTP 400 بدون اعتماد مناسب.
+# نتركها اختيارية بدل إغراق اللوق بالأخطاء، مع استمرار الحظر اليدوي وفحص حالة TRADING من exchangeInfo.
+BINANCE_RISK_ENDPOINTS_ENABLED = os.getenv("BINANCE_RISK_ENDPOINTS_ENABLED", "0") == "1"
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
@@ -757,11 +760,16 @@ class BinancePublic:
         cached = self._cache_get(key, RISK_CACHE_SECONDS)
         if cached is not None:
             return cached
+
+        if not BINANCE_RISK_ENDPOINTS_ENABLED:
+            return self._cache_set(key, set())
+
         try:
             data = self.get("/sapi/v1/spot/asset/tags", {"tag": tag})
-        except Exception as exc:
-            print(f"تعذر تحديث Spot Asset Tags: {exc}", flush=True)
+        except Exception:
+            # لا نكرر خطأ HTTP 400 في اللوق؛ الحظر اليدوي وفحص exchangeInfo يظلان فعالين.
             return self._cache_set(key, set())
+
         rows = data.get("data", data) if isinstance(data, dict) else data
         assets: Set[str] = set()
         if isinstance(rows, list):
@@ -779,11 +787,16 @@ class BinancePublic:
         cached = self._cache_get(key, RISK_CACHE_SECONDS)
         if cached is not None:
             return cached
+
+        if not BINANCE_RISK_ENDPOINTS_ENABLED:
+            return self._cache_set(key, set())
+
         try:
             data = self.get("/sapi/v1/spot/delist-schedule")
-        except Exception as exc:
-            print(f"تعذر تحديث Delist Schedule: {exc}", flush=True)
+        except Exception:
+            # لا نكرر خطأ HTTP 400 في اللوق؛ العملات غير TRADING تُستبعد أصلًا من exchangeInfo.
             return self._cache_set(key, set())
+
         rows = data.get("data", data) if isinstance(data, dict) else data
         symbols: Set[str] = set()
         if isinstance(rows, list):
