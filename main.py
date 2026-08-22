@@ -77,12 +77,6 @@ RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
 
-# إنشاء مجلد التخزين الدائم عند الحاجة (Railway Volume: /app/data)
-for _persistent_path in (DATABASE_PATH, TELEGRAM_OFFSET_FILE):
-    _persistent_dir = os.path.dirname(_persistent_path)
-    if _persistent_dir:
-        os.makedirs(_persistent_dir, exist_ok=True)
-
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
 MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "200"))
@@ -97,6 +91,12 @@ MIN_AVERAGE_COIN_SCORE = float(os.getenv("MIN_AVERAGE_COIN_SCORE", "55"))
 COMMAND_POLL_SECONDS = float(os.getenv("COMMAND_POLL_SECONDS", "2"))
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") == "1"
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "/app/data/paper_trader_telegram_offset.json")
+
+# إنشاء مجلد التخزين الدائم بعد تعريف جميع المسارات
+for _persistent_path in (DATABASE_PATH, TELEGRAM_OFFSET_FILE):
+    _persistent_dir = os.path.dirname(_persistent_path)
+    if _persistent_dir:
+        os.makedirs(_persistent_dir, exist_ok=True)
 
 # التعلم الذاتي من نتائج Paper Trading
 LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "1") == "1"
