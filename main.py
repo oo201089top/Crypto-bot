@@ -1830,13 +1830,41 @@ class TelegramCommands:
                       f"• دعم الفوليوم للصعود: {'نعم ✅' if v15 >= 1.15 else 'جزئي 🟡' if v15 >= .8 else 'ضعيف ⚠️'}"]
 
             dom = "غير متاح" if market.btc_dominance is None else f"{market.btc_dominance:.2f}%"
+            btc_state = "🟢 صاعد" if market.btc_trend_score >= 58 else "🔴 هابط" if market.btc_trend_score <= 42 else "⚪ حيادي"
             lines += ["", "₿ BTC والسوق",
-                      f"• BTC Trend: {market.btc_trend_score:.1f}/100 | 1H {market.btc_change_1h:+.2f}%",
+                      f"• حالة BTC: {btc_state} — Trend {market.btc_trend_score:.1f}/100 | 1H {market.btc_change_1h:+.2f}%",
                       f"• BTC.D: {dom}",
                       f"• دعم السوق للألتكوين: {'نعم ✅' if market.market_safe else 'لا/حذر ⚠️'}"]
+            if market.btc_dominance is None:
+                lines.append("• ⚪ BTC.D غير متاح — لم يتم احتسابه في حكم مصدر الحركة")
             # Relative strength: coin 1H trend vs BTC trend.
             rel = data["1H"]["trend"] - market.btc_trend_score
-            lines.append(f"• قوة العملة مقابل BTC: {'مستقلة/أقوى' if rel >= 8 else 'مرتبطة بالسوق' if rel > -8 else 'أضعف من BTC'} ({rel:+.1f})")
+            rel_label = "قوة ذاتية أعلى" if rel >= 8 else "مرتبطة بالسوق" if rel > -8 else "أضعف من BTC"
+            lines.append(f"• قوة العملة مقابل BTC: {rel_label} ({rel:+.1f})")
+
+            # مصدر الحركة: يفسر الصعود والهبوط ولا يكتفي برقم BTC.
+            coin_1h = data["1H"]["trend"]
+            if coin_1h >= 58:
+                if market.btc_trend_score >= 58 and rel < 8:
+                    movement_source = "🚀 الصعود مدعوم من BTC والسوق"
+                elif market.btc_trend_score >= 58 and rel >= 8:
+                    movement_source = "🚀🔥 الصعود مدعوم من BTC + قوة ذاتية للعملة"
+                elif rel >= 8:
+                    movement_source = "🔥 الصعود مستقل نسبيًا عن BTC — قوة ذاتية للعملة"
+                else:
+                    movement_source = "🟡 صعود العملة غير مدعوم بوضوح من BTC"
+            elif coin_1h <= 42:
+                if market.btc_trend_score <= 42 and rel <= -8:
+                    movement_source = "🔴 الهبوط مدعوم من ضعف BTC + ضعف ذاتي للعملة"
+                elif market.btc_trend_score <= 42:
+                    movement_source = "🔴 الهبوط مدعوم من ضعف BTC والسوق"
+                elif market.btc_trend_score >= 58:
+                    movement_source = "⚠️ ضعف ذاتي — العملة تهبط رغم دعم BTC"
+                else:
+                    movement_source = "🔻 الهبوط أقرب لضعف ذاتي في العملة"
+            else:
+                movement_source = "⚪ حركة العملة حيادية/غير محسومة بالنسبة لـ BTC"
+            lines += ["", "🧭 مصدر الحركة", f"• {movement_source}"]
 
             lines += ["", "⚔️ Futures"]
             if "funding" in fut: lines.append(f"• Funding: {fut['funding']:+.4f}%")
@@ -1848,12 +1876,38 @@ class TelegramCommands:
 
             nearest_r = resistances[0]["price"] if resistances else None
             nearest_s = supports[0]["price"] if supports else None
+
+            # التشبع: نذكر النوع والفريمات صراحة.
+            overbought = [(fr, data[fr]["rsi"]) for fr in ["5M","15M","1H","4H","1D","1W"] if data[fr]["rsi"] >= 70]
+            oversold = [(fr, data[fr]["rsi"]) for fr in ["5M","15M","1H","4H","1D","1W"] if data[fr]["rsi"] <= 30]
+            lines += ["", "🌡️ التشبع"]
+            if overbought:
+                lines.append("• ⚠️ تشبع شرائي: " + " | ".join(f"{fr} RSI {rv:.1f}" for fr,rv in overbought))
+            elif oversold:
+                lines.append("• 🟢 تشبع بيعي: " + " | ".join(f"{fr} RSI {rv:.1f}" for fr,rv in oversold))
+            else:
+                lines.append("• لا يوجد تشبع شرائي أو بيعي واضح على الفريمات الرئيسية")
+
+            # جودة الدخول الآن منفصلة عن قوة الاتجاه.
+            distance_r_pct = ((nearest_r / price - 1) * 100) if nearest_r and price else None
+            if overbought and any(fr in {"15M","1H","4H"} for fr,_ in overbought):
+                entry_quality = "🔴 ضعيفة — تشبع شرائي/مطاردة محتملة"
+            elif distance_r_pct is not None and 0 <= distance_r_pct <= 0.5 and v15 < 0.8:
+                entry_quality = "🟠 مخاطرة مرتفعة — قرب مقاومة مع فوليوم ضعيف"
+            elif upside >= 70 and v15 >= 1.0:
+                entry_quality = "🟢 جيدة — الاتجاه والحجم يدعمان الحركة"
+            else:
+                entry_quality = "🟡 متوسطة — تحتاج تأكيد إضافي"
+            lines += ["", "🎯 حالة الدخول الآن", f"• {entry_quality}"]
+
             lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
             if upside >= 70: verdict="🟢 الصعود مدعوم"
             elif upside >= 55: verdict="🟡 ميل صاعد لكن يحتاج تأكيد"
             elif downside >= 65: verdict="🔴 خطر الهبوط مرتفع"
             else: verdict="🟡 الحركة غير محسومة"
             lines.append(f"• الحكم: {verdict}")
+            lines.append(f"• مصدر الحركة: {movement_source}")
+            lines.append(f"• جودة الدخول الآن: {entry_quality}")
             if nearest_r: lines.append(f"• اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي يقوي استمرار الصعود.")
             if nearest_s: lines.append(f"• كسر {nearest_s:.8f} بإغلاق وفوليوم بيع قوي يرفع خطر الهبوط.")
             lines.append("• الدرجات احتمالية تحليلية وليست ضمانًا لاتجاه السعر.")
@@ -1877,7 +1931,7 @@ class TelegramCommands:
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
-                "🔬 /SPKUSDT — تحليل شامل لأي عملة USDT من 5M إلى 1W\n"
+                "🔬 /[رمز العملة]USDT — تحليل شامل من 5M إلى 1W (مثال: /SPKUSDT)\n"
                 "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
                 "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
                 "📃 /excluded — عرض العملات المستبعدة\n"
