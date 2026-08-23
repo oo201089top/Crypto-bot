@@ -1779,7 +1779,13 @@ class TelegramCommands:
                 rs = rsi(closes)
                 supports, resistances = self._sr_candidates(candles, price, label)
                 all_s.extend(supports); all_r.extend(resistances)
-                data[label] = {"trend": tr, "rsi": rs, "vol": rv}
+                # نحفظ كذلك القمم/القيعان الفعلية المغلقة حتى لا يضيع مستوى واضح
+                # بسبب تجميع الـ pivots في مستوى متوسط قريب منه.
+                closed_rows = candles[:-1] if len(candles) > 1 else candles
+                recent_window = closed_rows[-120:] if closed_rows else []
+                raw_high = max((float(c["high"]) for c in recent_window), default=price)
+                raw_low = min((float(c["low"]) for c in recent_window), default=price)
+                data[label] = {"trend": tr, "rsi": rs, "vol": rv, "raw_high": raw_high, "raw_low": raw_low}
 
             supports = [x for x in self._merge_levels(all_s, price) if x["price"] < price]
             resistances = [x for x in self._merge_levels(all_r, price) if x["price"] > price]
@@ -1877,6 +1883,19 @@ class TelegramCommands:
             nearest_r = resistances[0]["price"] if resistances else None
             nearest_s = supports[0]["price"] if supports else None
 
+            # نعطي أولوية للقمة/القاع السعري الفعلي إذا كان قريبًا جدًا من المستوى المجمّع.
+            # مثال: High فعلي 0.06997 أفضل للعرض من cluster محسوب 0.06995667.
+            raw_res = [(data[fr]["raw_high"], fr) for fr in data if data[fr]["raw_high"] > price]
+            raw_sup = [(data[fr]["raw_low"], fr) for fr in data if data[fr]["raw_low"] < price]
+            if raw_res:
+                raw_r_price, raw_r_frame = min(raw_res, key=lambda z: z[0])
+                if nearest_r is None or abs(raw_r_price - nearest_r) / price * 100 <= 0.35:
+                    nearest_r = raw_r_price
+            if raw_sup:
+                raw_s_price, raw_s_frame = max(raw_sup, key=lambda z: z[0])
+                if nearest_s is None or abs(raw_s_price - nearest_s) / price * 100 <= 0.35:
+                    nearest_s = raw_s_price
+
             # التشبع: نذكر النوع والفريمات صراحة.
             overbought = [(fr, data[fr]["rsi"]) for fr in ["5M","15M","1H","4H","1D","1W"] if data[fr]["rsi"] >= 70]
             oversold = [(fr, data[fr]["rsi"]) for fr in ["5M","15M","1H","4H","1D","1W"] if data[fr]["rsi"] <= 30]
@@ -1900,6 +1919,44 @@ class TelegramCommands:
                 entry_quality = "🟡 متوسطة — تحتاج تأكيد إضافي"
             lines += ["", "🎯 حالة الدخول الآن", f"• {entry_quality}"]
 
+            # معلومات تنفيذية: المسافة للمستويات + توافق الفريمات + جودة الاختراق.
+            lines += ["", "📐 موقع السعر"]
+            if nearest_r:
+                dist_r = (nearest_r / price - 1) * 100
+                lines.append(f"• المقاومة الأقرب: {nearest_r:.8f} — تبعد {dist_r:.2f}% عن السعر")
+            if nearest_s:
+                dist_s = (price / nearest_s - 1) * 100
+                lines.append(f"• الدعم الأقرب: {nearest_s:.8f} — السعر أعلى منه {dist_s:.2f}%")
+
+            short_labels = [data[x]["trend"] for x in ("5M", "15M")]
+            mid_labels = [data[x]["trend"] for x in ("1H", "4H")]
+            short_avg = mean(short_labels); mid_avg = mean(mid_labels)
+            if mid_avg >= 58 and short_avg < 55:
+                frame_note = "⚠️ الاتجاه الأكبر صاعد لكن الزخم القصير يهدأ"
+            elif mid_avg <= 42 and short_avg > 45:
+                frame_note = "⚠️ الاتجاه الأكبر هابط لكن يوجد ارتداد قصير"
+            elif mid_avg >= 58 and short_avg >= 55:
+                frame_note = "🟢 الفريمات القصيرة والمتوسطة متوافقة على الصعود"
+            elif mid_avg <= 42 and short_avg <= 45:
+                frame_note = "🔴 الفريمات القصيرة والمتوسطة متوافقة على الهبوط"
+            else:
+                frame_note = "🟡 الفريمات متباينة — لا يوجد توافق كامل"
+            lines += ["", "🧩 توافق الفريمات", f"• {frame_note}"]
+
+            if nearest_r:
+                dist_r = (nearest_r / price - 1) * 100
+                if price >= nearest_r and v15 >= 1.15:
+                    breakout_state = "🟢 اختراق مؤكد مبدئيًا — السعر فوق المقاومة والفوليوم داعم"
+                elif price >= nearest_r:
+                    breakout_state = "🟠 اختراق ضعيف — السعر فوق المقاومة لكن الفوليوم لا يؤكد"
+                elif 0 <= dist_r <= 0.50 and v15 >= 1.15:
+                    breakout_state = "🟡 محاولة اختراق — السعر ملاصق للمقاومة والفوليوم يتحسن"
+                elif 0 <= dist_r <= 0.50:
+                    breakout_state = "⚠️ اختبار مقاومة — السعر قريب جدًا لكن الفوليوم ضعيف"
+                else:
+                    breakout_state = "⚪ لا يوجد اختراق حاليًا"
+                lines += ["", "🚧 حالة الاختراق", f"• {breakout_state}"]
+
             lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
             if upside >= 70: verdict="🟢 الصعود مدعوم"
             elif upside >= 55: verdict="🟡 ميل صاعد لكن يحتاج تأكيد"
@@ -1908,7 +1965,11 @@ class TelegramCommands:
             lines.append(f"• الحكم: {verdict}")
             lines.append(f"• مصدر الحركة: {movement_source}")
             lines.append(f"• جودة الدخول الآن: {entry_quality}")
-            if nearest_r: lines.append(f"• اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي يقوي استمرار الصعود.")
+            lines.append(f"• توافق الفريمات: {frame_note}")
+            if nearest_r:
+                lines.append(f"• المقاومة الأقرب {nearest_r:.8f} تبعد {(nearest_r / price - 1) * 100:.2f}% عن السعر.")
+                lines.append(f"• حالة الاختراق: {breakout_state}")
+                lines.append(f"• اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي يقوي استمرار الصعود.")
             if nearest_s: lines.append(f"• كسر {nearest_s:.8f} بإغلاق وفوليوم بيع قوي يرفع خطر الهبوط.")
             lines.append("• الدرجات احتمالية تحليلية وليست ضمانًا لاتجاه السعر.")
             return "\n".join(lines)
