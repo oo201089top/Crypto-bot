@@ -1880,21 +1880,10 @@ class TelegramCommands:
             if not any(k in fut for k in ("funding","oi_change_1h","long_short","taker_ratio")):
                 lines.append("• بيانات العقود غير متاحة لهذه العملة")
 
+            # استخدم نفس المستويات المعروضة في "أقوى الدعوم/المقاومات" في كل أجزاء التقرير.
+            # هذا يمنع ظهور مستوى مختلف في "موقع السعر" أو الخلاصة.
             nearest_r = resistances[0]["price"] if resistances else None
             nearest_s = supports[0]["price"] if supports else None
-
-            # نعطي أولوية للقمة/القاع السعري الفعلي إذا كان قريبًا جدًا من المستوى المجمّع.
-            # مثال: High فعلي 0.06997 أفضل للعرض من cluster محسوب 0.06995667.
-            raw_res = [(data[fr]["raw_high"], fr) for fr in data if data[fr]["raw_high"] > price]
-            raw_sup = [(data[fr]["raw_low"], fr) for fr in data if data[fr]["raw_low"] < price]
-            if raw_res:
-                raw_r_price, raw_r_frame = min(raw_res, key=lambda z: z[0])
-                if nearest_r is None or abs(raw_r_price - nearest_r) / price * 100 <= 0.35:
-                    nearest_r = raw_r_price
-            if raw_sup:
-                raw_s_price, raw_s_frame = max(raw_sup, key=lambda z: z[0])
-                if nearest_s is None or abs(raw_s_price - nearest_s) / price * 100 <= 0.35:
-                    nearest_s = raw_s_price
 
             # التشبع: نذكر النوع والفريمات صراحة.
             overbought = [(fr, data[fr]["rsi"]) for fr in ["5M","15M","1H","4H","1D","1W"] if data[fr]["rsi"] >= 70]
@@ -1958,10 +1947,30 @@ class TelegramCommands:
                 lines += ["", "🚧 حالة الاختراق", f"• {breakout_state}"]
 
             lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
-            if upside >= 70: verdict="🟢 الصعود مدعوم"
-            elif upside >= 55: verdict="🟡 ميل صاعد لكن يحتاج تأكيد"
-            elif downside >= 65: verdict="🔴 خطر الهبوط مرتفع"
-            else: verdict="🟡 الحركة غير محسومة"
+            # الحكم النهائي يعطي وزنًا أكبر للاتجاه الأكبر (4H + 1D + 1W).
+            # لا نسمح لارتداد 5M/15M/1H بمحو اتجاه هابط واضح على الفريمات الكبيرة.
+            if macro_trend <= 42:
+                if downside >= 65:
+                    verdict = "🔴 هابط — خطر الهبوط مرتفع"
+                else:
+                    verdict = "🔴 ميل هابط — الصعود الحالي ضعيف وغير مؤكد"
+            elif macro_trend >= 58:
+                if upside >= 70:
+                    verdict = "🟢 الصعود مدعوم"
+                elif upside >= 55:
+                    verdict = "🟡 ميل صاعد لكن يحتاج تأكيد"
+                else:
+                    verdict = "🟡 الاتجاه الأكبر صاعد لكن الزخم الحالي ضعيف"
+            elif upside >= 70:
+                verdict = "🟢 الصعود مدعوم"
+            elif downside >= 65:
+                verdict = "🔴 خطر الهبوط مرتفع"
+            elif upside >= 55:
+                verdict = "🟡 ميل صاعد لكن يحتاج تأكيد"
+            elif downside > upside and macro_trend < 50:
+                verdict = "🔴 ميل هابط — الصعود الحالي ضعيف وغير مؤكد"
+            else:
+                verdict = "🟡 الحركة غير محسومة"
             lines.append(f"• الحكم: {verdict}")
             lines.append(f"• مصدر الحركة: {movement_source}")
             lines.append(f"• جودة الدخول الآن: {entry_quality}")
