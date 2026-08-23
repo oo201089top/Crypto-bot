@@ -68,6 +68,13 @@ BTC_MAX_DOMINANCE_RISE_1H = float(os.getenv("BTC_MAX_DOMINANCE_RISE_1H", "0.30")
 COINGECKO_GLOBAL_URL = os.getenv("COINGECKO_GLOBAL_URL", "https://api.coingecko.com/api/v3/global")
 MARKET_CONTEXT_CACHE_SECONDS = int(os.getenv("MARKET_CONTEXT_CACHE_SECONDS", "300"))
 
+# Binance Alpha — بيانات سوق عامة فقط، وتداولها هنا Paper Trading مثل بقية البوت
+BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "1") == "1"
+BINANCE_ALPHA_BASE = os.getenv("BINANCE_ALPHA_BASE", "https://www.binance.com")
+BINANCE_ALPHA_CACHE_SECONDS = int(os.getenv("BINANCE_ALPHA_CACHE_SECONDS", "300"))
+BINANCE_ALPHA_MAX_CANDIDATES = int(os.getenv("BINANCE_ALPHA_MAX_CANDIDATES", "60"))
+BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H = float(os.getenv("BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H", "500000"))
+
 # التعزيز الذكي ووضع الإنقاذ
 SMART_AVERAGE_MIN_REBOUND = float(os.getenv("SMART_AVERAGE_MIN_REBOUND", "80"))
 SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "60"))
@@ -760,6 +767,195 @@ class BinancePublic:
                 time.sleep(min(BINANCE_BACKOFF_BASE * (2 ** attempt), 30))
         raise RuntimeError(f"تعذر الاتصال بالمصدر الخارجي: {last_error}")
 
+    # ---------- Binance Alpha public market data ----------
+    def _alpha_get(self, path: str, params: Optional[Dict] = None):
+        return self.get_absolute(BINANCE_ALPHA_BASE.rstrip("/") + path, params)
+
+    def alpha_token_list(self) -> List[Dict]:
+        if not BINANCE_ALPHA_ENABLED:
+            return []
+        key = "alpha_token_list"
+        cached = self._cache_get(key, BINANCE_ALPHA_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        data = self._alpha_get("/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list")
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        if isinstance(rows, dict):
+            rows = rows.get("list") or rows.get("tokens") or rows.get("rows") or []
+        rows = [row for row in rows if isinstance(row, dict)]
+        return self._cache_set(key, rows)
+
+    @staticmethod
+    def _alpha_trade_symbol(alpha_id: object) -> str:
+        value = str(alpha_id or "").upper().strip()
+        if not value:
+            return ""
+        if value.endswith("USDT"):
+            return value
+        if not value.startswith("ALPHA_"):
+            value = f"ALPHA_{value}"
+        return value + "USDT"
+
+    def alpha_resolve(self, symbol: str) -> Optional[Dict]:
+        base = symbol.upper().strip().removesuffix("USDT")
+        if not base:
+            return None
+        for row in self.alpha_token_list():
+            token_symbol = str(row.get("symbol") or row.get("tokenSymbol") or "").upper().strip()
+            token_name = str(row.get("name") or row.get("tokenName") or "").upper().strip()
+            if base not in {token_symbol, token_name}:
+                continue
+            alpha_id = row.get("alphaId") or row.get("alphaID") or row.get("id")
+            trade_symbol = self._alpha_trade_symbol(alpha_id)
+            if not trade_symbol:
+                continue
+            resolved = dict(row)
+            resolved["display_symbol"] = (token_symbol or base) + "USDT"
+            resolved["alpha_trade_symbol"] = trade_symbol
+            return resolved
+        return None
+
+    def is_alpha_symbol(self, symbol: str) -> bool:
+        try:
+            return self.alpha_resolve(symbol) is not None
+        except Exception:
+            return False
+
+    def is_spot_symbol(self, symbol: str) -> bool:
+        symbol = symbol.upper().strip()
+        try:
+            return any(
+                item.get("symbol") == symbol
+                and item.get("status") == "TRADING"
+                and item.get("isSpotTradingAllowed", False)
+                for item in self.exchange_info().get("symbols", [])
+            )
+        except Exception:
+            return False
+
+    def market_kind(self, symbol: str) -> str:
+        if self.is_spot_symbol(symbol):
+            return "SPOT"
+        if self.is_alpha_symbol(symbol):
+            return "ALPHA"
+        return "UNKNOWN"
+
+    def alpha_klines(self, symbol: str, interval: str, limit: int = 200, start_time: Optional[int] = None) -> List[Dict]:
+        resolved = self.alpha_resolve(symbol)
+        if not resolved:
+            raise RuntimeError(f"{symbol} ليست ضمن Binance Alpha")
+        params: Dict = {"symbol": resolved["alpha_trade_symbol"], "interval": interval, "limit": min(int(limit), 1000)}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        payload = self._alpha_get("/bapi/defi/v1/public/alpha-trade/klines", params)
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if isinstance(rows, dict):
+            rows = rows.get("list") or rows.get("rows") or []
+        result: List[Dict] = []
+        for row in rows or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                continue
+            result.append({
+                "open_time": int(row[0]), "open": float(row[1]), "high": float(row[2]),
+                "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]),
+                "close_time": int(row[6]),
+            })
+        if not result:
+            raise RuntimeError(f"لا توجد Klines متاحة لـ {symbol} على Binance Alpha")
+        return result
+
+    def alpha_ticker(self, symbol: str) -> Dict:
+        resolved = self.alpha_resolve(symbol)
+        if not resolved:
+            raise RuntimeError(f"{symbol} ليست ضمن Binance Alpha")
+        key = f"alpha_ticker:{resolved['alpha_trade_symbol']}"
+        cached = self._cache_get(key, TICKER_24H_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        payload = self._alpha_get("/bapi/defi/v1/public/alpha-trade/ticker", {"symbol": resolved["alpha_trade_symbol"]})
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        return self._cache_set(key, data if isinstance(data, dict) else {})
+
+    def market_price(self, symbol: str) -> float:
+        if self.is_spot_symbol(symbol):
+            return self.price(symbol)
+        ticker = self.alpha_ticker(symbol)
+        for key in ("lastPrice", "price", "close", "last"):
+            value = ticker.get(key)
+            if value not in (None, ""):
+                return float(value)
+        return float(self.alpha_klines(symbol, "1m", limit=2)[-1]["close"])
+
+    def market_klines(self, symbol: str, interval: str, limit: int = 200, start_time: Optional[int] = None) -> List[Dict]:
+        if self.is_spot_symbol(symbol):
+            return self.klines(symbol, interval, limit=limit, start_time=start_time)
+        return self.alpha_klines(symbol, interval, limit=limit, start_time=start_time)
+
+    def market_ticker_24h(self, symbol: str) -> Dict:
+        if self.is_spot_symbol(symbol):
+            return next((x for x in self.tickers_24h() if x.get("symbol") == symbol), {})
+        return self.alpha_ticker(symbol)
+
+    def market_listing_year(self, symbol: str) -> int:
+        if self.is_spot_symbol(symbol):
+            return self.listing_year(symbol)
+        resolved = self.alpha_resolve(symbol)
+        if not resolved:
+            return 9999
+        for key in ("listingTime", "onlineTime", "listTime", "startTime", "createdAt"):
+            value = resolved.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+                if number > 10_000_000_000:
+                    number /= 1000.0
+                return datetime.fromtimestamp(number, tz=timezone.utc).year
+            except Exception:
+                pass
+        # Alpha منتج مبكر؛ عند غياب تاريخ موثوق لا نرفضه بفلتر سنة الإدراج.
+        return datetime.now(timezone.utc).year
+
+    def alpha_candidates(self) -> List[Tuple[str, float]]:
+        if not BINANCE_ALPHA_ENABLED:
+            return []
+        key = "alpha_candidates"
+        cached = self._cache_get(key, BINANCE_ALPHA_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+        rows: List[Tuple[str, float]] = []
+        tokens = self.alpha_token_list()
+        # نبدأ بالأحدث إذا كان تاريخ الإدراج متاحًا، وإلا بترتيب Binance نفسه.
+        def _rank(row: Dict) -> float:
+            for k in ("listingTime", "onlineTime", "listTime", "startTime", "createdAt"):
+                try:
+                    return float(row.get(k) or 0)
+                except Exception:
+                    pass
+            return 0.0
+        ordered = sorted(tokens, key=_rank, reverse=True) if tokens else []
+        for token in ordered[:BINANCE_ALPHA_MAX_CANDIDATES]:
+            base = str(token.get("symbol") or token.get("tokenSymbol") or "").upper().strip()
+            if not base or base in STABLE_BASES:
+                continue
+            logical = base + "USDT"
+            try:
+                ticker = self.alpha_ticker(logical)
+                qv = float(ticker.get("quoteVolume") or ticker.get("quote_volume") or 0)
+                if qv <= 0:
+                    vol = float(ticker.get("volume") or 0)
+                    last = float(ticker.get("lastPrice") or ticker.get("price") or 0)
+                    qv = vol * last
+                if qv < BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H:
+                    continue
+                rows.append((logical, qv))
+            except Exception:
+                continue
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return self._cache_set(key, rows)
+
     def spot_asset_tags(self, tag: str = "Monitoring") -> Set[str]:
         key = f"spot_asset_tags:{tag.lower()}"
         cached = self._cache_get(key, RISK_CACHE_SECONDS)
@@ -1402,6 +1598,10 @@ class Universe:
 
         base = symbol.upper().removesuffix("USDT")
 
+        # Alpha-only لا يملك Spot Monitoring Tag؛ قائمة الحظر اليدوية تبقى فعالة.
+        if self.api.market_kind(symbol) == "ALPHA":
+            return None
+
         monitoring = self.api.spot_asset_tags("Monitoring")
         if RISK_CHECK_FAILED_SENTINEL in monitoring:
             if RISK_FAIL_CLOSED:
@@ -1442,8 +1642,25 @@ class Universe:
 
             rows.append((symbol, quote_volume))
 
+        # احتفظ بأفضل Spot أولًا، ثم أضف Alpha كحصة مستقلة حتى لا تختفي عملات Alpha
+        # لمجرد أن أحجام Spot الكبيرة ملأت أول MAX_SYMBOLS_PER_SCAN مركز.
         rows.sort(key=lambda item: item[1], reverse=True)
-        return rows[:MAX_SYMBOLS_PER_SCAN]
+        combined = rows[:MAX_SYMBOLS_PER_SCAN]
+        seen = {symbol for symbol, _ in combined}
+        try:
+            for alpha_symbol, alpha_quote_volume in self.api.alpha_candidates():
+                if alpha_symbol in seen or alpha_symbol in EXCLUDED_MAJORS:
+                    continue
+                if self.risk_reason(alpha_symbol):
+                    continue
+                combined.append((alpha_symbol, alpha_quote_volume))
+                seen.add(alpha_symbol)
+        except Exception as exc:
+            print(f"تعذر تحديث Binance Alpha candidates: {exc}", flush=True)
+
+        # scan_batch يدور على القائمة على دفعات؛ لذلك Alpha ستأخذ دورها في الفحص
+        # حتى لو كان حجمها أقل من أكبر أزواج Spot.
+        return combined
 
     def scan_batch(self):
         candidates = self.candidates()
@@ -1465,7 +1682,7 @@ class Universe:
     def listing_year_ok(self, symbol: str) -> bool:
         if symbol not in self.listing_year_cache:
             try:
-                self.listing_year_cache[symbol] = self.api.listing_year(symbol)
+                self.listing_year_cache[symbol] = self.api.market_listing_year(symbol)
             except Exception:
                 return False
 
@@ -1524,7 +1741,7 @@ class TelegramCommands:
             trade_text = "لا توجد صفقة مفتوحة."
         else:
             try:
-                price = self.api.price(str(position["symbol"]))
+                price = self.api.market_price(str(position["symbol"]))
                 pnl = self.broker.pnl(position, price)
                 target = self.broker.target_price(position, TARGET_NET_PROFIT)
                 trade_text = (
@@ -1547,7 +1764,7 @@ class TelegramCommands:
 
         if position:
             try:
-                current_price = self.api.price(str(position["symbol"]))
+                current_price = self.api.market_price(str(position["symbol"]))
                 current_pnl = self.broker.pnl(position, current_price)
                 pnl_label = "الربح الحالي" if current_pnl >= 0 else "الخسارة الحالية"
                 open_text = (
@@ -1633,8 +1850,9 @@ class TelegramCommands:
                 for i, (_score, symbol, analysis, reasons, quote_volume) in enumerate(top, 1):
                     status = "✅ دخول" if analysis.entry_ok else "⏳ انتظار"
                     reason_text = "، ".join(reasons[:3])
+                    alpha_badge = " 🅰️Alpha" if bool(analysis.payload.get("is_binance_alpha")) else ""
                     lines.append(
-                        f"{i}) {symbol} — {analysis.coin_score:.1f}/100 — {status}\n"
+                        f"{i}) {symbol}{alpha_badge} — {analysis.coin_score:.1f}/100 — {status}\n"
                         f"   {reason_text}"
                     )
 
@@ -1779,18 +1997,18 @@ class TelegramCommands:
         if not symbol.endswith("USDT"):
             symbol += "USDT"
         try:
-            info = self.api.exchange_info()
-            valid = any(x.get("symbol") == symbol and x.get("status") == "TRADING" for x in info.get("symbols", []))
-            if not valid:
-                return f"❌ {symbol} غير موجودة أو غير متاحة للتداول على Binance Spot."
+            market_kind = self.api.market_kind(symbol)
+            is_alpha = self.api.is_alpha_symbol(symbol)
+            if market_kind == "UNKNOWN":
+                return f"❌ {symbol} غير موجودة على Binance Spot ولا ضمن Binance Alpha."
 
             frames = [("5M", "5m", 240), ("15M", "15m", 240), ("1H", "1h", 240),
                       ("4H", "4h", 240), ("1D", "1d", 240), ("1W", "1w", 180)]
             data: Dict[str, Dict] = {}
             all_s, all_r = [], []
-            price = self.api.price(symbol)
+            price = self.api.market_price(symbol)
             for label, interval, limit in frames:
-                candles = self.api.klines(symbol, interval, limit=limit)
+                candles = self.api.market_klines(symbol, interval, limit=limit)
                 closes = [c["close"] for c in candles]
                 tr = trend_score(closes)
                 rv = volume_ratio(candles)
@@ -1810,12 +2028,12 @@ class TelegramCommands:
             supports.sort(key=lambda x: x["price"], reverse=True)
             resistances.sort(key=lambda x: x["price"])
 
-            tick = next((x for x in self.api.tickers_24h() if x.get("symbol") == symbol), {})
+            tick = self.api.market_ticker_24h(symbol)
             quote_vol = float(tick.get("quoteVolume", 0) or 0)
             # حركة غير طبيعية قصيرة: آخر دقيقة مكتملة مقارنة بإغلاق الدقيقة السابقة.
             move_1m = None
             try:
-                one_min = self.api.klines(symbol, "1m", limit=4)
+                one_min = self.api.market_klines(symbol, "1m", limit=4)
                 closed_1m = one_min[:-1] if len(one_min) > 1 else one_min
                 if len(closed_1m) >= 2:
                     move_1m = pct_change(float(closed_1m[-1]["close"]), float(closed_1m[-2]["close"]))
@@ -1840,7 +2058,18 @@ class TelegramCommands:
             overbought = mean([data["15M"]["rsi"], data["1H"]["rsi"], data["4H"]["rsi"]])
             downside = round(max(0.0, min(100.0, (100-short_trend)*.35 + (100-macro_trend)*.25 + max(0, overbought-60)*1.1 + max(0, 1-data["15M"]["vol"])*20)))
 
-            lines = [f"🔬 التحليل الشامل — {symbol}", f"💰 السعر: {price:.8f}", "", "📊 الفريمات"]
+            lines = [f"🔬 التحليل الشامل — {symbol}", f"💰 السعر: {price:.8f}"]
+            lines += ["", "🅰️ Binance Alpha"]
+            if is_alpha:
+                source_text = "Binance Spot (مع وجود العملة أيضًا في Alpha)" if market_kind == "SPOT" else "Binance Alpha"
+                lines.append("• العملة ضمن Binance Alpha: نعم ✅")
+                lines.append(f"• مصدر بيانات هذا التحليل: {source_text}")
+                if market_kind == "ALPHA":
+                    lines.append("• ⚠️ Alpha سوق مبكر وعالي المخاطر؛ البوت يتعامل معه Paper Trading فقط")
+            else:
+                lines.append("• العملة ضمن Binance Alpha: لا")
+                lines.append("• مصدر بيانات هذا التحليل: Binance Spot")
+            lines += ["", "📊 الفريمات"]
             for label, _, _ in frames:
                 d=data[label]
                 lines.append(f"• {label}: {self._trend_label(d['trend'])} | RSI {d['rsi']:.1f} | Volume {self._volume_label(d['vol'])} ({d['vol']:.2f}x)")
@@ -1995,6 +2224,62 @@ class TelegramCommands:
                     breakout_state = "⚪ لا يوجد اختراق حاليًا"
                 lines += ["", "🚧 حالة الاختراق", f"• {breakout_state}"]
 
+            # دعم حاسم: لا نساوي بين دعم 5M ضعيف ومستوى متعدد الفريمات.
+            critical_support = None
+            for level in supports[:8]:
+                if len(level.get("frames", set())) >= 2 or int(level.get("touches", 0)) >= 4:
+                    critical_support = level["price"]
+                    break
+            if critical_support is None and nearest_s:
+                critical_support = nearest_s
+
+            lines += ["", "🛡️ مستويات القرار"]
+            if nearest_s:
+                lines.append(f"• الدعم الأقرب: {nearest_s:.8f}")
+            if critical_support:
+                lines.append(f"• الدعم الحاسم: {critical_support:.8f} — كسره يضعف الهيكل أكثر من كسر دعم لحظي ضعيف")
+            if nearest_r:
+                lines.append(f"• المقاومة الأقرب: {nearest_r:.8f}")
+
+            # ميزان القوة: يحول المؤشرات إلى أسباب مفهومة بدل أرقام منفصلة.
+            bull_factors, bear_factors = [], []
+            if macro_trend >= 58: bull_factors.append("الاتجاه الأكبر صاعد")
+            if short_trend >= 58: bull_factors.append("الزخم القصير صاعد")
+            if data["1D"]["vol"] >= 1.3: bull_factors.append("فوليوم يومي داعم")
+            if float(fut.get("oi_change_1h", 0) or 0) >= 2: bull_factors.append("OI يرتفع")
+            if float(fut.get("taker_ratio", 1) or 1) > 1.05: bull_factors.append("Taker شراء أقوى")
+            if rel >= 8: bull_factors.append("قوة ذاتية أعلى من BTC")
+            if overbought: bear_factors.append("تشبع شرائي")
+            if v15 < 0.8: bear_factors.append("فوليوم لحظي ضعيف")
+            if float(fut.get("taker_ratio", 1) or 1) < 0.95: bear_factors.append("Taker بيع أقوى")
+            if float(fut.get("long_short", 1) or 1) >= 1.6 or float(fut.get("top_positions_ls", 1) or 1) >= 2.0:
+                bear_factors.append("ازدحام Longs")
+            if distance_r_pct is not None and 0 <= distance_r_pct <= 0.75: bear_factors.append("مقاومة قريبة")
+            lines += ["", "⚖️ ميزان القوة"]
+            lines.append("• 🟢 عوامل الصعود: " + (" + ".join(bull_factors[:5]) if bull_factors else "لا توجد عوامل قوية كافية"))
+            lines.append("• 🔴 عوامل الهبوط/التصحيح: " + (" + ".join(bear_factors[:5]) if bear_factors else "لا توجد ضغوط بارزة"))
+            if upside >= downside + 15:
+                balance_note = "الكفة للصعود، لكن جودة الدخول تُحكم منفصلة"
+            elif downside >= upside + 15:
+                balance_note = "الكفة للهبوط/التصحيح"
+            else:
+                balance_note = "الكفتان متقاربتان — يحتاج تأكيد"
+            lines.append(f"• ⚖️ المحصلة: {balance_note}")
+
+            lines += ["", "🎯 سيناريوهات السعر"]
+            if nearest_r:
+                next_r = resistances[1]["price"] if len(resistances) > 1 else None
+                if next_r:
+                    lines.append(f"• 🚀 اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي → يفتح الطريق نحو {next_r:.8f}")
+                else:
+                    lines.append(f"• 🚀 اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي → يدعم استمرار الصعود")
+            if nearest_s:
+                fallback = supports[1]["price"] if len(supports) > 1 else critical_support
+                if fallback and abs(float(fallback) - float(nearest_s)) > 1e-15:
+                    lines.append(f"• ⚠️ فشل الاختراق/فقد {nearest_s:.8f} → مراقبة {fallback:.8f}")
+            if critical_support:
+                lines.append(f"• 🔴 كسر الدعم الحاسم {critical_support:.8f} بفوليوم بيع → ضعف واضح في الهيكل")
+
             lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
             # الحكم النهائي يعطي وزنًا أكبر للاتجاه الأكبر (4H + 1D + 1W).
             # لا نسمح لارتداد 5M/15M/1H بمحو اتجاه هابط واضح على الفريمات الكبيرة.
@@ -2024,6 +2309,10 @@ class TelegramCommands:
             lines.append(f"• مصدر الحركة: {movement_source}")
             lines.append(f"• جودة الدخول الآن: {entry_quality}")
             lines.append(f"• توافق الفريمات: {frame_note}")
+            lines.append(f"• Binance Alpha: {'نعم ✅' if is_alpha else 'لا'}")
+            if critical_support:
+                lines.append(f"• الدعم الحاسم: {critical_support:.8f}")
+            lines.append(f"• ميزان القوة: {balance_note}")
             if nearest_r:
                 lines.append(f"• المقاومة الأقرب {nearest_r:.8f} تبعد {(nearest_r / price - 1) * 100:.2f}% عن السعر.")
                 lines.append(f"• حالة الاختراق: {breakout_state}")
@@ -2050,7 +2339,7 @@ class TelegramCommands:
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
-                "🔬 /[رمز العملة]USDT — تحليل شامل من 5M إلى 1W (مثال: /SPKUSDT)\n"
+                "🔬 /[رمز العملة]USDT — تحليل شامل من 5M إلى 1W + يوضح Binance Alpha (مثال: /SPKUSDT)\n"
                 "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
                 "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
                 "📃 /excluded — عرض العملات المستبعدة\n"
@@ -2190,13 +2479,15 @@ def get_market_score() -> float:
 def get_analysis(symbol: str, market_score: float) -> Analysis:
     analysis = analyze_symbol(
         symbol,
-        api.klines(symbol, "5m", limit=120),
-        api.klines(symbol, "15m", limit=160),
-        api.klines(symbol, "1h", limit=140),
+        api.market_klines(symbol, "5m", limit=120),
+        api.market_klines(symbol, "15m", limit=160),
+        api.market_klines(symbol, "1h", limit=140),
         market_score,
         learner.effective_entry_score(),
     )
     analysis.payload["candle_time"] = analysis.candle_time
+    analysis.payload["market_source"] = api.market_kind(symbol)
+    analysis.payload["is_binance_alpha"] = api.is_alpha_symbol(symbol)
     market = get_market_context()
     analysis.payload.update({
         "market_safe": market.market_safe,
@@ -2252,9 +2543,10 @@ def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
             f"• السبب: {analysis.reason}"
         )
 
+    source_line = "\n🅰️ المصدر: Binance Alpha" if bool(analysis.payload.get("is_binance_alpha")) and analysis.payload.get("market_source") == "ALPHA" else ""
     message = f"""{title} — {position['symbol']}
 
-{trade_details}
+{trade_details}{source_line}
 
 🧪 Paper Trading — لا توجد أموال حقيقية."""
 
@@ -2383,7 +2675,7 @@ def manage_open_position(market_score: float) -> bool:
         return False
 
     symbol = str(position["symbol"])
-    current_price = api.price(symbol)
+    current_price = api.market_price(symbol)
     pnl = broker.pnl(position, current_price)
 
     db.update_excursions(int(position["id"]), pnl)
