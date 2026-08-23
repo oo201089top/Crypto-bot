@@ -84,6 +84,18 @@ DERIVATIVES_MIN_TECH_SCORE = float(os.getenv("DERIVATIVES_MIN_TECH_SCORE", "64")
 DERIVATIVES_SCORE_WEIGHT = float(os.getenv("DERIVATIVES_SCORE_WEIGHT", "0.12"))
 DERIVATIVES_BLOCK_SCORE = float(os.getenv("DERIVATIVES_BLOCK_SCORE", "38"))
 
+# Chase Guard — يمنع شراء الحركة بعد انطلاقها إذا اجتمع الإجهاد الفني مع ضغط مشتقات سلبي.
+# لا يمنع بسبب عامل واحد منفرد حتى لا يقتل الفرص المبكرة الجيدة.
+CHASE_GUARD_ENABLED = os.getenv("CHASE_GUARD_ENABLED", "1") == "1"
+CHASE_RSI_1H = float(os.getenv("CHASE_RSI_1H", "75"))
+CHASE_CHANGE_1H_PCT = float(os.getenv("CHASE_CHANGE_1H_PCT", "3.5"))
+CHASE_NEAR_RESISTANCE_PCT = float(os.getenv("CHASE_NEAR_RESISTANCE_PCT", "0.80"))
+CHASE_WEAK_15M_VOLUME = float(os.getenv("CHASE_WEAK_15M_VOLUME", "1.10"))
+CHASE_DERIV_SCORE_MAX = float(os.getenv("CHASE_DERIV_SCORE_MAX", "45"))
+CHASE_TAKER_MAX = float(os.getenv("CHASE_TAKER_MAX", "0.80"))
+CHASE_LONG_SHORT_MIN = float(os.getenv("CHASE_LONG_SHORT_MIN", "1.60"))
+CHASE_TOP_POSITIONS_MIN = float(os.getenv("CHASE_TOP_POSITIONS_MIN", "2.00"))
+
 # التعزيز الذكي ووضع الإنقاذ
 SMART_AVERAGE_MIN_REBOUND = float(os.getenv("SMART_AVERAGE_MIN_REBOUND", "80"))
 SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "60"))
@@ -1267,6 +1279,7 @@ def analyze_symbol(
     closes_1h = [c["close"] for c in candles_1h]
 
     rsi_15m = rsi(closes_15m)
+    rsi_1h = rsi(closes_1h)
     volume_5m = volume_ratio(candles_5m)
     volume_15m = volume_ratio(candles_15m)
     trend_5m = trend_score(closes_5m)
@@ -1375,6 +1388,7 @@ def analyze_symbol(
         "entry_setup_ok": entry_setup_ok,
         "coin_score": round(coin_score, 1),
         "rsi_15m": round(rsi_15m, 2),
+        "rsi_1h": round(rsi_1h, 2),
         "volume_5m": round(volume_5m, 2),
         "volume_15m": round(volume_15m, 2),
         "trend_5m": round(trend_5m, 1),
@@ -1446,6 +1460,10 @@ def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]
         reasons.append(f"المشتقات تميل {deriv.get('lean','SHORT')} بدرجة {float(deriv.get('derivatives_score',0)):.0f}/100")
     elif deriv.get("derivatives_score") is not None and float(deriv.get("derivatives_score")) < 45:
         reasons.append(f"المشتقات ضعيفة لصفقة Spot ({float(deriv.get('derivatives_score')):.0f}/100)")
+
+    if p.get("chase_guard"):
+        chase = p.get("chase_guard_reasons") or []
+        reasons.append("Chase Guard: " + " + ".join(str(x) for x in chase[:4]))
 
     return reasons or ["مؤهلة للدخول"]
 
@@ -2889,15 +2907,62 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     )
     analysis.payload["derivatives_block"] = derivative_block
 
-    # قرار الدخول النهائي: setup الفني + التقييم بعد المشتقات + أمان السوق + عدم وجود تحذير مشتقات قوي.
+    # Chase Guard مركّب:
+    # يلزم إجهاد فني واضح + ضغط مشتقات سلبي، وليس مجرد RSI مرتفع أو عامل منفرد.
+    p = analysis.payload
+    chase_technical = []
+    chase_derivatives = []
+
+    rsi_1h = float(p.get("rsi_1h", 50) or 50)
+    change_1h = float(p.get("change_1h_pct", 0) or 0)
+    distance_breakout = float(p.get("distance_to_breakout_pct", 999) or 999)
+    volume_15m = float(p.get("volume_15m", 0) or 0)
+
+    if rsi_1h >= CHASE_RSI_1H:
+        chase_technical.append(f"RSI 1H مرتفع {rsi_1h:.1f}")
+    if change_1h >= CHASE_CHANGE_1H_PCT:
+        chase_technical.append(f"ارتفاع سريع 1H +{change_1h:.1f}%")
+    if 0 <= distance_breakout <= CHASE_NEAR_RESISTANCE_PCT:
+        chase_technical.append(f"قرب مقاومة {distance_breakout:.2f}%")
+    if volume_15m < CHASE_WEAK_15M_VOLUME:
+        chase_technical.append(f"فوليوم 15M غير كافٍ {volume_15m:.2f}x")
+
+    if isinstance(deriv, dict) and deriv.get("available", True):
+        ds = deriv.get("derivatives_score")
+        taker = float(deriv.get("taker_ratio", 1) or 1)
+        global_ls = float(deriv.get("long_short", 1) or 1)
+        top_pos = float(deriv.get("top_positions_ls", 1) or 1)
+
+        if ds is not None and float(ds) <= CHASE_DERIV_SCORE_MAX:
+            chase_derivatives.append(f"Derivatives {float(ds):.0f}/100")
+        if taker <= CHASE_TAKER_MAX:
+            chase_derivatives.append(f"Taker Sell قوي {taker:.2f}")
+        if global_ls >= CHASE_LONG_SHORT_MIN or top_pos >= CHASE_TOP_POSITIONS_MIN:
+            chase_derivatives.append("ازدحام Longs")
+
+    chase_guard = bool(
+        CHASE_GUARD_ENABLED
+        and len(chase_technical) >= 2
+        and len(chase_derivatives) >= 1
+        and (len(chase_technical) + len(chase_derivatives)) >= 4
+    )
+    chase_reasons = chase_technical + chase_derivatives
+    analysis.payload["chase_guard"] = chase_guard
+    analysis.payload["chase_guard_reasons"] = chase_reasons
+
+    # قرار الدخول النهائي:
+    # setup الفني + التقييم بعد المشتقات + أمان السوق + لا تحذير مشتقات قوي + لا مطاردة مركبة.
     analysis.entry_ok = bool(
         analysis.payload.get("entry_setup_ok")
         and analysis.coin_score >= learned_min
         and market.market_safe
         and not derivative_block
+        and not chase_guard
     )
     if derivative_block:
         analysis.reason = "انتظار — مشتقات تميل بقوة ضد دخول Spot"
+    elif chase_guard:
+        analysis.reason = "انتظار — Chase Guard: " + " + ".join(chase_reasons[:4])
     elif analysis.entry_ok:
         analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
     return analysis
@@ -3203,12 +3268,22 @@ def scan_for_entry(market_score: float) -> None:
         if not market.market_safe:
             print(f"Entry blocked: market unsafe | {market.reason}", flush=True)
             return
+
+        # إعادة تحقق لحظة التنفيذ من Chase Guard والمشتقات بدل الاعتماد على Snapshot أقدم.
+        fresh = get_analysis(best.symbol, market.score)
+        if not fresh.entry_ok or fresh.payload.get("chase_guard"):
+            reason = fresh.reason or "انتظار — فشل فحص الدخول النهائي"
+            db.add_analysis(fresh.symbol, market.score, fresh.coin_score, "BLOCK", reason, fresh.payload)
+            print(f"Entry blocked {fresh.symbol}: {reason}", flush=True)
+            return
+
         position = broker.buy(
-            best.symbol,
-            best.price,
+            fresh.symbol,
+            fresh.price,
             "دخول مبكر قبل الانطلاق — V3",
-            best.payload,
+            fresh.payload,
         )
+        best = fresh
         send_buy_message(position, best, averaging=False)
     else:
         print(
