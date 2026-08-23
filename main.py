@@ -1754,6 +1754,24 @@ class TelegramCommands:
                 out["taker_ratio"] = float(taker[-1].get("buySellRatio", 0))
         except Exception as exc:
             out["taker_error"] = str(exc)
+        # بيانات مشتقات مساعدة فقط؛ التنفيذ في هذا المشروع Spot/Paper ولا يفتح Futures.
+        try:
+            ft = self.api.get_absolute(base + "/fapi/v1/ticker/24hr", {"symbol": symbol})
+            out["futures_quote_volume_24h"] = float(ft.get("quoteVolume", 0) or 0)
+        except Exception as exc:
+            out["futures_volume_error"] = str(exc)
+        try:
+            top_accounts = self.api.get_absolute(base + "/futures/data/topLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+            if isinstance(top_accounts, list) and top_accounts:
+                out["top_accounts_ls"] = float(top_accounts[-1].get("longShortRatio", 0) or 0)
+        except Exception as exc:
+            out["top_accounts_error"] = str(exc)
+        try:
+            top_positions = self.api.get_absolute(base + "/futures/data/topLongShortPositionRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+            if isinstance(top_positions, list) and top_positions:
+                out["top_positions_ls"] = float(top_positions[-1].get("longShortRatio", 0) or 0)
+        except Exception as exc:
+            out["top_positions_error"] = str(exc)
         return out
 
     def _coin_report(self, symbol: str) -> str:
@@ -1794,6 +1812,15 @@ class TelegramCommands:
 
             tick = next((x for x in self.api.tickers_24h() if x.get("symbol") == symbol), {})
             quote_vol = float(tick.get("quoteVolume", 0) or 0)
+            # حركة غير طبيعية قصيرة: آخر دقيقة مكتملة مقارنة بإغلاق الدقيقة السابقة.
+            move_1m = None
+            try:
+                one_min = self.api.klines(symbol, "1m", limit=4)
+                closed_1m = one_min[:-1] if len(one_min) > 1 else one_min
+                if len(closed_1m) >= 2:
+                    move_1m = pct_change(float(closed_1m[-1]["close"]), float(closed_1m[-2]["close"]))
+            except Exception:
+                move_1m = None
             if quote_vol >= 100_000_000: liquidity = "قوية جدًا"
             elif quote_vol >= 25_000_000: liquidity = "قوية"
             elif quote_vol >= 5_000_000: liquidity = "متوسطة"
@@ -1872,13 +1899,35 @@ class TelegramCommands:
                 movement_source = "⚪ حركة العملة حيادية/غير محسومة بالنسبة لـ BTC"
             lines += ["", "🧭 مصدر الحركة", f"• {movement_source}"]
 
-            lines += ["", "⚔️ Futures"]
+            lines += ["", "⚔️ المشتقات — رادار مساعد لتداول Spot"]
             if "funding" in fut: lines.append(f"• Funding: {fut['funding']:+.4f}%")
             if "oi_change_1h" in fut: lines.append(f"• OI تغير 1H: {fut['oi_change_1h']:+.2f}%")
-            if "long_short" in fut: lines.append(f"• Long/Short: {fut['long_short']:.2f}")
+            if "long_short" in fut: lines.append(f"• Global Long/Short: {fut['long_short']:.2f}")
+            if "top_accounts_ls" in fut: lines.append(f"• Top Accounts L/S: {fut['top_accounts_ls']:.2f}")
+            if "top_positions_ls" in fut: lines.append(f"• Top Positions L/S: {fut['top_positions_ls']:.2f}")
             if "taker_ratio" in fut: lines.append(f"• Taker Buy/Sell: {fut['taker_ratio']:.2f} — {'شراء أقوى' if fut['taker_ratio']>1.05 else 'بيع أقوى' if fut['taker_ratio']<.95 else 'متوازن'}")
-            if not any(k in fut for k in ("funding","oi_change_1h","long_short","taker_ratio")):
+            fv = float(fut.get("futures_quote_volume_24h", 0) or 0)
+            if fv > 0 and quote_vol > 0:
+                fs_ratio = fv / quote_vol
+                driver = "العقود تهيمن ⚠️" if fs_ratio >= 5 else "العقود أعلى" if fs_ratio >= 2 else "متوازن نسبيًا"
+                lines.append(f"• Futures/Spot Volume: {fs_ratio:.1f}x — {driver}")
+            if not any(k in fut for k in ("funding","oi_change_1h","long_short","taker_ratio","top_accounts_ls","top_positions_ls")):
                 lines.append("• بيانات العقود غير متاحة لهذه العملة")
+
+            lines += ["", "🚨 الحركة اللحظية"]
+            if move_1m is None:
+                lines.append("• تغير 1M: غير متاح")
+            elif move_1m >= 3.0:
+                lines.append(f"• 🟢 PUMP ALERT: {move_1m:+.2f}% خلال آخر دقيقة مكتملة")
+            elif move_1m <= -3.0:
+                lines.append(f"• 🔴 DUMP ALERT: {move_1m:+.2f}% خلال آخر دقيقة مكتملة")
+            else:
+                lines.append(f"• لا توجد حركة Pump/Dump استثنائية الآن — 1M {move_1m:+.2f}%")
+
+            lines += ["", "⛓️ On-chain و Token Unlock"]
+            lines.append("• Exchange Inflow/Outflow والمحافظ الكبيرة: غير متاح — يحتاج مصدر On-chain خارجي موثوق")
+            lines.append("• Token Unlock القادم: غير متاح — يحتاج مصدر Unlock خارجي موثوق")
+            lines.append("• ⚪ لم تدخل هذه البيانات في الحكم حتى يتم ربط مصدر حقيقي؛ لا توجد تقديرات أو بيانات وهمية")
 
             # استخدم نفس المستويات المعروضة في "أقوى الدعوم/المقاومات" في كل أجزاء التقرير.
             # هذا يمنع ظهور مستوى مختلف في "موقع السعر" أو الخلاصة.
