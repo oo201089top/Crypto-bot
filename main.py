@@ -1642,6 +1642,225 @@ class TelegramCommands:
         except Exception as exc:
             return f"تعذر تنفيذ /scan: {exc}"
 
+    @staticmethod
+    def _level_strength(touches: int, frames: int) -> str:
+        score = touches + max(0, frames - 1) * 2
+        if score >= 7:
+            return "قوي جدًا"
+        if score >= 4:
+            return "قوي"
+        if score >= 2:
+            return "متوسط"
+        return "ضعيف"
+
+    @staticmethod
+    def _trend_label(score: float) -> str:
+        if score >= 65:
+            return "🟢 صاعد قوي"
+        if score >= 55:
+            return "🟢 صاعد"
+        if score <= 35:
+            return "🔴 هابط قوي"
+        if score <= 45:
+            return "🔴 هابط"
+        return "🟡 حيادي"
+
+    @staticmethod
+    def _volume_label(ratio: float) -> str:
+        if ratio >= 2.0:
+            return "قوي جدًا"
+        if ratio >= 1.35:
+            return "قوي"
+        if ratio >= 0.80:
+            return "متوسط"
+        return "ضعيف"
+
+    def _sr_candidates(self, candles: List[Dict], price: float, frame: str) -> Tuple[List[Dict], List[Dict]]:
+        # Pivot-based support/resistance.  We deliberately ignore the live candle
+        # and cluster nearby pivots so repeated reactions become stronger levels.
+        rows = candles[:-1] if len(candles) > 1 else candles
+        if len(rows) < 7 or price <= 0:
+            return [], []
+        pivots = []
+        for i in range(2, len(rows) - 2):
+            c = rows[i]
+            if c["high"] >= max(rows[j]["high"] for j in range(i - 2, i + 3)):
+                pivots.append((float(c["high"]), "R"))
+            if c["low"] <= min(rows[j]["low"] for j in range(i - 2, i + 3)):
+                pivots.append((float(c["low"]), "S"))
+        # 0.35% minimum clustering band, widened slightly for volatile markets.
+        a = atr(rows[-80:]) if rows else 0.0
+        band = max(price * 0.0035, a * 0.35)
+        clusters: List[Dict] = []
+        for level, kind in sorted(pivots, key=lambda x: x[0]):
+            found = None
+            for cl in clusters:
+                if cl["kind"] == kind and abs(level - cl["price"]) <= band:
+                    found = cl
+                    break
+            if found:
+                n = found["touches"]
+                found["price"] = (found["price"] * n + level) / (n + 1)
+                found["touches"] += 1
+            else:
+                clusters.append({"price": level, "kind": kind, "touches": 1, "frames": {frame}})
+        supports = [x for x in clusters if x["price"] < price]
+        resistances = [x for x in clusters if x["price"] > price]
+        supports.sort(key=lambda x: x["price"], reverse=True)
+        resistances.sort(key=lambda x: x["price"])
+        return supports[:3], resistances[:3]
+
+    def _merge_levels(self, levels: List[Dict], price: float) -> List[Dict]:
+        merged: List[Dict] = []
+        band = max(price * 0.0045, 1e-12)
+        for item in sorted(levels, key=lambda x: x["price"]):
+            hit = next((x for x in merged if abs(x["price"] - item["price"]) <= band), None)
+            if hit:
+                total = hit["touches"] + item["touches"]
+                hit["price"] = (hit["price"] * hit["touches"] + item["price"] * item["touches"]) / total
+                hit["touches"] = total
+                hit["frames"].update(item["frames"])
+            else:
+                merged.append({"price": item["price"], "touches": item["touches"], "frames": set(item["frames"])})
+        return merged
+
+    def _futures_snapshot(self, symbol: str) -> Dict:
+        base = "https://fapi.binance.com"
+        out: Dict = {}
+        try:
+            premium = self.api.get_absolute(base + "/fapi/v1/premiumIndex", {"symbol": symbol})
+            out["funding"] = float(premium.get("lastFundingRate", 0)) * 100
+        except Exception as exc:
+            out["funding_error"] = str(exc)
+        try:
+            oi = self.api.get_absolute(base + "/fapi/v1/openInterest", {"symbol": symbol})
+            out["oi"] = float(oi.get("openInterest", 0))
+            hist = self.api.get_absolute(base + "/futures/data/openInterestHist", {"symbol": symbol, "period": "5m", "limit": 13})
+            if isinstance(hist, list) and len(hist) >= 2:
+                old = float(hist[0].get("sumOpenInterestValue", 0) or 0)
+                new = float(hist[-1].get("sumOpenInterestValue", 0) or 0)
+                out["oi_change_1h"] = pct_change(new, old) if old else 0.0
+        except Exception as exc:
+            out["oi_error"] = str(exc)
+        try:
+            ls = self.api.get_absolute(base + "/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+            if isinstance(ls, list) and ls:
+                out["long_short"] = float(ls[-1].get("longShortRatio", 0))
+        except Exception as exc:
+            out["ls_error"] = str(exc)
+        try:
+            taker = self.api.get_absolute(base + "/futures/data/takerlongshortRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+            if isinstance(taker, list) and taker:
+                out["taker_ratio"] = float(taker[-1].get("buySellRatio", 0))
+        except Exception as exc:
+            out["taker_error"] = str(exc)
+        return out
+
+    def _coin_report(self, symbol: str) -> str:
+        symbol = symbol.upper().strip()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        try:
+            info = self.api.exchange_info()
+            valid = any(x.get("symbol") == symbol and x.get("status") == "TRADING" for x in info.get("symbols", []))
+            if not valid:
+                return f"❌ {symbol} غير موجودة أو غير متاحة للتداول على Binance Spot."
+
+            frames = [("5M", "5m", 240), ("15M", "15m", 240), ("1H", "1h", 240),
+                      ("4H", "4h", 240), ("1D", "1d", 240), ("1W", "1w", 180)]
+            data: Dict[str, Dict] = {}
+            all_s, all_r = [], []
+            price = self.api.price(symbol)
+            for label, interval, limit in frames:
+                candles = self.api.klines(symbol, interval, limit=limit)
+                closes = [c["close"] for c in candles]
+                tr = trend_score(closes)
+                rv = volume_ratio(candles)
+                rs = rsi(closes)
+                supports, resistances = self._sr_candidates(candles, price, label)
+                all_s.extend(supports); all_r.extend(resistances)
+                data[label] = {"trend": tr, "rsi": rs, "vol": rv}
+
+            supports = [x for x in self._merge_levels(all_s, price) if x["price"] < price]
+            resistances = [x for x in self._merge_levels(all_r, price) if x["price"] > price]
+            supports.sort(key=lambda x: x["price"], reverse=True)
+            resistances.sort(key=lambda x: x["price"])
+
+            tick = next((x for x in self.api.tickers_24h() if x.get("symbol") == symbol), {})
+            quote_vol = float(tick.get("quoteVolume", 0) or 0)
+            if quote_vol >= 100_000_000: liquidity = "قوية جدًا"
+            elif quote_vol >= 25_000_000: liquidity = "قوية"
+            elif quote_vol >= 5_000_000: liquidity = "متوسطة"
+            else: liquidity = "ضعيفة"
+
+            market = get_market_context()
+            fut = self._futures_snapshot(symbol)
+            short_trend = mean([data["5M"]["trend"], data["15M"]["trend"], data["1H"]["trend"]])
+            macro_trend = mean([data["4H"]["trend"], data["1D"]["trend"], data["1W"]["trend"]])
+            vol_support = mean([min(100.0, data[x]["vol"] * 50.0) for x in ("5M", "15M", "1H")])
+            btc_support = max(0.0, min(100.0, market.btc_trend_score))
+            deriv = 50.0
+            deriv += max(-15, min(15, float(fut.get("oi_change_1h", 0)) * 2.0))
+            deriv += max(-10, min(10, (float(fut.get("taker_ratio", 1)) - 1) * 25.0))
+            deriv = max(0.0, min(100.0, deriv))
+            upside = round(max(0.0, min(100.0, short_trend * .30 + macro_trend * .25 + vol_support * .20 + btc_support * .15 + deriv * .10)))
+            overbought = mean([data["15M"]["rsi"], data["1H"]["rsi"], data["4H"]["rsi"]])
+            downside = round(max(0.0, min(100.0, (100-short_trend)*.35 + (100-macro_trend)*.25 + max(0, overbought-60)*1.1 + max(0, 1-data["15M"]["vol"])*20)))
+
+            lines = [f"🔬 التحليل الشامل — {symbol}", f"💰 السعر: {price:.8f}", "", "📊 الفريمات"]
+            for label, _, _ in frames:
+                d=data[label]
+                lines.append(f"• {label}: {self._trend_label(d['trend'])} | RSI {d['rsi']:.1f} | Volume {self._volume_label(d['vol'])} ({d['vol']:.2f}x)")
+
+            lines += ["", "🛡️ أقوى الدعوم"]
+            for x in supports[:3]:
+                fr=" + ".join(sorted(x["frames"], key=lambda z:["5M","15M","1H","4H","1D","1W"].index(z)))
+                lines.append(f"• {x['price']:.8f} — {self._level_strength(x['touches'], len(x['frames']))} — {fr}")
+            if not supports: lines.append("• لا يوجد دعم موثوق قريب ضمن البيانات المتاحة")
+            lines += ["", "🧱 أقوى المقاومات"]
+            for x in resistances[:3]:
+                fr=" + ".join(sorted(x["frames"], key=lambda z:["5M","15M","1H","4H","1D","1W"].index(z)))
+                lines.append(f"• {x['price']:.8f} — {self._level_strength(x['touches'], len(x['frames']))} — {fr}")
+            if not resistances: lines.append("• لا توجد مقاومة موثوقة قريبة ضمن البيانات المتاحة")
+
+            v15=data["15M"]["vol"]
+            lines += ["", "💧 السيولة والفوليوم",
+                      f"• سيولة 24h: {liquidity} — {quote_vol/1_000_000:.2f}M USDT",
+                      f"• الفوليوم اللحظي 15M: {self._volume_label(v15)} ({v15:.2f}x)",
+                      f"• دعم الفوليوم للصعود: {'نعم ✅' if v15 >= 1.15 else 'جزئي 🟡' if v15 >= .8 else 'ضعيف ⚠️'}"]
+
+            dom = "غير متاح" if market.btc_dominance is None else f"{market.btc_dominance:.2f}%"
+            lines += ["", "₿ BTC والسوق",
+                      f"• BTC Trend: {market.btc_trend_score:.1f}/100 | 1H {market.btc_change_1h:+.2f}%",
+                      f"• BTC.D: {dom}",
+                      f"• دعم السوق للألتكوين: {'نعم ✅' if market.market_safe else 'لا/حذر ⚠️'}"]
+            # Relative strength: coin 1H trend vs BTC trend.
+            rel = data["1H"]["trend"] - market.btc_trend_score
+            lines.append(f"• قوة العملة مقابل BTC: {'مستقلة/أقوى' if rel >= 8 else 'مرتبطة بالسوق' if rel > -8 else 'أضعف من BTC'} ({rel:+.1f})")
+
+            lines += ["", "⚔️ Futures"]
+            if "funding" in fut: lines.append(f"• Funding: {fut['funding']:+.4f}%")
+            if "oi_change_1h" in fut: lines.append(f"• OI تغير 1H: {fut['oi_change_1h']:+.2f}%")
+            if "long_short" in fut: lines.append(f"• Long/Short: {fut['long_short']:.2f}")
+            if "taker_ratio" in fut: lines.append(f"• Taker Buy/Sell: {fut['taker_ratio']:.2f} — {'شراء أقوى' if fut['taker_ratio']>1.05 else 'بيع أقوى' if fut['taker_ratio']<.95 else 'متوازن'}")
+            if not any(k in fut for k in ("funding","oi_change_1h","long_short","taker_ratio")):
+                lines.append("• بيانات العقود غير متاحة لهذه العملة")
+
+            nearest_r = resistances[0]["price"] if resistances else None
+            nearest_s = supports[0]["price"] if supports else None
+            lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
+            if upside >= 70: verdict="🟢 الصعود مدعوم"
+            elif upside >= 55: verdict="🟡 ميل صاعد لكن يحتاج تأكيد"
+            elif downside >= 65: verdict="🔴 خطر الهبوط مرتفع"
+            else: verdict="🟡 الحركة غير محسومة"
+            lines.append(f"• الحكم: {verdict}")
+            if nearest_r: lines.append(f"• اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي يقوي استمرار الصعود.")
+            if nearest_s: lines.append(f"• كسر {nearest_s:.8f} بإغلاق وفوليوم بيع قوي يرفع خطر الهبوط.")
+            lines.append("• الدرجات احتمالية تحليلية وليست ضمانًا لاتجاه السعر.")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"❌ تعذر تحليل {symbol}: {exc}"
+
     def handle(self, text: str) -> None:
         raw = text.strip()
         if not raw:
@@ -1658,6 +1877,7 @@ class TelegramCommands:
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
+                "🔬 /SPKUSDT — تحليل شامل لأي عملة USDT من 5M إلى 1W\n"
                 "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
                 "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
                 "📃 /excluded — عرض العملات المستبعدة\n"
@@ -1690,6 +1910,8 @@ class TelegramCommands:
             symbol = parts[1].upper()
             self.db.remove_excluded(symbol)
             self._reply(f"✅ أزيل {symbol} من قائمة الاستبعاد.")
+        elif command.startswith("/") and command[1:].upper().endswith("USDT") and command[1:].replace("_", "").isalnum():
+            self._reply(self._coin_report(command[1:].upper()))
         elif command == "/excluded":
             rows = self.db.list_excluded()
             if not rows:
