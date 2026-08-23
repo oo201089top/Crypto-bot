@@ -77,6 +77,13 @@ BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H = float(os.getenv("BINANCE_ALPHA_MIN_QUOTE_VO
 # إذا تعذر معرفة سنة إدراج Alpha-only نرفضها من المضاربة بدل افتراض أنها حديثة.
 ALPHA_UNKNOWN_LISTING_FAIL_CLOSED = os.getenv("ALPHA_UNKNOWN_LISTING_FAIL_CLOSED", "1") == "1"
 
+# مشتقات — رادار مساعد لقرارات Spot/Paper فقط، ولا يفتح أي صفقة Futures.
+DERIVATIVES_ENABLED = os.getenv("DERIVATIVES_ENABLED", "1") == "1"
+DERIVATIVES_CACHE_SECONDS = int(os.getenv("DERIVATIVES_CACHE_SECONDS", "60"))
+DERIVATIVES_MIN_TECH_SCORE = float(os.getenv("DERIVATIVES_MIN_TECH_SCORE", "64"))
+DERIVATIVES_SCORE_WEIGHT = float(os.getenv("DERIVATIVES_SCORE_WEIGHT", "0.12"))
+DERIVATIVES_BLOCK_SCORE = float(os.getenv("DERIVATIVES_BLOCK_SCORE", "38"))
+
 # التعزيز الذكي ووضع الإنقاذ
 SMART_AVERAGE_MIN_REBOUND = float(os.getenv("SMART_AVERAGE_MIN_REBOUND", "80"))
 SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "60"))
@@ -1278,9 +1285,8 @@ def analyze_symbol(
         )
     )
 
-    entry_ok = bool(
+    entry_setup_ok = bool(
         market_ok
-        and coin_score >= learned_entry_score
         and ENTRY_RSI_MIN <= rsi_15m <= ENTRY_RSI_MAX
         and -0.75 <= extension_atr <= MAX_ENTRY_EXTENSION_ATR
         and change_1h_pct <= MAX_ENTRY_CHANGE_1H_PCT
@@ -1289,6 +1295,7 @@ def analyze_symbol(
         and volume_build >= MIN_VOLUME_BUILD
         and max(volume_5m, volume_15m) >= 1.00
     )
+    entry_ok = bool(entry_setup_ok and coin_score >= learned_entry_score)
 
     # ارتداد حقيقي:
     # 1) كان السعر قريبًا/تحت EMA20.
@@ -1332,6 +1339,7 @@ def analyze_symbol(
     payload = {
         "market_score": round(market_score, 1),
         "market_ok": market_ok,
+        "entry_setup_ok": entry_setup_ok,
         "coin_score": round(coin_score, 1),
         "rsi_15m": round(rsi_15m, 2),
         "volume_5m": round(volume_5m, 2),
@@ -1400,6 +1408,11 @@ def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]
         reasons.append(f"ليست في منطقة ما قبل الاختراق ({dist:.1f}%)")
     if float(p.get("volume_build", 0)) < MIN_VOLUME_BUILD:
         reasons.append(f"تجميع الحجم غير كافٍ {float(p.get('volume_build', 0)):.2f}x")
+    deriv = p.get("derivatives") or {}
+    if p.get("derivatives_block"):
+        reasons.append(f"المشتقات تميل {deriv.get('lean','SHORT')} بدرجة {float(deriv.get('derivatives_score',0)):.0f}/100")
+    elif deriv.get("derivatives_score") is not None and float(deriv.get("derivatives_score")) < 45:
+        reasons.append(f"المشتقات ضعيفة لصفقة Spot ({float(deriv.get('derivatives_score')):.0f}/100)")
 
     return reasons or ["مؤهلة للدخول"]
 
@@ -1890,8 +1903,12 @@ class TelegramCommands:
                         else " 🟡Spot+Alpha" if membership == "SPOT_ALPHA"
                         else " 🟢Spot"
                     )
+                    deriv_info = analysis.payload.get("derivatives") or {}
+                    deriv_text = ""
+                    if deriv_info.get("derivatives_score") is not None:
+                        deriv_text = f" | مشتقات {deriv_info.get('lean','NEUTRAL')} {float(deriv_info.get('derivatives_score')):.0f}/100"
                     lines.append(
-                        f"{i}) {symbol}{market_badge} — {analysis.coin_score:.1f}/100 — {status}\n"
+                        f"{i}) {symbol}{market_badge} — {analysis.coin_score:.1f}/100 — {status}{deriv_text}\n"
                         f"   {reason_text}"
                     )
 
@@ -1982,54 +1999,8 @@ class TelegramCommands:
         return merged
 
     def _futures_snapshot(self, symbol: str) -> Dict:
-        base = "https://fapi.binance.com"
-        out: Dict = {}
-        try:
-            premium = self.api.get_absolute(base + "/fapi/v1/premiumIndex", {"symbol": symbol})
-            out["funding"] = float(premium.get("lastFundingRate", 0)) * 100
-        except Exception as exc:
-            out["funding_error"] = str(exc)
-        try:
-            oi = self.api.get_absolute(base + "/fapi/v1/openInterest", {"symbol": symbol})
-            out["oi"] = float(oi.get("openInterest", 0))
-            hist = self.api.get_absolute(base + "/futures/data/openInterestHist", {"symbol": symbol, "period": "5m", "limit": 13})
-            if isinstance(hist, list) and len(hist) >= 2:
-                old = float(hist[0].get("sumOpenInterestValue", 0) or 0)
-                new = float(hist[-1].get("sumOpenInterestValue", 0) or 0)
-                out["oi_change_1h"] = pct_change(new, old) if old else 0.0
-        except Exception as exc:
-            out["oi_error"] = str(exc)
-        try:
-            ls = self.api.get_absolute(base + "/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
-            if isinstance(ls, list) and ls:
-                out["long_short"] = float(ls[-1].get("longShortRatio", 0))
-        except Exception as exc:
-            out["ls_error"] = str(exc)
-        try:
-            taker = self.api.get_absolute(base + "/futures/data/takerlongshortRatio", {"symbol": symbol, "period": "5m", "limit": 1})
-            if isinstance(taker, list) and taker:
-                out["taker_ratio"] = float(taker[-1].get("buySellRatio", 0))
-        except Exception as exc:
-            out["taker_error"] = str(exc)
-        # بيانات مشتقات مساعدة فقط؛ التنفيذ في هذا المشروع Spot/Paper ولا يفتح Futures.
-        try:
-            ft = self.api.get_absolute(base + "/fapi/v1/ticker/24hr", {"symbol": symbol})
-            out["futures_quote_volume_24h"] = float(ft.get("quoteVolume", 0) or 0)
-        except Exception as exc:
-            out["futures_volume_error"] = str(exc)
-        try:
-            top_accounts = self.api.get_absolute(base + "/futures/data/topLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
-            if isinstance(top_accounts, list) and top_accounts:
-                out["top_accounts_ls"] = float(top_accounts[-1].get("longShortRatio", 0) or 0)
-        except Exception as exc:
-            out["top_accounts_error"] = str(exc)
-        try:
-            top_positions = self.api.get_absolute(base + "/futures/data/topLongShortPositionRatio", {"symbol": symbol, "period": "5m", "limit": 1})
-            if isinstance(top_positions, list) and top_positions:
-                out["top_positions_ls"] = float(top_positions[-1].get("longShortRatio", 0) or 0)
-        except Exception as exc:
-            out["top_positions_error"] = str(exc)
-        return out
+        # نفس محرك المشتقات المستخدم في قرار بوت المضاربة، حتى لا يختلف /USDT عن التداول الوهمي.
+        return get_derivatives_snapshot(symbol)
 
     def _coin_report(self, symbol: str) -> str:
         symbol = symbol.upper().strip()
@@ -2125,10 +2096,7 @@ class TelegramCommands:
             macro_trend = mean([data["4H"]["trend"], data["1D"]["trend"], data["1W"]["trend"]])
             vol_support = mean([min(100.0, data[x]["vol"] * 50.0) for x in ("5M", "15M", "1H")])
             btc_support = max(0.0, min(100.0, market.btc_trend_score))
-            deriv = 50.0
-            deriv += max(-15, min(15, float(fut.get("oi_change_1h", 0)) * 2.0))
-            deriv += max(-10, min(10, (float(fut.get("taker_ratio", 1)) - 1) * 25.0))
-            deriv = max(0.0, min(100.0, deriv))
+            deriv = float(fut.get("derivatives_score", 50.0) or 50.0)
             upside = round(max(0.0, min(100.0, short_trend * .30 + macro_trend * .25 + vol_support * .20 + btc_support * .15 + deriv * .10)))
             overbought = mean([data["15M"]["rsi"], data["1H"]["rsi"], data["4H"]["rsi"]])
             downside = round(max(0.0, min(100.0, (100-short_trend)*.35 + (100-macro_trend)*.25 + max(0, overbought-60)*1.1 + max(0, 1-data["15M"]["vol"])*20)))
@@ -2208,19 +2176,35 @@ class TelegramCommands:
             lines += ["", "🧭 مصدر الحركة", f"• {movement_source}"]
 
             lines += ["", "⚔️ المشتقات — رادار مساعد لتداول Spot"]
-            if "funding" in fut: lines.append(f"• Funding: {fut['funding']:+.4f}%")
-            if "oi_change_1h" in fut: lines.append(f"• OI تغير 1H: {fut['oi_change_1h']:+.2f}%")
-            if "long_short" in fut: lines.append(f"• Global Long/Short: {fut['long_short']:.2f}")
-            if "top_accounts_ls" in fut: lines.append(f"• Top Accounts L/S: {fut['top_accounts_ls']:.2f}")
-            if "top_positions_ls" in fut: lines.append(f"• Top Positions L/S: {fut['top_positions_ls']:.2f}")
-            if "taker_ratio" in fut: lines.append(f"• Taker Buy/Sell: {fut['taker_ratio']:.2f} — {'شراء أقوى' if fut['taker_ratio']>1.05 else 'بيع أقوى' if fut['taker_ratio']<.95 else 'متوازن'}")
-            fv = float(fut.get("futures_quote_volume_24h", 0) or 0)
-            if fv > 0 and quote_vol > 0:
-                fs_ratio = fv / quote_vol
-                driver = "العقود تهيمن ⚠️" if fs_ratio >= 5 else "العقود أعلى" if fs_ratio >= 2 else "متوازن نسبيًا"
-                lines.append(f"• Futures/Spot Volume: {fs_ratio:.1f}x — {driver}")
-            if not any(k in fut for k in ("funding","oi_change_1h","long_short","taker_ratio","top_accounts_ls","top_positions_ls")):
-                lines.append("• بيانات العقود غير متاحة لهذه العملة")
+            if fut.get("available") is False:
+                lines.append(f"• غير متاحة: {fut.get('reason','لا يوجد عقد Futures موثوق')}")
+            else:
+                if "funding" in fut: lines.append(f"• Funding: {fut['funding']:+.4f}%")
+                if fut.get("funding_trend"):
+                    lines.append("• Funding Trend: " + " → ".join(f"{x:+.4f}%" for x in fut['funding_trend']))
+                if "oi_value" in fut: lines.append(f"• Open Interest: {fut['oi_value']/1_000_000:.2f}M USDT")
+                if "oi_change_1h" in fut: lines.append(f"• OI تغير 1H: {fut['oi_change_1h']:+.2f}%")
+                if "oi_change_24h" in fut: lines.append(f"• OI تغير 24H: {fut['oi_change_24h']:+.2f}%")
+                if "long_short" in fut: lines.append(f"• Global Long/Short: {fut['long_short']:.2f}")
+                if "top_accounts_ls" in fut: lines.append(f"• Top Accounts L/S: {fut['top_accounts_ls']:.2f}")
+                if "top_positions_ls" in fut: lines.append(f"• Top Positions L/S: {fut['top_positions_ls']:.2f}")
+                if "taker_ratio" in fut: lines.append(f"• Taker Buy/Sell: {fut['taker_ratio']:.2f} — {'شراء أقوى' if fut['taker_ratio']>1.05 else 'بيع أقوى' if fut['taker_ratio']<.95 else 'متوازن'}")
+                if "futures_spot_ratio" in fut:
+                    fs_ratio = float(fut['futures_spot_ratio'])
+                    driver = "العقود تهيمن بشدة ⚠️" if fs_ratio >= 10 else "العقود تهيمن ⚠️" if fs_ratio >= 5 else "العقود أعلى" if fs_ratio >= 2 else "Spot صحي/متوازن"
+                    lines.append(f"• Futures/Spot Volume: {fs_ratio:.1f}x — {driver}")
+                if "oi_futures_volume_ratio" in fut: lines.append(f"• OI/Futures Volume: {fut['oi_futures_volume_ratio']:.2f}")
+                if "oi_market_cap_ratio" in fut:
+                    lines.append(f"• OI/Market Cap: {fut['oi_market_cap_ratio']:.1f}%")
+                else:
+                    lines.append("• OI/Market Cap: غير متاح — لا يوجد Market Cap موثوق من المصدر الحالي")
+                lines.append("• Liquidated 24h: غير متاح من Binance العام بشكل موثوق")
+                if fut.get("derivatives_score") is not None:
+                    lean_ar = "LONG 🟢" if fut.get("lean") == "LONG" else "SHORT 🔴" if fut.get("lean") == "SHORT" else "NEUTRAL ⚪"
+                    conf_ar = {"low":"منخفضة", "medium":"متوسطة", "high":"عالية"}.get(str(fut.get("confidence")), "منخفضة")
+                    lines.append(f"• 🧭 Derivatives Lean: {lean_ar} — {fut['derivatives_score']:.0f}/100 | الثقة {conf_ar}")
+                    if fut.get("derivatives_reasons"):
+                        lines.append("• السبب: " + " + ".join(fut['derivatives_reasons'][:4]))
 
             lines += ["", "🚨 الحركة اللحظية"]
             if move_1m is None:
@@ -2336,6 +2320,8 @@ class TelegramCommands:
             if float(fut.get("taker_ratio", 1) or 1) < 0.95: bear_factors.append("Taker بيع أقوى")
             if float(fut.get("long_short", 1) or 1) >= 1.6 or float(fut.get("top_positions_ls", 1) or 1) >= 2.0:
                 bear_factors.append("ازدحام Longs")
+            if float(fut.get("derivatives_score", 50) or 50) >= 58: bull_factors.append("المشتقات تدعم Spot")
+            if float(fut.get("derivatives_score", 50) or 50) <= 42: bear_factors.append("المشتقات تميل ضد Spot")
             if distance_r_pct is not None and 0 <= distance_r_pct <= 0.75: bear_factors.append("مقاومة قريبة")
             lines += ["", "⚖️ ميزان القوة"]
             lines.append("• 🟢 عوامل الصعود: " + (" + ".join(bull_factors[:5]) if bull_factors else "لا توجد عوامل قوية كافية"))
@@ -2563,14 +2549,259 @@ def get_market_score() -> float:
     return get_market_context().score
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _alpha_market_cap(symbol: str) -> Optional[float]:
+    """أفضل محاولة من بيانات Binance Alpha فقط؛ لا نخمن Market Cap لرموز Spot."""
+    try:
+        row = api.alpha_resolve(symbol)
+        if not row:
+            return None
+        for key in ("marketCap", "market_cap", "circulatingMarketCap", "circulating_market_cap"):
+            value = row.get(key)
+            if value not in (None, ""):
+                number = _safe_float(value, 0.0)
+                if number > 0:
+                    return number
+    except Exception:
+        pass
+    return None
+
+
+def _derivatives_score(snapshot: Dict) -> Tuple[float, str, str, List[str]]:
+    """درجة دعم/خطر للمضاربة Spot، وليست توصية Futures."""
+    score = 50.0
+    reasons: List[str] = []
+    available = 0
+
+    taker = snapshot.get("taker_ratio")
+    if taker is not None:
+        available += 1
+        taker = float(taker)
+        if taker >= 1.15:
+            score += 8; reasons.append("Taker شراء قوي")
+        elif taker > 1.05:
+            score += 4; reasons.append("Taker شراء أعلى")
+        elif taker <= 0.85:
+            score -= 8; reasons.append("Taker بيع قوي")
+        elif taker < 0.95:
+            score -= 4; reasons.append("Taker بيع أعلى")
+
+    top_pos = snapshot.get("top_positions_ls")
+    if top_pos is not None:
+        available += 1
+        top_pos = float(top_pos)
+        if 1.10 <= top_pos <= 1.80:
+            score += 4; reasons.append("مراكز الكبار تميل Long بشكل صحي")
+        elif top_pos >= 2.50:
+            score -= 5; reasons.append("ازدحام Long في مراكز الكبار")
+        elif top_pos <= 0.80:
+            score -= 4; reasons.append("مراكز الكبار تميل Short")
+
+    top_acc = snapshot.get("top_accounts_ls")
+    if top_acc is not None:
+        available += 1
+        top_acc = float(top_acc)
+        if 1.05 <= top_acc <= 1.80:
+            score += 2
+        elif top_acc >= 2.50:
+            score -= 3; reasons.append("ازدحام Long في حسابات الكبار")
+        elif top_acc <= 0.80:
+            score -= 3
+
+    global_ls = snapshot.get("long_short")
+    if global_ls is not None:
+        available += 1
+        global_ls = float(global_ls)
+        if global_ls >= 2.20:
+            score -= 6; reasons.append("الجمهور مزدحم Long")
+        elif global_ls <= 0.55:
+            score += 2; reasons.append("الجمهور مزدحم Short")
+
+    funding = snapshot.get("funding")
+    if funding is not None:
+        available += 1
+        funding = float(funding)
+        if funding >= 0.05:
+            score -= 8; reasons.append("Funding موجب مرتفع")
+        elif funding >= 0.02:
+            score -= 4; reasons.append("Funding موجب ملحوظ")
+        elif funding <= -0.05:
+            score -= 2; reasons.append("Funding سالب شديد/سوق مضغوط")
+        elif funding < 0:
+            score += 2
+
+    fs = snapshot.get("futures_spot_ratio")
+    if fs is not None:
+        available += 1
+        fs = float(fs)
+        if fs >= 15:
+            score -= 10; reasons.append("العقود تهيمن بشدة على السبوت")
+        elif fs >= 8:
+            score -= 7; reasons.append("هيمنة عقود مرتفعة")
+        elif fs >= 5:
+            score -= 4; reasons.append("العقود أعلى من السبوت")
+        elif fs <= 2:
+            score += 5; reasons.append("دعم Spot صحي")
+
+    oi_fut = snapshot.get("oi_futures_volume_ratio")
+    if oi_fut is not None:
+        available += 1
+        oi_fut = float(oi_fut)
+        if oi_fut <= 0.15:
+            score += 3
+        elif oi_fut >= 0.50:
+            score -= 5; reasons.append("OI مرتفع مقارنة بدوران العقود")
+
+    oi_mcap = snapshot.get("oi_market_cap_ratio")
+    if oi_mcap is not None:
+        available += 1
+        oi_mcap = float(oi_mcap)
+        if oi_mcap >= 25:
+            score -= 10; reasons.append("OI ضخم مقابل القيمة السوقية")
+        elif oi_mcap >= 15:
+            score -= 6; reasons.append("رافعة مرتفعة مقابل حجم المشروع")
+        elif oi_mcap <= 8:
+            score += 3
+
+    oi1h = snapshot.get("oi_change_1h")
+    if oi1h is not None and taker is not None:
+        available += 1
+        oi1h = float(oi1h)
+        if oi1h >= 4 and float(taker) >= 1.05:
+            score += 4; reasons.append("OI يرتفع مع شراء")
+        elif oi1h >= 4 and float(taker) < 0.95:
+            score -= 4; reasons.append("OI يرتفع مع بيع")
+
+    score = max(0.0, min(100.0, score))
+    if score >= 58:
+        lean = "LONG"
+    elif score <= 42:
+        lean = "SHORT"
+    else:
+        lean = "NEUTRAL"
+
+    distance = abs(score - 50)
+    if available >= 7 and distance >= 15:
+        confidence = "high"
+    elif available >= 5 and distance >= 8:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    return round(score, 1), lean, confidence, reasons
+
+
+def get_derivatives_snapshot(symbol: str) -> Dict:
+    if not DERIVATIVES_ENABLED or api.market_kind(symbol) != "SPOT":
+        return {"available": False, "reason": "لا توجد مشتقات Binance Futures موثوقة لهذا السوق"}
+
+    cache_key = f"deriv_snapshot:{symbol}"
+    cached = api._cache_get(cache_key, DERIVATIVES_CACHE_SECONDS)
+    if cached is not None:
+        return cached
+
+    base = "https://fapi.binance.com"
+    out: Dict = {"available": True}
+
+    try:
+        premium = api.get_absolute(base + "/fapi/v1/premiumIndex", {"symbol": symbol})
+        out["funding"] = _safe_float(premium.get("lastFundingRate")) * 100
+    except Exception as exc:
+        out["funding_error"] = str(exc)
+
+    try:
+        funding_hist = api.get_absolute(base + "/fapi/v1/fundingRate", {"symbol": symbol, "limit": 6})
+        if isinstance(funding_hist, list):
+            out["funding_trend"] = [round(_safe_float(x.get("fundingRate")) * 100, 5) for x in funding_hist[-6:]]
+    except Exception as exc:
+        out["funding_trend_error"] = str(exc)
+
+    try:
+        oi = api.get_absolute(base + "/fapi/v1/openInterest", {"symbol": symbol})
+        out["oi_qty"] = _safe_float(oi.get("openInterest"))
+        hist = api.get_absolute(base + "/futures/data/openInterestHist", {"symbol": symbol, "period": "5m", "limit": 13})
+        if isinstance(hist, list) and hist:
+            out["oi_value"] = _safe_float(hist[-1].get("sumOpenInterestValue"))
+            if len(hist) >= 2:
+                old = _safe_float(hist[0].get("sumOpenInterestValue"))
+                new = _safe_float(hist[-1].get("sumOpenInterestValue"))
+                out["oi_change_1h"] = pct_change(new, old) if old else 0.0
+        hist24 = api.get_absolute(base + "/futures/data/openInterestHist", {"symbol": symbol, "period": "1h", "limit": 25})
+        if isinstance(hist24, list) and len(hist24) >= 2:
+            old24 = _safe_float(hist24[0].get("sumOpenInterestValue"))
+            new24 = _safe_float(hist24[-1].get("sumOpenInterestValue"))
+            out["oi_change_24h"] = pct_change(new24, old24) if old24 else 0.0
+    except Exception as exc:
+        out["oi_error"] = str(exc)
+
+    endpoints = (
+        ("long_short", "/futures/data/globalLongShortAccountRatio", "longShortRatio"),
+        ("top_accounts_ls", "/futures/data/topLongShortAccountRatio", "longShortRatio"),
+        ("top_positions_ls", "/futures/data/topLongShortPositionRatio", "longShortRatio"),
+        ("taker_ratio", "/futures/data/takerlongshortRatio", "buySellRatio"),
+    )
+    for key, path, field in endpoints:
+        try:
+            rows = api.get_absolute(base + path, {"symbol": symbol, "period": "5m", "limit": 1})
+            if isinstance(rows, list) and rows:
+                out[key] = _safe_float(rows[-1].get(field), 0.0)
+        except Exception as exc:
+            out[key + "_error"] = str(exc)
+
+    try:
+        ft = api.get_absolute(base + "/fapi/v1/ticker/24hr", {"symbol": symbol})
+        out["futures_quote_volume_24h"] = _safe_float(ft.get("quoteVolume"))
+    except Exception as exc:
+        out["futures_volume_error"] = str(exc)
+
+    try:
+        spot = api.market_ticker_24h(symbol)
+        out["spot_quote_volume_24h"] = _safe_float(spot.get("quoteVolume"))
+    except Exception as exc:
+        out["spot_volume_error"] = str(exc)
+
+    fv = _safe_float(out.get("futures_quote_volume_24h"))
+    sv = _safe_float(out.get("spot_quote_volume_24h"))
+    oiv = _safe_float(out.get("oi_value"))
+    if fv > 0 and sv > 0:
+        out["futures_spot_ratio"] = fv / sv
+    if oiv > 0 and fv > 0:
+        out["oi_futures_volume_ratio"] = oiv / fv
+
+    market_cap = _alpha_market_cap(symbol)
+    if market_cap and market_cap > 0:
+        out["market_cap"] = market_cap
+        if oiv > 0:
+            out["oi_market_cap_ratio"] = (oiv / market_cap) * 100.0
+    else:
+        out["market_cap_unavailable"] = True
+
+    # Binance العام لا يوفر لنا إجمالي Liquidations 24h بشكل موثوق دون مصدر خارجي.
+    out["liquidations_24h"] = None
+    out["liquidations_note"] = "غير متاح من مصدر Binance العام بشكل موثوق"
+
+    score, lean, confidence, reasons = _derivatives_score(out)
+    out["derivatives_score"] = score
+    out["lean"] = lean
+    out["confidence"] = confidence
+    out["derivatives_reasons"] = reasons
+    return api._cache_set(cache_key, out)
+
+
 def get_analysis(symbol: str, market_score: float) -> Analysis:
+    learned_min = learner.effective_entry_score()
     analysis = analyze_symbol(
         symbol,
         api.market_klines(symbol, "5m", limit=120),
         api.market_klines(symbol, "15m", limit=160),
         api.market_klines(symbol, "1h", limit=140),
         market_score,
-        learner.effective_entry_score(),
+        learned_min,
     )
     analysis.payload["candle_time"] = analysis.candle_time
     analysis.payload["market_source"] = api.market_kind(symbol)
@@ -2587,8 +2818,45 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         "market_reason": market.reason,
         "strategy_version": STRATEGY_VERSION,
     })
-    # أمان السوق شرط إلزامي للدخول الأول في V3.
-    analysis.entry_ok = bool(analysis.entry_ok and market.market_safe)
+
+    # لا نضغط Futures API على كل السوق: نفحص المشتقات عندما تكون العملة أصلًا قريبة من جودة الدخول.
+    deriv = {}
+    if DERIVATIVES_ENABLED and analysis.coin_score >= max(DERIVATIVES_MIN_TECH_SCORE, learned_min - 8):
+        try:
+            deriv = get_derivatives_snapshot(symbol)
+        except Exception as exc:
+            deriv = {"available": False, "reason": str(exc)}
+    analysis.payload["derivatives"] = deriv
+
+    # المشتقات تعدّل التقييم بنطاق محافظ (حوالي ±6 نقاط عند وزن 12%).
+    technical_score = float(analysis.coin_score)
+    deriv_score = deriv.get("derivatives_score") if isinstance(deriv, dict) else None
+    if deriv_score is not None:
+        adjusted = technical_score + (float(deriv_score) - 50.0) * DERIVATIVES_SCORE_WEIGHT
+        analysis.coin_score = round(max(0.0, min(100.0, adjusted)), 1)
+        analysis.payload["technical_coin_score"] = round(technical_score, 1)
+        analysis.payload["coin_score"] = analysis.coin_score
+        analysis.payload["derivatives_adjustment"] = round(analysis.coin_score - technical_score, 1)
+
+    derivative_block = bool(
+        isinstance(deriv, dict)
+        and deriv.get("derivatives_score") is not None
+        and float(deriv.get("derivatives_score")) <= DERIVATIVES_BLOCK_SCORE
+        and str(deriv.get("confidence", "low")) in {"medium", "high"}
+    )
+    analysis.payload["derivatives_block"] = derivative_block
+
+    # قرار الدخول النهائي: setup الفني + التقييم بعد المشتقات + أمان السوق + عدم وجود تحذير مشتقات قوي.
+    analysis.entry_ok = bool(
+        analysis.payload.get("entry_setup_ok")
+        and analysis.coin_score >= learned_min
+        and market.market_safe
+        and not derivative_block
+    )
+    if derivative_block:
+        analysis.reason = "انتظار — مشتقات تميل بقوة ضد دخول Spot"
+    elif analysis.entry_ok:
+        analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
     return analysis
 
 
