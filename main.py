@@ -98,6 +98,13 @@ RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
 BINANCE_RISK_ENDPOINTS_ENABLED = os.getenv("BINANCE_RISK_ENDPOINTS_ENABLED", "1") == "1"
 RISK_FAIL_CLOSED = os.getenv("RISK_FAIL_CLOSED", "1") == "1"
 RISK_CHECK_FAILED_SENTINEL = "__RISK_CHECK_FAILED__"
+# حماية إضافية: يمكن إضافة رموز Monitoring يدويًا من متغير البيئة عند الحاجة.
+# PORTAL مضاف افتراضيًا لأنه ظهر فعليًا تحت Monitoring بينما endpoint لم يلتقطه في النسخة السابقة.
+MONITORING_FALLBACK_ASSETS = {
+    x.strip().upper()
+    for x in os.getenv("MONITORING_FALLBACK_ASSETS", "PORTAL").split(",")
+    if x.strip()
+}
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
@@ -989,11 +996,12 @@ class BinancePublic:
         rows.sort(key=lambda x: x[1], reverse=True)
         return self._cache_set(key, rows)
 
-    def spot_asset_tags(self, tag: str = "Monitoring") -> Set[str]:
+    def spot_asset_tags(self, tag: str = "Monitoring", force_refresh: bool = False) -> Set[str]:
         key = f"spot_asset_tags:{tag.lower()}"
-        cached = self._cache_get(key, RISK_CACHE_SECONDS)
-        if cached is not None:
-            return cached
+        if not force_refresh:
+            cached = self._cache_get(key, RISK_CACHE_SECONDS)
+            if cached is not None:
+                return cached
 
         # Binance يصنف هذا endpoint كـ MARKET_DATA، أي يحتاج API Key فقط.
         if not BINANCE_RISK_ENDPOINTS_ENABLED or not BINANCE_API_KEY:
@@ -1009,14 +1017,39 @@ class BinancePublic:
 
         rows = data.get("data", data) if isinstance(data, dict) else data
         assets: Set[str] = set()
-        if isinstance(rows, list):
-            for row in rows:
-                if isinstance(row, str):
-                    assets.add(row.upper())
-                elif isinstance(row, dict):
-                    value = row.get("asset") or row.get("symbol") or row.get("coin")
-                    if value:
-                        assets.add(str(value).upper())
+
+        # Binance غيّر شكل بعض الاستجابات عبر الوقت؛ نقرأ الحقول المعروفة حتى لو كانت متداخلة.
+        asset_keys = {
+            "asset", "symbol", "coin", "baseAsset", "assetCode",
+            "token", "tokenSymbol", "code"
+        }
+
+        def collect_assets(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in asset_keys and isinstance(v, (str, int, float)):
+                        value = str(v).upper().strip()
+                        if value:
+                            # لو رجع زوجًا مثل PORTALUSDT نحفظ الزوج والـbase معًا.
+                            assets.add(value)
+                            if value.endswith("USDT") and len(value) > 4:
+                                assets.add(value[:-4])
+                    elif isinstance(v, (dict, list, tuple)):
+                        collect_assets(v)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    collect_assets(item)
+            elif isinstance(obj, str):
+                value = obj.upper().strip()
+                # نقبل strings المباشرة فقط إذا بدت كرمز أصل قصير.
+                if value and value.replace("_", "").replace("-", "").isalnum() and len(value) <= 20:
+                    assets.add(value)
+
+        collect_assets(rows)
+
+        # طبقة احتياطية يدوية لا تعتمد على endpoint وحده.
+        if tag.lower() == "monitoring":
+            assets.update(MONITORING_FALLBACK_ASSETS)
 
         return self._cache_set(key, assets)
 
@@ -1483,6 +1516,7 @@ class AdaptiveLearner:
 class PaperBroker:
     def __init__(self, database: Database):
         self.db = database
+        self.risk_guard = None
 
     def position(self):
         return self.db.get_open_trade()
@@ -1494,6 +1528,13 @@ class PaperBroker:
         reason: str,
         payload: Dict,
     ):
+        # بوابة أمان نهائية داخل طبقة التنفيذ نفسها:
+        # لا يمكن إنشاء BUY حتى لو أخطأ مسار scan أو التعزيز في استدعاء فلتر المخاطر.
+        if self.risk_guard is not None:
+            risk = self.risk_guard(symbol, force_refresh=True)
+            if risk:
+                raise RuntimeError(f"BUY BLOCKED BY RISK GUARD: {risk}")
+
         position = self.position()
 
         if position and position["symbol"] != symbol:
@@ -1630,7 +1671,7 @@ class Universe:
         self.listing_year_cache: Dict[str, Optional[int]] = {}
         self.scan_cursor = 0
 
-    def risk_reason(self, symbol: str) -> Optional[str]:
+    def risk_reason(self, symbol: str, force_refresh: bool = False) -> Optional[str]:
         manual = self.db.is_excluded(symbol)
         if manual:
             return f"قائمة الحظر: {manual}"
@@ -1641,7 +1682,7 @@ class Universe:
         if self.api.market_kind(symbol) == "ALPHA":
             return None
 
-        monitoring = self.api.spot_asset_tags("Monitoring")
+        monitoring = self.api.spot_asset_tags("Monitoring", force_refresh=force_refresh)
         if RISK_CHECK_FAILED_SENTINEL in monitoring:
             if RISK_FAIL_CLOSED:
                 return "تعذر التحقق من Binance Monitoring Tag — دخول ممنوع احترازيًا"
@@ -2484,6 +2525,8 @@ api = BinancePublic()
 broker = PaperBroker(db)
 notifier = Notifier(db)
 universe = Universe(api, db)
+# حماية تنفيذية مزدوجة: كل BUY يمر على risk_reason مرة أخرى لحظة التنفيذ.
+broker.risk_guard = universe.risk_reason
 learner = AdaptiveLearner(db)
 commands = TelegramCommands(db, api, broker, universe, learner)
 
@@ -3151,7 +3194,7 @@ def scan_for_entry(market_score: float) -> None:
 
     if best:
         # فحص أخير لحظة التنفيذ: لا Monitoring/Delisting ولا سوق غير آمن.
-        risk = universe.risk_reason(best.symbol)
+        risk = universe.risk_reason(best.symbol, force_refresh=True)
         market = get_market_context()
         if risk:
             db.add_analysis(best.symbol, market_score, best.coin_score, "BLOCK", risk, best.payload)
