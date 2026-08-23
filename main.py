@@ -38,6 +38,7 @@ import requests
 # =========================
 
 BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
@@ -76,9 +77,11 @@ RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
 
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
-# هذه المسارات غير موثقة حاليًا ضمن Binance Spot API العام وتعيد HTTP 400 بدون اعتماد مناسب.
-# نتركها اختيارية بدل إغراق اللوق بالأخطاء، مع استمرار الحظر اليدوي وفحص حالة TRADING من exchangeInfo.
-BINANCE_RISK_ENDPOINTS_ENABLED = os.getenv("BINANCE_RISK_ENDPOINTS_ENABLED", "0") == "1"
+# Get Spot Asset Tags هو MARKET_DATA ويحتاج X-MBX-APIKEY (لا يحتاج Secret أو توقيع).
+# حماية Fail-Closed: إذا تعذر التحقق من Monitoring Tag نمنع الدخول بدل السماح بالخطأ.
+BINANCE_RISK_ENDPOINTS_ENABLED = os.getenv("BINANCE_RISK_ENDPOINTS_ENABLED", "1") == "1"
+RISK_FAIL_CLOSED = os.getenv("RISK_FAIL_CLOSED", "1") == "1"
+RISK_CHECK_FAILED_SENTINEL = "__RISK_CHECK_FAILED__"
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
@@ -668,6 +671,8 @@ class Database:
 class BinancePublic:
     def __init__(self):
         self.session = requests.Session()
+        if BINANCE_API_KEY:
+            self.session.headers.update({"X-MBX-APIKEY": BINANCE_API_KEY})
         self._cache: Dict[str, tuple] = {}
 
     def _cache_get(self, key: str, ttl: int):
@@ -761,14 +766,17 @@ class BinancePublic:
         if cached is not None:
             return cached
 
-        if not BINANCE_RISK_ENDPOINTS_ENABLED:
-            return self._cache_set(key, set())
+        # Binance يصنف هذا endpoint كـ MARKET_DATA، أي يحتاج API Key فقط.
+        if not BINANCE_RISK_ENDPOINTS_ENABLED or not BINANCE_API_KEY:
+            failed = {RISK_CHECK_FAILED_SENTINEL}
+            return self._cache_set(key, failed)
 
         try:
             data = self.get("/sapi/v1/spot/asset/tags", {"tag": tag})
-        except Exception:
-            # لا نكرر خطأ HTTP 400 في اللوق؛ الحظر اليدوي وفحص exchangeInfo يظلان فعالين.
-            return self._cache_set(key, set())
+        except Exception as exc:
+            print(f"تعذر التحقق من Binance {tag} Tag — سيتم منع الدخول احترازيًا: {exc}", flush=True)
+            failed = {RISK_CHECK_FAILED_SENTINEL}
+            return self._cache_set(key, failed)
 
         rows = data.get("data", data) if isinstance(data, dict) else data
         assets: Set[str] = set()
@@ -780,35 +788,14 @@ class BinancePublic:
                     value = row.get("asset") or row.get("symbol") or row.get("coin")
                     if value:
                         assets.add(str(value).upper())
+
         return self._cache_set(key, assets)
 
     def delist_symbols(self) -> Set[str]:
-        key = "spot_delist_schedule"
-        cached = self._cache_get(key, RISK_CACHE_SECONDS)
-        if cached is not None:
-            return cached
-
-        if not BINANCE_RISK_ENDPOINTS_ENABLED:
-            return self._cache_set(key, set())
-
-        try:
-            data = self.get("/sapi/v1/spot/delist-schedule")
-        except Exception:
-            # لا نكرر خطأ HTTP 400 في اللوق؛ العملات غير TRADING تُستبعد أصلًا من exchangeInfo.
-            return self._cache_set(key, set())
-
-        rows = data.get("data", data) if isinstance(data, dict) else data
-        symbols: Set[str] = set()
-        if isinstance(rows, list):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                vals = row.get("symbols") or row.get("symbol") or []
-                if isinstance(vals, str):
-                    vals = [vals]
-                for value in vals:
-                    symbols.add(str(value).upper())
-        return self._cache_set(key, symbols)
+        # لا نعتمد على endpoint غير موثوق لجدول الحذف.
+        # العملات غير TRADING تُستبعد أصلًا من exchangeInfo،
+        # والعملات المعرضة لخطر الحذف تُمنع عبر Monitoring Tag.
+        return set()
 
     def btc_dominance(self) -> float:
         key = "btc_dominance"
@@ -1414,19 +1401,16 @@ class Universe:
             return f"قائمة الحظر: {manual}"
 
         base = symbol.upper().removesuffix("USDT")
-        try:
-            monitoring = self.api.spot_asset_tags("Monitoring")
-            if base in monitoring or symbol.upper() in monitoring:
-                return "Binance Monitoring Tag"
-        except Exception:
-            pass
 
-        try:
-            delisting = self.api.delist_symbols()
-            if symbol.upper() in delisting or base in delisting:
-                return "Binance Delisting Schedule"
-        except Exception:
-            pass
+        monitoring = self.api.spot_asset_tags("Monitoring")
+        if RISK_CHECK_FAILED_SENTINEL in monitoring:
+            if RISK_FAIL_CLOSED:
+                return "تعذر التحقق من Binance Monitoring Tag — دخول ممنوع احترازيًا"
+        elif base in monitoring or symbol.upper() in monitoring:
+            return "Binance Monitoring Tag — دخول ممنوع"
+
+        # الحذف الفعلي يُمنع أيضًا عبر status=TRADING في exchangeInfo داخل candidates().
+        # ويمكن إضافة أي إعلان حذف يدويًا عبر قائمة الحظر دون حذف السجل التاريخي.
         return None
 
     def candidates(self):
