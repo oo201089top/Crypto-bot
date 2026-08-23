@@ -2006,6 +2006,7 @@ class TelegramCommands:
                       ("4H", "4h", 240), ("1D", "1d", 240), ("1W", "1w", 180)]
             data: Dict[str, Dict] = {}
             all_s, all_r = [], []
+            structural_high_candidates = []
             price = self.api.market_price(symbol)
             for label, interval, limit in frames:
                 candles = self.api.market_klines(symbol, interval, limit=limit)
@@ -2023,10 +2024,44 @@ class TelegramCommands:
                 raw_low = min((float(c["low"]) for c in recent_window), default=price)
                 data[label] = {"trend": tr, "rsi": rs, "vol": rv, "raw_high": raw_high, "raw_low": raw_low}
 
+                # المقاومة الهيكلية: آخر Swing High حقيقي على الفريمات الأهم،
+                # بدل اعتبار كل مقاومة حسابية صغيرة سقفًا رئيسيًا للحركة.
+                if label in {"1H", "4H", "1D"} and len(closed_rows) >= 7:
+                    look = closed_rows[-90:]
+                    for i in range(len(look) - 3, 1, -1):
+                        h = float(look[i]["high"])
+                        if h <= price * 1.002:
+                            continue
+                        left = [float(look[i-j]["high"]) for j in (1, 2)]
+                        right = [float(look[i+j]["high"]) for j in (1, 2)]
+                        if h > max(left) and h >= max(right):
+                            structural_high_candidates.append({"price": h, "frame": label})
+                            break
+
             supports = [x for x in self._merge_levels(all_s, price) if x["price"] < price]
             resistances = [x for x in self._merge_levels(all_r, price) if x["price"] > price]
             supports.sort(key=lambda x: x["price"], reverse=True)
             resistances.sort(key=lambda x: x["price"])
+
+            # دمج قمم Swing المتقاربة بين 1H/4H/1D وتحديد المقاومة الهيكلية الرئيسية.
+            structural_resistance = None
+            structural_frames = []
+            if structural_high_candidates:
+                clusters = []
+                for cand in sorted(structural_high_candidates, key=lambda x: x["price"]):
+                    placed = False
+                    for cl in clusters:
+                        center = mean(x["price"] for x in cl)
+                        if center and abs(cand["price"] / center - 1.0) <= 0.005:
+                            cl.append(cand)
+                            placed = True
+                            break
+                    if not placed:
+                        clusters.append([cand])
+                clusters.sort(key=lambda cl: (-len({x["frame"] for x in cl}), mean(x["price"] for x in cl)))
+                best = clusters[0]
+                structural_resistance = max(x["price"] for x in best)
+                structural_frames = sorted({x["frame"] for x in best}, key=lambda z:["1H","4H","1D"].index(z))
 
             tick = self.api.market_ticker_24h(symbol)
             quote_vol = float(tick.get("quoteVolume", 0) or 0)
@@ -2240,6 +2275,9 @@ class TelegramCommands:
                 lines.append(f"• الدعم الحاسم: {critical_support:.8f} — كسره يضعف الهيكل أكثر من كسر دعم لحظي ضعيف")
             if nearest_r:
                 lines.append(f"• المقاومة الأقرب: {nearest_r:.8f}")
+            if structural_resistance:
+                fr_txt = " + ".join(structural_frames) if structural_frames else "1H/4H/1D"
+                lines.append(f"• 🏔️ المقاومة الهيكلية الرئيسية: {structural_resistance:.8f} — آخر Swing High واضح — {fr_txt}")
 
             # ميزان القوة: يحول المؤشرات إلى أسباب مفهومة بدل أرقام منفصلة.
             bull_factors, bear_factors = [], []
@@ -2273,6 +2311,8 @@ class TelegramCommands:
                     lines.append(f"• 🚀 اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي → يفتح الطريق نحو {next_r:.8f}")
                 else:
                     lines.append(f"• 🚀 اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي → يدعم استمرار الصعود")
+            if structural_resistance and (nearest_r is None or structural_resistance > nearest_r * 1.003):
+                lines.append(f"• 🏔️ اختراق المقاومة الهيكلية {structural_resistance:.8f} وتثبيت فوقها بفوليوم قوي → تأكيد أقوى لموجة صاعدة جديدة")
             if nearest_s:
                 fallback = supports[1]["price"] if len(supports) > 1 else critical_support
                 if fallback and abs(float(fallback) - float(nearest_s)) > 1e-15:
@@ -2312,6 +2352,8 @@ class TelegramCommands:
             lines.append(f"• Binance Alpha: {'نعم ✅' if is_alpha else 'لا'}")
             if critical_support:
                 lines.append(f"• الدعم الحاسم: {critical_support:.8f}")
+            if structural_resistance:
+                lines.append(f"• المقاومة الهيكلية الرئيسية: {structural_resistance:.8f} — آخر Swing High واضح")
             lines.append(f"• ميزان القوة: {balance_note}")
             if nearest_r:
                 lines.append(f"• المقاومة الأقرب {nearest_r:.8f} تبعد {(nearest_r / price - 1) * 100:.2f}% عن السعر.")
