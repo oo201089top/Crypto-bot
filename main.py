@@ -74,6 +74,8 @@ BINANCE_ALPHA_BASE = os.getenv("BINANCE_ALPHA_BASE", "https://www.binance.com")
 BINANCE_ALPHA_CACHE_SECONDS = int(os.getenv("BINANCE_ALPHA_CACHE_SECONDS", "300"))
 BINANCE_ALPHA_MAX_CANDIDATES = int(os.getenv("BINANCE_ALPHA_MAX_CANDIDATES", "60"))
 BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H = float(os.getenv("BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H", "500000"))
+# إذا تعذر معرفة سنة إدراج Alpha-only نرفضها من المضاربة بدل افتراض أنها حديثة.
+ALPHA_UNKNOWN_LISTING_FAIL_CLOSED = os.getenv("ALPHA_UNKNOWN_LISTING_FAIL_CLOSED", "1") == "1"
 
 # التعزيز الذكي ووضع الإنقاذ
 SMART_AVERAGE_MIN_REBOUND = float(os.getenv("SMART_AVERAGE_MIN_REBOUND", "80"))
@@ -833,10 +835,24 @@ class BinancePublic:
         except Exception:
             return False
 
-    def market_kind(self, symbol: str) -> str:
-        if self.is_spot_symbol(symbol):
+    def market_membership(self, symbol: str) -> str:
+        """تصنيف مكان تداول الرمز بدون خلط Spot مع Alpha."""
+        spot = self.is_spot_symbol(symbol)
+        alpha = self.is_alpha_symbol(symbol)
+        if spot and alpha:
+            return "SPOT_ALPHA"
+        if spot:
             return "SPOT"
-        if self.is_alpha_symbol(symbol):
+        if alpha:
+            return "ALPHA_ONLY"
+        return "UNKNOWN"
+
+    def market_kind(self, symbol: str) -> str:
+        """مصدر بيانات التحليل/التنفيذ الوهمي: نفضّل Spot عند توفره."""
+        membership = self.market_membership(symbol)
+        if membership in {"SPOT", "SPOT_ALPHA"}:
+            return "SPOT"
+        if membership == "ALPHA_ONLY":
             return "ALPHA"
         return "UNKNOWN"
 
@@ -898,12 +914,15 @@ class BinancePublic:
             return next((x for x in self.tickers_24h() if x.get("symbol") == symbol), {})
         return self.alpha_ticker(symbol)
 
-    def market_listing_year(self, symbol: str) -> int:
+    def market_listing_year(self, symbol: str) -> Optional[int]:
+        # Spot (ومن ضمنه Spot + Alpha): سنة الإدراج المعتمدة هي تاريخ زوج Spot.
         if self.is_spot_symbol(symbol):
             return self.listing_year(symbol)
+
+        # Alpha-only: نحاول أخذ تاريخ موثوق من بيانات Alpha.
         resolved = self.alpha_resolve(symbol)
         if not resolved:
-            return 9999
+            return None
         for key in ("listingTime", "onlineTime", "listTime", "startTime", "createdAt"):
             value = resolved.get(key)
             if value in (None, ""):
@@ -912,11 +931,14 @@ class BinancePublic:
                 number = float(value)
                 if number > 10_000_000_000:
                     number /= 1000.0
-                return datetime.fromtimestamp(number, tz=timezone.utc).year
+                year = datetime.fromtimestamp(number, tz=timezone.utc).year
+                if 2009 <= year <= datetime.now(timezone.utc).year + 1:
+                    return year
             except Exception:
                 pass
-        # Alpha منتج مبكر؛ عند غياب تاريخ موثوق لا نرفضه بفلتر سنة الإدراج.
-        return datetime.now(timezone.utc).year
+
+        # لا نخترع سنة حالية لعملة Alpha-only إذا Binance لم توفر تاريخًا صالحًا.
+        return None
 
     def alpha_candidates(self) -> List[Tuple[str, float]]:
         if not BINANCE_ALPHA_ENABLED:
@@ -942,6 +964,10 @@ class BinancePublic:
                 continue
             logical = base + "USDT"
             try:
+                # إذا كان الرمز موجودًا في Spot أيضًا فهو موجود أصلًا بقائمة Spot،
+                # فلا نكرره كمرشح Alpha. هنا نضيف Alpha-only فقط.
+                if self.is_spot_symbol(logical):
+                    continue
                 ticker = self.alpha_ticker(logical)
                 qv = float(ticker.get("quoteVolume") or ticker.get("quote_volume") or 0)
                 if qv <= 0:
@@ -1588,7 +1614,7 @@ class Universe:
     def __init__(self, api: BinancePublic, database: Database):
         self.api = api
         self.db = database
-        self.listing_year_cache: Dict[str, int] = {}
+        self.listing_year_cache: Dict[str, Optional[int]] = {}
         self.scan_cursor = 0
 
     def risk_reason(self, symbol: str) -> Optional[str]:
@@ -1679,14 +1705,22 @@ class Universe:
         self.scan_cursor = (start + batch_size) % len(candidates)
         return batch
 
-    def listing_year_ok(self, symbol: str) -> bool:
+    def listing_year_value(self, symbol: str) -> Optional[int]:
         if symbol not in self.listing_year_cache:
             try:
                 self.listing_year_cache[symbol] = self.api.market_listing_year(symbol)
             except Exception:
-                return False
+                self.listing_year_cache[symbol] = None
+        return self.listing_year_cache[symbol]
 
-        return self.listing_year_cache[symbol] >= MIN_LISTING_YEAR
+    def listing_year_ok(self, symbol: str) -> bool:
+        year = self.listing_year_value(symbol)
+        if year is None:
+            # Alpha-only بسنة مجهولة: Fail-Closed افتراضيًا.
+            if self.api.market_membership(symbol) == "ALPHA_ONLY":
+                return not ALPHA_UNKNOWN_LISTING_FAIL_CLOSED
+            return False
+        return year >= MIN_LISTING_YEAR
 
 
 
@@ -1850,9 +1884,14 @@ class TelegramCommands:
                 for i, (_score, symbol, analysis, reasons, quote_volume) in enumerate(top, 1):
                     status = "✅ دخول" if analysis.entry_ok else "⏳ انتظار"
                     reason_text = "، ".join(reasons[:3])
-                    alpha_badge = " 🅰️Alpha" if bool(analysis.payload.get("is_binance_alpha")) else ""
+                    membership = str(analysis.payload.get("market_membership") or self.api.market_membership(symbol))
+                    market_badge = (
+                        " 🅰️Alpha Only" if membership == "ALPHA_ONLY"
+                        else " 🟡Spot+Alpha" if membership == "SPOT_ALPHA"
+                        else " 🟢Spot"
+                    )
                     lines.append(
-                        f"{i}) {symbol}{alpha_badge} — {analysis.coin_score:.1f}/100 — {status}\n"
+                        f"{i}) {symbol}{market_badge} — {analysis.coin_score:.1f}/100 — {status}\n"
                         f"   {reason_text}"
                     )
 
@@ -1998,7 +2037,8 @@ class TelegramCommands:
             symbol += "USDT"
         try:
             market_kind = self.api.market_kind(symbol)
-            is_alpha = self.api.is_alpha_symbol(symbol)
+            membership = self.api.market_membership(symbol)
+            is_alpha = membership in {"SPOT_ALPHA", "ALPHA_ONLY"}
             if market_kind == "UNKNOWN":
                 return f"❌ {symbol} غير موجودة على Binance Spot ولا ضمن Binance Alpha."
 
@@ -2095,13 +2135,17 @@ class TelegramCommands:
 
             lines = [f"🔬 التحليل الشامل — {symbol}", f"💰 السعر: {price:.8f}"]
             lines += ["", "🅰️ Binance Alpha"]
-            if is_alpha:
-                source_text = "Binance Spot (مع وجود العملة أيضًا في Alpha)" if market_kind == "SPOT" else "Binance Alpha"
+            if membership == "SPOT_ALPHA":
+                lines.append("• نوع السوق: 🟡 Spot + Alpha")
                 lines.append("• العملة ضمن Binance Alpha: نعم ✅")
-                lines.append(f"• مصدر بيانات هذا التحليل: {source_text}")
-                if market_kind == "ALPHA":
-                    lines.append("• ⚠️ Alpha سوق مبكر وعالي المخاطر؛ البوت يتعامل معه Paper Trading فقط")
+                lines.append("• مصدر بيانات هذا التحليل: Binance Spot — بدون تكرارها كمرشح Alpha")
+            elif membership == "ALPHA_ONLY":
+                lines.append("• نوع السوق: 🅰️ Alpha Only")
+                lines.append("• العملة ضمن Binance Alpha: نعم ✅")
+                lines.append("• مصدر بيانات هذا التحليل: Binance Alpha")
+                lines.append("• ⚠️ Alpha سوق مبكر وعالي المخاطر؛ البوت يتعامل معه Paper Trading فقط")
             else:
+                lines.append("• نوع السوق: 🟢 Spot")
                 lines.append("• العملة ضمن Binance Alpha: لا")
                 lines.append("• مصدر بيانات هذا التحليل: Binance Spot")
             lines += ["", "📊 الفريمات"]
@@ -2349,7 +2393,8 @@ class TelegramCommands:
             lines.append(f"• مصدر الحركة: {movement_source}")
             lines.append(f"• جودة الدخول الآن: {entry_quality}")
             lines.append(f"• توافق الفريمات: {frame_note}")
-            lines.append(f"• Binance Alpha: {'نعم ✅' if is_alpha else 'لا'}")
+            market_summary = "🅰️ Alpha Only" if membership == "ALPHA_ONLY" else "🟡 Spot + Alpha" if membership == "SPOT_ALPHA" else "🟢 Spot"
+            lines.append(f"• نوع السوق: {market_summary}")
             if critical_support:
                 lines.append(f"• الدعم الحاسم: {critical_support:.8f}")
             if structural_resistance:
@@ -2529,6 +2574,7 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     )
     analysis.payload["candle_time"] = analysis.candle_time
     analysis.payload["market_source"] = api.market_kind(symbol)
+    analysis.payload["market_membership"] = api.market_membership(symbol)
     analysis.payload["is_binance_alpha"] = api.is_alpha_symbol(symbol)
     market = get_market_context()
     analysis.payload.update({
