@@ -2175,14 +2175,27 @@ class TelegramCommands:
 
             market = get_market_context()
             fut = self._futures_snapshot(symbol)
-            short_trend = mean([data["5M"]["trend"], data["15M"]["trend"], data["1H"]["trend"]])
-            macro_trend = mean([data["4H"]["trend"], data["1D"]["trend"], data["1W"]["trend"]])
+            # نفصل بين الاتجاه التداولي الحالي (الأهم للدخول) والاتجاه الهيكلي البعيد.
+            # هذا يمنع 1D/1W من تحويل تصحيح هابط واضح على 1H/4H إلى حكم صاعد مضلل.
+            short_trend = mean([data["5M"]["trend"], data["15M"]["trend"]])
+            trading_trend = mean([data["1H"]["trend"], data["4H"]["trend"]])
+            structural_trend = mean([data["1D"]["trend"], data["1W"]["trend"]])
+            macro_trend = trading_trend  # توافق خلفي: الحكم النهائي يعتمد الاتجاه التداولي 1H+4H.
             vol_support = mean([min(100.0, data[x]["vol"] * 50.0) for x in ("5M", "15M", "1H")])
             btc_support = max(0.0, min(100.0, market.btc_trend_score))
             deriv = float(fut.get("derivatives_score", 50.0) or 50.0)
-            upside = round(max(0.0, min(100.0, short_trend * .30 + macro_trend * .25 + vol_support * .20 + btc_support * .15 + deriv * .10)))
+
+            # قوة الاستمرار تعطي الوزن الأكبر لـ 1H/4H، ثم الزخم القصير؛ اليومي/الأسبوعي سياق لا تصريح دخول.
+            upside = round(max(0.0, min(100.0,
+                short_trend * .20 + trading_trend * .35 + structural_trend * .10
+                + vol_support * .15 + btc_support * .10 + deriv * .10
+            )))
             overbought = mean([data["15M"]["rsi"], data["1H"]["rsi"], data["4H"]["rsi"]])
-            downside = round(max(0.0, min(100.0, (100-short_trend)*.35 + (100-macro_trend)*.25 + max(0, overbought-60)*1.1 + max(0, 1-data["15M"]["vol"])*20)))
+            downside = round(max(0.0, min(100.0,
+                (100-short_trend) * .20 + (100-trading_trend) * .35
+                + (100-structural_trend) * .05 + (100-deriv) * .10
+                + max(0, overbought-60) * 1.0 + max(0, 1-data["15M"]["vol"]) * 15
+            )))
 
             lines = [f"🔬 التحليل الشامل — {symbol}", f"💰 السعر: {price:.8f}"]
             lines += ["", "🅰️ Binance Alpha"]
@@ -2345,9 +2358,9 @@ class TelegramCommands:
             mid_labels = [data[x]["trend"] for x in ("1H", "4H")]
             short_avg = mean(short_labels); mid_avg = mean(mid_labels)
             if mid_avg >= 58 and short_avg < 55:
-                frame_note = "⚠️ الاتجاه الأكبر صاعد لكن الزخم القصير يهدأ"
+                frame_note = "⚠️ الاتجاه التداولي 1H/4H صاعد لكن الزخم القصير يهدأ"
             elif mid_avg <= 42 and short_avg > 45:
-                frame_note = "⚠️ الاتجاه الأكبر هابط لكن يوجد ارتداد قصير"
+                frame_note = "⚠️ الاتجاه التداولي 1H/4H هابط؛ يوجد ارتداد قصير فقط"
             elif mid_avg >= 58 and short_avg >= 55:
                 frame_note = "🟢 الفريمات القصيرة والمتوسطة متوافقة على الصعود"
             elif mid_avg <= 42 and short_avg <= 45:
@@ -2362,8 +2375,10 @@ class TelegramCommands:
                     breakout_state = "🟢 اختراق مؤكد مبدئيًا — السعر فوق المقاومة والفوليوم داعم"
                 elif price >= nearest_r:
                     breakout_state = "🟠 اختراق ضعيف — السعر فوق المقاومة لكن الفوليوم لا يؤكد"
+                elif 0 <= dist_r <= 0.50 and v15 >= 1.15 and short_avg >= 50 and data["15M"]["trend"] >= 45:
+                    breakout_state = "🟡 محاولة اختراق — السعر ملاصق للمقاومة والزخم/الفوليوم يتحسنان"
                 elif 0 <= dist_r <= 0.50 and v15 >= 1.15:
-                    breakout_state = "🟡 محاولة اختراق — السعر ملاصق للمقاومة والفوليوم يتحسن"
+                    breakout_state = "🟡 ارتداد من الدعم قيد الاختبار — الفوليوم تحسن لكن الاتجاه لم يتحول بعد"
                 elif 0 <= dist_r <= 0.50:
                     breakout_state = "⚠️ اختبار مقاومة — السعر قريب جدًا لكن الفوليوم ضعيف"
                 else:
@@ -2392,8 +2407,10 @@ class TelegramCommands:
 
             # ميزان القوة: يحول المؤشرات إلى أسباب مفهومة بدل أرقام منفصلة.
             bull_factors, bear_factors = [], []
-            if macro_trend >= 58: bull_factors.append("الاتجاه الأكبر صاعد")
+            if trading_trend >= 58: bull_factors.append("الاتجاه التداولي 1H/4H صاعد")
+            if structural_trend >= 58: bull_factors.append("اليومي/الأسبوعي ما زال داعمًا هيكليًا")
             if short_trend >= 58: bull_factors.append("الزخم القصير صاعد")
+            if trading_trend <= 42: bear_factors.append("الاتجاه التداولي 1H/4H هابط")
             if data["1D"]["vol"] >= 1.3: bull_factors.append("فوليوم يومي داعم")
             if float(fut.get("oi_change_1h", 0) or 0) >= 2: bull_factors.append("OI يرتفع")
             if float(fut.get("taker_ratio", 1) or 1) > 1.05: bull_factors.append("Taker شراء أقوى")
@@ -2409,7 +2426,9 @@ class TelegramCommands:
             lines += ["", "⚖️ ميزان القوة"]
             lines.append("• 🟢 عوامل الصعود: " + (" + ".join(bull_factors[:5]) if bull_factors else "لا توجد عوامل قوية كافية"))
             lines.append("• 🔴 عوامل الهبوط/التصحيح: " + (" + ".join(bear_factors[:5]) if bear_factors else "لا توجد ضغوط بارزة"))
-            if upside >= downside + 15:
+            if trading_trend <= 42 and upside > downside:
+                balance_note = "يوجد دعم هيكلي/ارتداد، لكن الكفة التداولية لم تتحول للصعود بعد"
+            elif upside >= downside + 15 and trading_trend >= 50:
                 balance_note = "الكفة للصعود، لكن جودة الدخول تُحكم منفصلة"
             elif downside >= upside + 15:
                 balance_note = "الكفة للهبوط/التصحيح"
@@ -2434,8 +2453,8 @@ class TelegramCommands:
                 lines.append(f"• 🔴 كسر الدعم الحاسم {critical_support:.8f} بفوليوم بيع → ضعف واضح في الهيكل")
 
             lines += ["", f"🚀 قوة استمرار الصعود: {upside}/100", f"📉 خطر الهبوط/التصحيح: {downside}/100", "", "🧠 الخلاصة"]
-            # الحكم النهائي يعطي وزنًا أكبر للاتجاه الأكبر (4H + 1D + 1W).
-            # لا نسمح لارتداد 5M/15M/1H بمحو اتجاه هابط واضح على الفريمات الكبيرة.
+            # الحكم النهائي يعطي الوزن الأكبر للاتجاه التداولي 1H + 4H.
+            # 1D/1W سياق هيكلي، ولا يحق لهما وحدهما تحويل تصحيح 1H/4H الهابط إلى إشارة صعود.
             if macro_trend <= 42:
                 if downside >= 65:
                     verdict = "🔴 هابط — خطر الهبوط مرتفع"
@@ -2447,7 +2466,7 @@ class TelegramCommands:
                 elif upside >= 55:
                     verdict = "🟡 ميل صاعد لكن يحتاج تأكيد"
                 else:
-                    verdict = "🟡 الاتجاه الأكبر صاعد لكن الزخم الحالي ضعيف"
+                    verdict = "🟡 الاتجاه التداولي صاعد لكن الزخم الحالي ضعيف"
             elif upside >= 70:
                 verdict = "🟢 الصعود مدعوم"
             elif downside >= 65:
