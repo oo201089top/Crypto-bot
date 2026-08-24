@@ -19,8 +19,10 @@ AI Spot Trader — Paper Trading V3
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import sqlite3
 import time
 import traceback
@@ -132,6 +134,14 @@ MIN_AVERAGE_COIN_SCORE = float(os.getenv("MIN_AVERAGE_COIN_SCORE", "55"))
 COMMAND_POLL_SECONDS = float(os.getenv("COMMAND_POLL_SECONDS", "2"))
 TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") == "1"
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "/app/data/paper_trader_telegram_offset.json")
+
+# تحليل صور قوائم العملات المرسلة إلى تيليجرام.
+# نستخدم Vision فقط لاستخراج أزواج USDT الظاهرة في الصورة، ثم كل التحليل يتم من Binance نفسه.
+PHOTO_SCAN_ENABLED = os.getenv("PHOTO_SCAN_ENABLED", "1") == "1"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.6-luna").strip()
+PHOTO_SCAN_MIN_SCORE = float(os.getenv("PHOTO_SCAN_MIN_SCORE", "65"))
+PHOTO_SCAN_MAX_REPORTS = int(os.getenv("PHOTO_SCAN_MAX_REPORTS", "10"))
 
 # إنشاء مجلد التخزين الدائم بعد تعريف جميع المسارات
 for _persistent_path in (DATABASE_PATH, TELEGRAM_OFFSET_FILE):
@@ -1834,11 +1844,25 @@ class TelegramCommands:
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             print(text, flush=True)
             return
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=20,
-        )
+
+        # Telegram يقبل حتى 4096 حرفًا تقريبًا في الرسالة؛ نقسم التقارير الطويلة بأمان.
+        remaining = str(text or "")
+        chunks = []
+        while len(remaining) > 3900:
+            cut = remaining.rfind("\n", 0, 3900)
+            if cut < 1200:
+                cut = 3900
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+        if remaining:
+            chunks.append(remaining)
+
+        for chunk in chunks or [""]:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
+                timeout=20,
+            )
 
     def _status_text(self) -> str:
         position = self.broker.position()
@@ -2514,6 +2538,215 @@ class TelegramCommands:
                 lines = [f"• {row['symbol']}: {row['reason']}" for row in rows[:50]]
                 self._reply("🚫 العملات المستبعدة\n\n" + "\n".join(lines))
 
+
+    def _telegram_photo_bytes(self, message: Dict) -> bytes:
+        photos = message.get("photo") or []
+        if not photos:
+            raise RuntimeError("الرسالة لا تحتوي صورة.")
+        # Telegram يرسل عدة أحجام؛ آخر عنصر عادة أعلى دقة.
+        file_id = str(photos[-1].get("file_id") or "")
+        if not file_id:
+            raise RuntimeError("تعذر الحصول على file_id للصورة.")
+
+        meta = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=20,
+        )
+        meta.raise_for_status()
+        file_path = str(((meta.json().get("result") or {}).get("file_path")) or "")
+        if not file_path:
+            raise RuntimeError("Telegram لم يرجع مسار الصورة.")
+
+        response = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}",
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.content
+
+    @staticmethod
+    def _openai_output_text(payload: Dict) -> str:
+        # استخراج نص Responses API بدون الاعتماد على SDK خارجي.
+        direct = payload.get("output_text")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        parts = []
+        for item in payload.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content") or []:
+                if not isinstance(content, dict):
+                    continue
+                value = content.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
+        return "\n".join(parts).strip()
+
+    def _extract_usdt_symbols_from_photo(self, image_bytes: bytes) -> List[str]:
+        if not PHOTO_SCAN_ENABLED:
+            raise RuntimeError("PHOTO_SCAN_ENABLED=0")
+        if not OPENAI_API_KEY:
+            raise RuntimeError(
+                "ميزة قراءة الصور تحتاج OPENAI_API_KEY في متغيرات البيئة. "
+                "لن يحاول البوت تخمين العملات بدون Vision."
+            )
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            "اقرأ لقطة شاشة لقائمة أزواج عملات في منصة تداول. "
+            "استخرج فقط الأزواج الظاهرة فعليًا التي يكون Quote فيها USDT بالضبط. "
+            "لا تحول USDC أو FDUSD أو BTC أو ETH أو EUR إلى USDT، ولا تستنتج زوجًا غير ظاهر. "
+            "أعد النتيجة كسطر واحد فقط، رموز Binance بدون شرطة مائلة ومفصولة بفواصل، "
+            "مثال: ETHFIUSDT,ENAUSDT,EIGENUSDT. "
+            "إذا لم يوجد أي زوج USDT أعد NONE."
+        )
+
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_VISION_MODEL,
+                "input": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{image_b64}",
+                            "detail": "high",
+                        },
+                    ],
+                }],
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        answer = self._openai_output_text(response.json()).upper()
+
+        # لا نثق بالنص الخام وحده؛ نلتقط فقط Tokens تنتهي USDT.
+        symbols = re.findall(r"\b[A-Z0-9]{2,20}USDT\b", answer)
+        unique = []
+        seen = set()
+        for symbol in symbols:
+            if symbol not in seen:
+                unique.append(symbol)
+                seen.add(symbol)
+        return unique
+
+    def _photo_scan(self, message: Dict) -> None:
+        self._reply("🖼️ استلمت الصورة — أقرأ أزواج USDT الظاهرة ثم أفحصها من Binance...")
+
+        try:
+            image_bytes = self._telegram_photo_bytes(message)
+            extracted = self._extract_usdt_symbols_from_photo(image_bytes)
+        except Exception as exc:
+            self._reply(f"❌ تعذر قراءة الصورة: {exc}")
+            return
+
+        if not extracted:
+            self._reply("⚪ لم أجد أزواج USDT واضحة في الصورة.")
+            return
+
+        # تحقق من أن الزوج موجود فعلًا في Binance Spot؛ الصورة وحدها لا تكفي.
+        valid = [s for s in extracted if self.api.is_spot_symbol(s)]
+        invalid = [s for s in extracted if s not in valid]
+
+        if not valid:
+            msg = "⚪ وجدت رموزًا في الصورة لكن لا يوجد بينها زوج Binance Spot/USDT صالح حاليًا."
+            if invalid:
+                msg += "\nالمرفوض: " + ", ".join(invalid[:20])
+            self._reply(msg)
+            return
+
+        market_score = get_market_score()
+        learned_min = self.learner.effective_entry_score()
+        rows = []
+        rejected = []
+
+        for symbol in valid:
+            try:
+                risk = self.universe.risk_reason(symbol)
+                if risk:
+                    rejected.append((symbol, str(risk)))
+                    continue
+                if not self.universe.listing_year_ok(symbol):
+                    rejected.append((symbol, f"سنة الإدراج أقدم من {MIN_LISTING_YEAR}"))
+                    continue
+
+                analysis = get_analysis(symbol, market_score)
+                reasons = entry_rejection_reasons(analysis, learned_min)
+                rows.append((analysis.coin_score, symbol, analysis, reasons))
+            except Exception as exc:
+                rejected.append((symbol, f"خطأ تحليل: {exc}"))
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+
+        # المرشح = درجة فنية كافية. لا يعني BUY؛ حالة الدخول تبقى ظاهرة منفصلة.
+        qualified = [row for row in rows if row[0] >= PHOTO_SCAN_MIN_SCORE]
+        selected = qualified[:max(1, PHOTO_SCAN_MAX_REPORTS)]
+
+        lines = [
+            "🔎 فحص الصورة — أزواج USDT فقط",
+            "",
+            "📌 الموجود بالصورة: " + ", ".join(valid),
+            f"• تقييم السوق: {market_score:.1f}/100",
+            f"• حد ترشيح الصورة: {PHOTO_SCAN_MIN_SCORE:.0f}/100",
+            f"• المرشحون: {len(qualified)}",
+            "",
+            "🏆 الترتيب:",
+        ]
+
+        if not rows:
+            lines.append("لا توجد عملات قابلة للتحليل بعد فلاتر الأمان.")
+        else:
+            for i, (score, symbol, analysis, reasons) in enumerate(rows, 1):
+                if score >= PHOTO_SCAN_MIN_SCORE:
+                    status = "✅ مرشح"
+                else:
+                    status = "⏳ أقل من حد الترشيح"
+                if analysis.entry_ok:
+                    entry = "🟢 دخول مؤهل"
+                elif analysis.payload.get("chase_guard"):
+                    entry = "🔴 Chase Guard"
+                else:
+                    entry = "🟡 انتظار"
+                reason_text = "، ".join(reasons[:2])
+                lines.append(
+                    f"{i}) {symbol} — {score:.1f}/100 — {status} | {entry}\n"
+                    f"   {reason_text}"
+                )
+
+        if rejected:
+            lines += ["", "🚫 مستبعدة:"]
+            for symbol, reason in rejected[:10]:
+                lines.append(f"• {symbol}: {reason}")
+
+        if invalid:
+            lines += ["", "⚪ ظهرت بالصورة لكن ليست Binance Spot/USDT صالحة:"]
+            lines.append("• " + ", ".join(invalid[:20]))
+
+        self._reply("\n".join(lines))
+
+        if not selected:
+            self._reply("⚪ لا يوجد مرشح تجاوز حد الصورة حاليًا؛ لن أرسل تقارير طويلة لعملات ضعيفة.")
+            return
+
+        self._reply(
+            f"🔬 سأرسل التقرير الشامل لـ {len(selected)} مرشح"
+            + ("ين" if len(selected) == 2 else "ات" if len(selected) > 2 else "")
+            + "، مرتبة من الأقوى للأضعف."
+        )
+        for _score, symbol, _analysis, _reasons in selected:
+            try:
+                self._reply(self._coin_report(symbol))
+            except Exception as exc:
+                self._reply(f"❌ تعذر إنشاء التقرير الشامل لـ {symbol}: {exc}")
+
     def poll_once(self) -> None:
         if not TELEGRAM_COMMANDS_ENABLED or not TELEGRAM_TOKEN:
             return
@@ -2530,6 +2763,12 @@ class TelegramCommands:
             text = str(message.get("text", ""))
             if TELEGRAM_CHAT_ID and chat != str(TELEGRAM_CHAT_ID):
                 continue
+
+            # صورة = Scan بصري لأزواج USDT الظاهرة فقط.
+            if message.get("photo"):
+                self._photo_scan(message)
+                continue
+
             self.handle(text)
         self._save_offset()
 
