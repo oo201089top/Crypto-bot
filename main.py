@@ -7,7 +7,7 @@ AI Spot Trader — Paper Trading V3
 - رأس مال Paper إجمالي 5000 USDT.
 - حتى 5 صفقات مفتوحة بالتوازي.
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
-- التعزيز فقط بعد ارتداد حقيقي مؤكد.
+- التعزيز فقط بعد ارتداد حقيقي مؤكد، ويشمل Rescue Recovery عند عودة القوة.
 - خروج عند +10 USDT صافي بعد الرسوم.
 - بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ وإلا Rescue عند صافي موجب بعد الرسوم.
 - إشعارات تيليجرام للدخول والتعزيز والبيع.
@@ -119,6 +119,7 @@ SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "
 RESCUE_COIN_SCORE = float(os.getenv("RESCUE_COIN_SCORE", "48"))
 RESCUE_TREND_15M = float(os.getenv("RESCUE_TREND_15M", "43"))
 RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
+RESCUE_RECOVERY_AVERAGING_ENABLED = os.getenv("RESCUE_RECOVERY_AVERAGING_ENABLED", "1") == "1"
 
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
@@ -4424,8 +4425,15 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
 
 
 def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
-    title = "🟡 تعزيز وهمي" if averaging else "🟢 دخول وهمي"
-    target = broker.target_price(position, TARGET_NET_PROFIT)
+    rescue_mode = bool(int(position["rescue_mode"] or 0))
+    title = "🟡 تعزيز إنقاذ وهمي" if averaging and rescue_mode else ("🟡 تعزيز وهمي" if averaging else "🟢 دخول وهمي")
+    active_target_profit = RESCUE_NET_BUFFER if rescue_mode else TARGET_NET_PROFIT
+    target = broker.target_price(position, active_target_profit)
+    target_label = (
+        f"هدف خروج الإنقاذ +{RESCUE_NET_BUFFER:.2f}$ الصافي"
+        if rescue_mode
+        else "هدف +10$ الصافي"
+    )
 
     fill_price = float(analysis.price)
     fill_fee = TRANCHE_SIZE * FEE_RATE
@@ -4442,7 +4450,7 @@ def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
             f"• عدد الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
             f"• متوسط الدخول الجديد: {position['avg_price']:.8f}\n"
             f"• إجمالي المستخدم: {position['total_cost']:.2f} USDT\n"
-            f"• هدف +10$ الصافي: {target:.8f}\n"
+            f"• {target_label}: {target:.8f}\n"
             f"• تقييم السوق: {analysis.market_score:.1f}/100\n"
             f"• تقييم العملة: {analysis.coin_score:.1f}/100\n"
             f"• تقييم الارتداد: {float(analysis.payload.get('rebound_score', 0)):.1f}/100\n"
@@ -4456,7 +4464,7 @@ def send_buy_message(position, analysis: Analysis, averaging: bool) -> None:
             f"• إجمالي الكمية: {total_qty:.8f} {base_asset}\n"
             f"• عدد الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
             f"• إجمالي المستخدم: {position['total_cost']:.2f} USDT\n"
-            f"• هدف +10$ الصافي: {target:.8f}\n"
+            f"• {target_label}: {target:.8f}\n"
             f"• تقييم السوق: {analysis.market_score:.1f}/100\n"
             f"• تقييم العملة: {analysis.coin_score:.1f}/100\n"
             f"• السبب: {analysis.reason}"
@@ -4686,21 +4694,39 @@ def manage_one_position(position, market_score: float) -> None:
         return
 
     # التعزيز فقط بعد ارتداد حقيقي، وعلى شمعة جديدة، وبعد فترة انتظار.
-    # عند دخول وضع الإنقاذ نتوقف عن إضافة رأس مال جديد.
+    # Rescue Recovery: وضع الإنقاذ لا يمنع التعزيز نهائيًا؛ لكنه لا يسمح به أثناء الهبوط.
+    # إذا عادت القوة ونجحت نفس شروط التعزيز الصارمة، يمكن استخدام الدفعات المتبقية
+    # لتخفيض المتوسط. تبقى الصفقة في Rescue ويعاد حساب هدف الخروج الموجب بعد التعزيز.
+    rescue_mode = bool(int(position["rescue_mode"] or 0))
+    rescue_recovery_ok = bool(RESCUE_RECOVERY_AVERAGING_ENABLED and rescue_mode)
     if (
         int(position["tranches"]) < MAX_TRANCHES
-        and not int(position["rescue_mode"] or 0)
+        and (not rescue_mode or rescue_recovery_ok)
         and analysis.rebound_ok
         and not bot_paused()
         and averaging_allowed(position, analysis)
     ):
-        position = broker.buy(
-            symbol,
-            current_price,
-            "تعزيز بعد ارتداد حقيقي مؤكد",
-            analysis.payload,
+        buy_reason = (
+            "تعزيز Rescue Recovery بعد عودة القوة وارتداد حقيقي مؤكد"
+            if rescue_mode
+            else "تعزيز بعد ارتداد حقيقي مؤكد"
         )
+        buy_payload = dict(analysis.payload)
+        buy_payload["rescue_recovery"] = rescue_mode
+        position = broker.buy(symbol, current_price, buy_reason, buy_payload)
+        # نحتفظ بوضع Rescue بعد التعزيز؛ الهدف يصبح رأس المال + الرسوم + هامش الإنقاذ.
         send_buy_message(position, analysis, averaging=True)
+        if rescue_mode:
+            rescue_target = broker.target_price(position, RESCUE_NET_BUFFER)
+            notifier.send(
+                f"🛟 Rescue Recovery — {symbol}\n\n"
+                f"• تم التعزيز فقط بعد ارتداد مؤكد\n"
+                f"• الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
+                f"• المتوسط الجديد: {float(position['avg_price']):.8f}\n"
+                f"• هدف خروج الإنقاذ الجديد: {rescue_target:.8f}\n"
+                f"• صافي الخروج المطلوب: +{RESCUE_NET_BUFFER:.2f} USDT بعد الرسوم\n\n"
+                "⚠️ وضع الإنقاذ ما زال فعالًا؛ لا تعزيز أثناء السقوط."
+            )
         return
 
     return
