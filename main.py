@@ -87,6 +87,14 @@ DERIVATIVES_SCORE_WEIGHT = float(os.getenv("DERIVATIVES_SCORE_WEIGHT", "0.12"))
 MOMENTUM_QUALITY_SCORE_WEIGHT = float(os.getenv("MOMENTUM_QUALITY_SCORE_WEIGHT", "0.06"))
 DERIVATIVES_BLOCK_SCORE = float(os.getenv("DERIVATIVES_BLOCK_SCORE", "38"))
 
+# Early Flow — التقاط بناء الحركة قبل الانطلاق، مع منع المطاردة المتأخرة.
+EARLY_FLOW_ENABLED = os.getenv("EARLY_FLOW_ENABLED", "1") == "1"
+EARLY_FLOW_ALERT_SCORE = float(os.getenv("EARLY_FLOW_ALERT_SCORE", "75"))
+EARLY_FLOW_ENTRY_SCORE = float(os.getenv("EARLY_FLOW_ENTRY_SCORE", "82"))
+EARLY_FLOW_MIN_TIMING = float(os.getenv("EARLY_FLOW_MIN_TIMING", "72"))
+EARLY_FLOW_MIN_TECH_SCORE = float(os.getenv("EARLY_FLOW_MIN_TECH_SCORE", "64"))
+EARLY_FLOW_ALERT_COOLDOWN_MINUTES = int(os.getenv("EARLY_FLOW_ALERT_COOLDOWN_MINUTES", "120"))
+
 # Chase Guard — يمنع شراء الحركة بعد انطلاقها إذا اجتمع الإجهاد الفني مع ضغط مشتقات سلبي.
 # لا يمنع بسبب عامل واحد منفرد حتى لا يقتل الفرص المبكرة الجيدة.
 CHASE_GUARD_ENABLED = os.getenv("CHASE_GUARD_ENABLED", "1") == "1"
@@ -2640,7 +2648,8 @@ class TelegramCommands:
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
                 "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
-                "📋 /full SYMBOLUSDT — التقرير التحليلي الكامل بكل التفاصيل\n"
+                "🌊 /early SYMBOLUSDT — اختبار Early Flow فورًا\n"
+                "📋 /full [SYMBOLUSDT] — التقرير الكامل؛ بدون رمز يستخدم آخر عملة\n"
                 "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
                 "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
                 "📃 /excluded — عرض العملات المستبعدة\n"
@@ -2673,16 +2682,61 @@ class TelegramCommands:
             symbol = parts[1].upper()
             self.db.remove_excluded(symbol)
             self._reply(f"✅ أزيل {symbol} من قائمة الاستبعاد.")
-        elif command == "/full":
+        elif command == "/early":
             if len(parts) < 2:
-                self._reply("الاستخدام: /full AKEUSDT")
+                self._reply("الاستخدام: /early KITEUSDT")
                 return
-            full_symbol = parts[1].upper().strip().lstrip("/")
+            symbol = parts[1].upper().strip().lstrip("/")
+            if not symbol.endswith("USDT"):
+                symbol += "USDT"
+            try:
+                market = get_market_context()
+                analysis = get_analysis(symbol, market.score)
+                flow = analysis.payload.get("early_flow") or {}
+                deriv = analysis.payload.get("derivatives") or {}
+                reasons = flow.get("reasons") or []
+                late = flow.get("late_reasons") or []
+                if not deriv.get("available"):
+                    self._reply(
+                        f"🌊 Early Flow — {symbol}\n\n"
+                        f"⚪ غير متاح حاليًا\n"
+                        f"السبب: {deriv.get('reason','بيانات المشتقات غير متاحة')}\n"
+                        f"📊 Technical: {analysis.coin_score:.0f}/100"
+                    )
+                    return
+                verdict = "✅ شروط Early Flow للدخول مكتملة" if flow.get("entry_ok") else ("🚨 يستحق التنبيه والمراقبة" if flow.get("strong") else "👀 لم يصل شرط التنبيه بعد")
+                why = " + ".join(reasons[:5]) or "لا توجد عوامل تدفق قوية كافية"
+                late_text = " + ".join(late[:3]) if late else "لا توجد علامة مطاردة واضحة"
+                self._reply(
+                    f"🌊 Early Flow — {symbol}\n\n"
+                    f"💰 السعر: {analysis.price:.8f}\n"
+                    f"🌊 التدفق: {float(flow.get('score',0)):.0f}/100 (تنبيه من {EARLY_FLOW_ALERT_SCORE:.0f})\n"
+                    f"⏱️ التوقيت: {float(flow.get('timing',0)):.0f}/100 — {flow.get('timing_label','')}\n"
+                    f"📊 Technical: {analysis.coin_score:.0f}/100\n"
+                    f"📈 OI 1H: {deriv.get('oi_change_1h','غير متاح')}%\n"
+                    f"⚔️ Taker: {deriv.get('taker_ratio','غير متاح')}\n"
+                    f"💸 Funding: {deriv.get('funding','غير متاح')}%\n\n"
+                    f"🧠 التدفق: {why}\n"
+                    f"🚧 التوقيت: {late_text}\n\n"
+                    f"🎯 {verdict}"
+                )
+            except Exception as exc:
+                self._reply(f"❌ تعذر اختبار Early Flow لـ {symbol}: {exc}")
+        elif command == "/full":
+            if len(parts) >= 2:
+                full_symbol = parts[1].upper().strip().lstrip("/")
+            else:
+                full_symbol = self.db.get_runtime("last_report_symbol", "").upper().strip()
+            if not full_symbol:
+                self._reply("الاستخدام: /full KITEUSDT — أو حلل عملة أولًا ثم أرسل /full")
+                return
             if not full_symbol.endswith("USDT"):
                 full_symbol += "USDT"
             self._reply(self._coin_report(full_symbol, full=True))
         elif command.startswith("/") and command[1:].upper().endswith("USDT") and command[1:].replace("_", "").isalnum():
-            self._reply(self._coin_report(command[1:].upper(), full=False))
+            symbol = command[1:].upper()
+            self.db.set_runtime("last_report_symbol", symbol)
+            self._reply(self._coin_report(symbol, full=False))
         elif command == "/excluded":
             rows = self.db.list_excluded()
             if not rows:
@@ -3233,6 +3287,165 @@ def _derivatives_momentum_quality(symbol: str, current: Dict, price: float) -> T
     return round(score, 1), label, reasons, deltas
 
 
+def _early_flow_score(analysis: Analysis, deriv: Dict) -> Dict:
+    """رادار دخول مبكر: يفصل قوة التدفق عن جودة التوقيت حتى لا نطارد حركة متأخرة."""
+    p = analysis.payload
+    score = 45.0
+    reasons: List[str] = []
+
+    taker = deriv.get("taker_ratio")
+    oi1h = deriv.get("oi_change_1h")
+    funding = deriv.get("funding")
+    top_pos = deriv.get("top_positions_ls")
+    global_ls = deriv.get("long_short")
+    fs = deriv.get("futures_spot_ratio")
+    deltas = deriv.get("momentum_deltas") or {}
+    oi_accel = deltas.get("oi_acceleration")
+    taker_delta = deltas.get("taker_delta")
+
+    if oi1h is not None:
+        oi1h = float(oi1h)
+        if oi1h >= 5:
+            score += 13; reasons.append(f"OI يتوسع بقوة +{oi1h:.1f}%")
+        elif oi1h >= 2:
+            score += 8; reasons.append(f"OI يتوسع +{oi1h:.1f}%")
+        elif oi1h < -2:
+            score -= 8; reasons.append("OI ينكمش")
+
+    if oi_accel is not None:
+        oi_accel = float(oi_accel)
+        if oi_accel >= 2:
+            score += 8; reasons.append("OI يتسارع")
+        elif oi_accel <= -2:
+            score -= 5; reasons.append("نمو OI يتباطأ")
+
+    if taker is not None:
+        taker = float(taker)
+        if taker >= 1.15:
+            score += 13; reasons.append(f"Taker شراء قوي {taker:.2f}")
+        elif taker >= 1.05:
+            score += 8; reasons.append(f"Taker شراء أعلى {taker:.2f}")
+        elif taker <= 0.85:
+            score -= 10; reasons.append(f"Taker بيع قوي {taker:.2f}")
+    if taker_delta is not None and float(taker_delta) >= 0.12:
+        score += 5; reasons.append("Taker يتحسن")
+
+    vol15 = float(p.get("volume_15m", 0) or 0)
+    vol5 = float(p.get("volume_5m", 0) or 0)
+    vol_build = float(p.get("volume_build", 0) or 0)
+    if max(vol5, vol15) >= 1.2:
+        score += 9; reasons.append("Spot Volume يتوسع")
+    elif max(vol5, vol15) >= 0.9:
+        score += 4
+    if vol_build >= 1.05:
+        score += 6; reasons.append("الفوليوم يتزايد تدريجيًا")
+
+    if funding is not None:
+        f = float(funding)
+        if -0.01 <= f <= 0.02:
+            score += 5; reasons.append("Funding ما زال معتدلًا")
+        elif f >= 0.05:
+            score -= 8; reasons.append("Funding مزدحم")
+
+    if top_pos is not None and global_ls is not None:
+        tp, gl = float(top_pos), float(global_ls)
+        if tp >= 1.10 and gl <= 1.10:
+            score += 6; reasons.append("الكبار Long والجمهور غير مزدحم")
+        elif tp >= 2.5 and gl >= 1.5:
+            score -= 5; reasons.append("ازدحام Long واسع")
+
+    if fs is not None and float(fs) >= 8:
+        score -= 5; reasons.append("العقود تهيمن على Spot")
+
+    # Entry Timing مستقل: 100 = مبكر/قريب من البنية، 0 = مطاردة متأخرة.
+    timing = 100.0
+    late_reasons: List[str] = []
+    rsi15 = float(p.get("rsi_15m", 50) or 50)
+    rsi1h = float(p.get("rsi_1h", 50) or 50)
+    change1h = float(p.get("change_1h_pct", 0) or 0)
+    change15 = float(p.get("change_15m_pct", 0) or 0)
+    ext = float(p.get("extension_atr", 0) or 0)
+
+    if change1h > 3.0:
+        penalty = min(40.0, (change1h - 3.0) * 6.0)
+        timing -= penalty; late_reasons.append(f"ارتفع 1H +{change1h:.1f}%")
+    if change15 > 1.8:
+        timing -= min(20.0, (change15 - 1.8) * 8.0); late_reasons.append(f"قفزة 15M +{change15:.1f}%")
+    if rsi15 > 68:
+        timing -= min(25.0, (rsi15 - 68) * 1.5); late_reasons.append(f"RSI 15M مرتفع {rsi15:.1f}")
+    if rsi1h > 72:
+        timing -= min(20.0, (rsi1h - 72) * 1.2); late_reasons.append(f"RSI 1H مرتفع {rsi1h:.1f}")
+    if ext > 0.85:
+        timing -= min(30.0, (ext - 0.85) * 20.0); late_reasons.append(f"بعيد عن EMA/ATR {ext:.2f}")
+    timing = max(0.0, min(100.0, timing))
+    score = max(0.0, min(100.0, score))
+
+    if timing >= 80:
+        timing_label = "🟢 مبكر"
+    elif timing >= 60:
+        timing_label = "🟡 مقبول"
+    elif timing >= 35:
+        timing_label = "🟠 متأخر نسبيًا"
+    else:
+        timing_label = "🔴 متأخر — ممنوع المطاردة"
+
+    strong = bool(score >= EARLY_FLOW_ALERT_SCORE and timing >= 60)
+    entry_ok = bool(
+        EARLY_FLOW_ENABLED
+        and score >= EARLY_FLOW_ENTRY_SCORE
+        and timing >= EARLY_FLOW_MIN_TIMING
+        and float(analysis.coin_score) >= EARLY_FLOW_MIN_TECH_SCORE
+        and 42 <= rsi15 <= 68
+        and float(p.get("trend_5m", 0) or 0) >= 50
+        and float(p.get("trend_15m", 0) or 0) >= 50
+        and max(vol5, vol15) >= 0.90
+    )
+    return {
+        "score": round(score, 1), "strong": strong, "entry_ok": entry_ok,
+        "reasons": reasons[:6], "timing": round(timing, 1),
+        "timing_label": timing_label, "late_reasons": late_reasons[:5],
+    }
+
+
+def _early_flow_alert_allowed(symbol: str) -> bool:
+    key = f"early_flow_alert_at:{symbol.upper()}"
+    raw = db.get_runtime(key, "")
+    if raw:
+        try:
+            last = datetime.fromisoformat(raw)
+            minutes = (datetime.now(timezone.utc) - last).total_seconds() / 60.0
+            if minutes < EARLY_FLOW_ALERT_COOLDOWN_MINUTES:
+                return False
+        except Exception:
+            pass
+    db.set_runtime(key, utc_now())
+    return True
+
+
+def send_early_flow_alert(analysis: Analysis) -> None:
+    flow = analysis.payload.get("early_flow") or {}
+    if not flow.get("strong") or not _early_flow_alert_allowed(analysis.symbol):
+        return
+    deriv = analysis.payload.get("derivatives") or {}
+    reasons = flow.get("reasons") or []
+    why = " + ".join(reasons[:4]) if reasons else "تدفق مبكر متعدد العوامل"
+    text = (
+        f"🚨 Early Flow — {analysis.symbol}\n\n"
+        f"💰 السعر: {analysis.price:.8f}\n"
+        f"🌊 قوة التدفق: {float(flow.get('score',0)):.0f}/100\n"
+        f"⏱️ توقيت الدخول: {float(flow.get('timing',0)):.0f}/100 — {flow.get('timing_label','')}\n"
+        f"📈 OI 1H: {deriv.get('oi_change_1h','غير متاح')}%\n"
+        f"⚔️ Taker: {deriv.get('taker_ratio','غير متاح')}\n"
+        f"💸 Funding: {deriv.get('funding','غير متاح')}%\n\n"
+        f"🧠 السبب: {why}\n"
+        + ("✅ مرشح دخول مبكر للبوت إذا بقيت الحماية سليمة." if flow.get("entry_ok") else "👀 مراقبة مبكرة — لم تكتمل شروط الدخول بعد.")
+    )
+    notifier.send_once(
+        f"EARLY_FLOW:{analysis.symbol}:{int(time.time() // (EARLY_FLOW_ALERT_COOLDOWN_MINUTES*60))}",
+        text, {"symbol": analysis.symbol, "early_flow": flow, "derivatives": deriv},
+    )
+
+
 def get_derivatives_snapshot(symbol: str) -> Dict:
     if not DERIVATIVES_ENABLED or api.market_kind(symbol) != "SPOT":
         return {"available": False, "reason": "لا توجد مشتقات Binance Futures موثوقة لهذا السوق"}
@@ -3449,11 +3662,23 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     analysis.payload["chase_guard"] = chase_guard
     analysis.payload["chase_guard_reasons"] = chase_reasons
 
+    # Early Flow: مسار مبكر محافظ، لكنه لا يتجاوز أمان السوق أو المشتقات أو Chase Guard.
+    early_flow = {"score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "غير متاح", "reasons": []}
+    if EARLY_FLOW_ENABLED and isinstance(deriv, dict) and deriv.get("available"):
+        try:
+            early_flow = _early_flow_score(analysis, deriv)
+        except Exception as exc:
+            early_flow = {"score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "خطأ", "reasons": [str(exc)]}
+    analysis.payload["early_flow"] = early_flow
+
     # قرار الدخول النهائي:
     # setup الفني + التقييم بعد المشتقات + أمان السوق + لا تحذير مشتقات قوي + لا مطاردة مركبة.
+    normal_entry_ok = bool(analysis.payload.get("entry_setup_ok") and analysis.coin_score >= learned_min)
+    early_entry_ok = bool(early_flow.get("entry_ok"))
+    analysis.payload["normal_entry_ok"] = normal_entry_ok
+    analysis.payload["early_flow_entry_ok"] = early_entry_ok
     analysis.entry_ok = bool(
-        analysis.payload.get("entry_setup_ok")
-        and analysis.coin_score >= learned_min
+        (normal_entry_ok or early_entry_ok)
         and market.market_safe
         and not derivative_block
         and not chase_guard
@@ -3463,7 +3688,10 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     elif chase_guard:
         analysis.reason = "انتظار — Chase Guard: " + " + ".join(chase_reasons[:4])
     elif analysis.entry_ok:
-        analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
+        if early_entry_ok and not normal_entry_ok:
+            analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100"
+        else:
+            analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
     return analysis
 
 
@@ -3740,6 +3968,12 @@ def scan_for_entry(market_score: float) -> None:
                 analysis.payload,
             )
 
+            # تنبيه تلقائي عند ظهور تدفق مبكر قوي حتى لو لم تكتمل صفقة الدخول بعد.
+            try:
+                send_early_flow_alert(analysis)
+            except Exception as exc:
+                print(f"Early Flow alert error {symbol}: {exc}", flush=True)
+
             if analysis.entry_ok and (
                 best is None
                 or analysis.coin_score > best.coin_score
@@ -3776,10 +4010,15 @@ def scan_for_entry(market_score: float) -> None:
             print(f"Entry blocked {fresh.symbol}: {reason}", flush=True)
             return
 
+        buy_reason = (
+            "دخول Early Flow مبكر — V3"
+            if fresh.payload.get("early_flow_entry_ok") and not fresh.payload.get("normal_entry_ok")
+            else "دخول مبكر قبل الانطلاق — V3"
+        )
         position = broker.buy(
             fresh.symbol,
             fresh.price,
-            "دخول مبكر قبل الانطلاق — V3",
+            buy_reason,
             fresh.payload,
         )
         best = fresh
