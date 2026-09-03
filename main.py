@@ -4,9 +4,9 @@ AI Spot Trader — Paper Trading V3
 
 مشروع مستقل عن بوت الإشارات:
 - تداول وهمي فقط.
-- رأس مال 1000 USDT.
-- صفقة واحدة.
-- 4 دفعات × 250 USDT.
+- رأس مال Paper إجمالي 3000 USDT.
+- حتى 3 صفقات مفتوحة بالتوازي.
+- لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد.
 - خروج عند +10 USDT صافي بعد الرسوم.
 - بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ وإلا Rescue عند صافي موجب بعد الرسوم.
@@ -45,13 +45,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
 
-PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "3000"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 TRANCHE_SIZE = float(os.getenv("TRANCHE_SIZE", "250"))
 MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
 STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "V3")
 RESCUE_NET_BUFFER = float(os.getenv("RESCUE_NET_BUFFER", "0.50"))
+TIME_STALL_HOURS = float(os.getenv("TIME_STALL_HOURS", "72"))
 
 # دخول مبكر / منع مطاردة العملات بعد الانطلاق
 ENTRY_RSI_MIN = float(os.getenv("ENTRY_RSI_MIN", "46"))
@@ -393,8 +395,21 @@ class Database:
                 ),
             )
 
-    def get_open_trade(self):
+    def get_open_trades(self):
+        """Return all currently open trades, oldest first."""
         with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM trades WHERE status='OPEN' ORDER BY id ASC"
+            ).fetchall()
+
+    def get_open_trade(self, symbol: Optional[str] = None):
+        """Return one open trade. If symbol is supplied, return that symbol's trade."""
+        with self.connect() as conn:
+            if symbol:
+                return conn.execute(
+                    "SELECT * FROM trades WHERE status='OPEN' AND symbol=? ORDER BY id DESC LIMIT 1",
+                    (symbol.upper(),),
+                ).fetchone()
             return conn.execute(
                 "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -1610,8 +1625,11 @@ class PaperBroker:
         self.db = database
         self.risk_guard = None
 
-    def position(self):
-        return self.db.get_open_trade()
+    def positions(self):
+        return self.db.get_open_trades()
+
+    def position(self, symbol: Optional[str] = None):
+        return self.db.get_open_trade(symbol)
 
     def buy(
         self,
@@ -1627,13 +1645,21 @@ class PaperBroker:
             if risk:
                 raise RuntimeError(f"BUY BLOCKED BY RISK GUARD: {risk}")
 
-        position = self.position()
-
-        if position and position["symbol"] != symbol:
-            raise RuntimeError("يوجد مركز مفتوح لعملة أخرى")
+        symbol = symbol.upper()
+        position = self.position(symbol)
+        open_positions = self.positions()
 
         if position and int(position["tranches"]) >= MAX_TRANCHES:
-            raise RuntimeError("تم استخدام جميع الدفعات")
+            raise RuntimeError("تم استخدام جميع دفعات هذه الصفقة")
+
+        if not position and len(open_positions) >= MAX_OPEN_POSITIONS:
+            raise RuntimeError("تم الوصول للحد الأقصى من الصفقات المفتوحة")
+
+        # كل صفقة لها ميزانية مستقلة 1000$ افتراضيًا (4 × 250)،
+        # مع حماية إضافية لإجمالي رأس المال الوهمي.
+        used_capital = sum(float(p["total_cost"] or 0) for p in open_positions)
+        if used_capital + TRANCHE_SIZE > PAPER_BALANCE + 1e-9:
+            raise RuntimeError("لا يوجد رصيد Paper كافٍ للدفعة الجديدة")
 
         trade_id = (
             int(position["id"])
@@ -1661,7 +1687,7 @@ class PaperBroker:
             trade_id,
             int(payload.get("candle_time", payload.get("open_time", 0)) or 0),
         )
-        updated = self.position()
+        updated = self.position(symbol)
         self.db.add_trade_event(
             trade_id, symbol, "BUY", price, self.pnl(updated, price) if updated else None,
             {**payload, "reason": reason, "tranches": int(updated["tranches"]) if updated else 0},
@@ -1995,56 +2021,70 @@ class TelegramCommands:
         return "\n".join(lines)
 
     def _status_text(self) -> str:
-        position = self.broker.position()
+        positions = self.broker.positions()
         state = "متوقف مؤقتًا ⏸️" if bot_paused() else "يعمل 🟢"
-        if not position:
-            trade_text = "لا توجد صفقة مفتوحة."
-        else:
-            try:
-                price = self.api.market_price(str(position["symbol"]))
-                pnl = self.broker.pnl(position, price)
-                target = self.broker.target_price(position, TARGET_NET_PROFIT)
-                timing_text = self._trade_timing_text(position)
-                trade_text = (
-                    f"الصفقة: {position['symbol']}\n"
-                    f"الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
-                    f"المستخدم: {position['total_cost']:.2f} USDT\n"
-                    f"المتوسط: {position['avg_price']:.8f}\n"
-                    f"{'الربح الحالي' if pnl >= 0 else 'الخسارة الحالية'}: {pnl:+.2f} USDT\n"
-                    f"هدف +10$: {target:.8f}\n"
-                    f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}\n\n"
-                    f"{timing_text}"
-                )
-            except Exception as exc:
-                trade_text = f"تعذر قراءة الصفقة: {exc}"
         cooldown = "نعم" if post_exit_cooldown_active() else "لا"
-        return f"🤖 حالة البوت: {state}\n• حد الدخول المتعلم: {self.learner.effective_entry_score():.1f}/100\n• انتظار بعد آخر بيع: {cooldown}\n\n{trade_text}"
+
+        if not positions:
+            trade_text = "لا توجد صفقات مفتوحة."
+        else:
+            blocks = []
+            for slot, position in enumerate(positions, start=1):
+                try:
+                    price = self.api.market_price(str(position["symbol"]))
+                    pnl = self.broker.pnl(position, price)
+                    target = self.broker.target_price(position, TARGET_NET_PROFIT)
+                    timing_text = self._trade_timing_text(position)
+                    blocks.append(
+                        f"🟢 الصفقة {slot}/{MAX_OPEN_POSITIONS}: {position['symbol']}\n"
+                        f"الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
+                        f"المستخدم: {position['total_cost']:.2f} / {TRANCHE_SIZE * MAX_TRANCHES:.2f} USDT\n"
+                        f"المتوسط: {position['avg_price']:.8f}\n"
+                        f"{'الربح الحالي' if pnl >= 0 else 'الخسارة الحالية'}: {pnl:+.2f} USDT\n"
+                        f"هدف +10$: {target:.8f}\n"
+                        f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}\n"
+                        f"Time-Stall: {'نعم ⏳ — إعادة تقييم قوية' if time_stall_active(position) else 'لا'}\n\n"
+                        f"{timing_text}"
+                    )
+                except Exception as exc:
+                    blocks.append(f"🟢 الصفقة {slot}/{MAX_OPEN_POSITIONS}: {position['symbol']}\nتعذر قراءة الصفقة: {exc}")
+            trade_text = "\n\n━━━━━━━━━━━━\n\n".join(blocks)
+
+        used = sum(float(p["total_cost"] or 0) for p in positions)
+        return (
+            f"🤖 حالة البوت: {state}\n"
+            f"• حد الدخول المتعلم: {self.learner.effective_entry_score():.1f}/100\n"
+            f"• انتظار بعد آخر بيع: {cooldown}\n"
+            f"• الصفقات المفتوحة: {len(positions)}/{MAX_OPEN_POSITIONS}\n"
+            f"• رأس المال المستخدم: {used:.2f}/{PAPER_BALANCE:.2f} USDT\n\n"
+            f"{trade_text}"
+        )
 
     def _stats_text(self) -> str:
         row = self.db.trade_stats()
-        position = self.broker.position()
+        positions = self.broker.positions()
 
-        if position:
-            try:
-                current_price = self.api.market_price(str(position["symbol"]))
-                current_pnl = self.broker.pnl(position, current_price)
-                pnl_label = "الربح الحالي" if current_pnl >= 0 else "الخسارة الحالية"
-                open_text = (
-                    f"\n\n🟢 الصفقات المفتوحة: 1\n"
-                    f"• العملة: {position['symbol']}\n"
-                    f"• الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
-                    f"• المستخدم: {position['total_cost']:.2f} USDT\n"
-                    f"• متوسط الدخول: {position['avg_price']:.8f}\n"
-                    f"• السعر الحالي: {current_price:.8f}\n"
-                    f"• {pnl_label}: {current_pnl:+.2f} USDT"
-                )
-            except Exception as exc:
-                open_text = (
-                    f"\n\n🟢 الصفقات المفتوحة: 1\n"
-                    f"• تعذر قراءة تفاصيل الصفقة: {exc}"
-                )
+        if positions:
+            details = []
+            total_open_pnl = 0.0
+            for position in positions:
+                try:
+                    current_price = self.api.market_price(str(position["symbol"]))
+                    current_pnl = self.broker.pnl(position, current_price)
+                    total_open_pnl += current_pnl
+                    details.append(
+                        f"• {position['symbol']}: {position['tranches']}/{MAX_TRANCHES} دفعات | "
+                        f"{float(position['total_cost']):.2f}$ | PnL {current_pnl:+.2f}$"
+                    )
+                except Exception as exc:
+                    details.append(f"• {position['symbol']}: تعذر القراءة ({exc})")
+            open_text = (
+                f"\n\n🟢 الصفقات المفتوحة: {len(positions)}/{MAX_OPEN_POSITIONS}\n"
+                + "\n".join(details)
+                + f"\n• صافي PnL المفتوح: {total_open_pnl:+.2f} USDT"
+            )
         else:
-            open_text = "\n\n⚪ الصفقات المفتوحة: 0"
+            open_text = f"\n\n⚪ الصفقات المفتوحة: 0/{MAX_OPEN_POSITIONS}"
 
         return (
             "📊 إحصائيات Paper Trading\n\n"
@@ -2642,8 +2682,8 @@ class TelegramCommands:
                 return "\n".join(lines)
 
             # التقرير الافتراضي مختصر وموجّه للقرار؛ كل الحسابات التفصيلية أعلاه تبقى فعالة.
-            position = self.broker.position()
-            same_position = bool(position and str(position["symbol"]).upper() == symbol)
+            position = self.broker.position(symbol)
+            same_position = bool(position)
             rescue_mode = bool(same_position and int(position["rescue_mode"] or 0))
 
             if same_position:
@@ -4001,6 +4041,24 @@ def post_exit_cooldown_active() -> bool:
         return False
 
 
+def trade_age_hours(position) -> float:
+    """عمر الصفقة بالساعات من أول دخول، ولا يعاد ضبطه عند التعزيز."""
+    raw = position["opened_at"]
+    if not raw:
+        return 0.0
+    try:
+        opened = datetime.fromisoformat(str(raw))
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - opened.astimezone(timezone.utc)).total_seconds() / 3600.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def time_stall_active(position) -> bool:
+    return TIME_STALL_HOURS > 0 and trade_age_hours(position) >= TIME_STALL_HOURS
+
+
 def averaging_allowed(position, analysis: Analysis) -> bool:
     last_candle = int(position["last_buy_candle_time"] or 0)
     if analysis.candle_time and analysis.candle_time == last_candle:
@@ -4062,11 +4120,7 @@ def rescue_reason_for(position, analysis: Analysis) -> Optional[str]:
     return " | ".join(reasons) if reasons else None
 
 
-def manage_open_position(market_score: float) -> bool:
-    position = broker.position()
-
-    if not position:
-        return False
+def manage_one_position(position, market_score: float) -> None:
 
     symbol = str(position["symbol"])
     current_price = api.market_price(symbol)
@@ -4089,7 +4143,7 @@ def manage_open_position(market_score: float) -> bool:
             "تحقق هدف +10$ الصافي",
         )
         learner.record_closed_trade(position, realized)
-        return True
+        return
 
     analysis = get_analysis(symbol, market_score)
 
@@ -4102,6 +4156,31 @@ def manage_open_position(market_score: float) -> bool:
         analysis.payload,
     )
 
+    if time_stall_active(position):
+        age_hours = trade_age_hours(position)
+        stall_payload = {
+            "age_hours": round(age_hours, 2),
+            "threshold_hours": TIME_STALL_HOURS,
+            "pnl": pnl,
+            "coin_score": analysis.coin_score,
+            "market_score": market_score,
+            "rescue_mode": int(position["rescue_mode"] or 0),
+            **analysis.payload,
+        }
+        notifier.send_once(
+            f"TIME_STALL:{position['id']}",
+            (
+                f"⏳ Time-Stall — {symbol}\n\n"
+                f"• عمر الصفقة: {age_hours / 24:.1f} يوم\n"
+                f"• الربح/الخسارة الحالية: {pnl:+.2f} USDT\n"
+                f"• تقييم العملة: {analysis.coin_score:.1f}/100\n"
+                f"• وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}\n\n"
+                "🔎 تجاوزت الصفقة حد الانتظار وتم رفعها لإعادة تقييم قوية. "
+                "لا بيع بخسارة ولا تعزيز لمجرد مرور الوقت."
+            ),
+            stall_payload,
+        )
+
     # لا نخرج عند التعادل لمجرد أن هناك تعزيزًا. نستمر نحو +10$ ما دام السيناريو سليمًا.
     # إذا ضعفت العملة/السوق أو أصبحت تحت Monitoring/Delisting نثبت وضع الإنقاذ.
     rescue_reason = rescue_reason_for(position, analysis)
@@ -4111,7 +4190,7 @@ def manage_open_position(market_score: float) -> bool:
             int(position["id"]), symbol, "RESCUE_MODE", current_price, pnl,
             {"reason": rescue_reason, **analysis.payload},
         )
-        position = broker.position()
+        position = broker.position(symbol)
 
     # وضع الإنقاذ: لا بيع بخسارة؛ الخروج فقط بصافي موجب بعد كل الرسوم.
     if int(position["rescue_mode"] or 0) and pnl >= RESCUE_NET_BUFFER:
@@ -4119,7 +4198,7 @@ def manage_open_position(market_score: float) -> bool:
         realized = broker.sell_all(position, current_price, reason, {"pnl": pnl})
         send_sell_message(position, current_price, realized, reason)
         learner.record_closed_trade(position, realized)
-        return True
+        return
 
     # التعزيز فقط بعد ارتداد حقيقي، وعلى شمعة جديدة، وبعد فترة انتظار.
     # عند دخول وضع الإنقاذ نتوقف عن إضافة رأس مال جديد.
@@ -4137,102 +4216,103 @@ def manage_open_position(market_score: float) -> bool:
             analysis.payload,
         )
         send_buy_message(position, analysis, averaging=True)
-        return True
+        return
 
-    return True
+    return
 
+def manage_open_positions(market_score: float) -> int:
+    """Manage every open trade independently and return how many remain open."""
+    positions = list(broker.positions())
+    for position in positions:
+        try:
+            manage_one_position(position, market_score)
+        except Exception as exc:
+            print(f"Manage error {position['symbol']}: {exc}", flush=True)
+            traceback.print_exc()
+    return len(broker.positions())
 
 def scan_for_entry(market_score: float) -> None:
     if bot_paused() or post_exit_cooldown_active():
         return
-    best: Optional[Analysis] = None
+
+    open_positions = list(broker.positions())
+    free_slots = MAX_OPEN_POSITIONS - len(open_positions)
+    if free_slots <= 0:
+        return
+
+    open_symbols = {str(p["symbol"]).upper() for p in open_positions}
+    candidates: List[Analysis] = []
 
     for symbol, _quote_volume in universe.scan_batch():
         try:
+            if symbol.upper() in open_symbols:
+                continue
+
             if not universe.listing_year_ok(symbol):
                 db.add_analysis(
-                    symbol,
-                    market_score,
-                    0,
-                    "REJECT",
+                    symbol, market_score, 0, "REJECT",
                     f"العملة مدرجة قبل {MIN_LISTING_YEAR}",
                     {"min_listing_year": MIN_LISTING_YEAR},
                 )
                 continue
 
             analysis = get_analysis(symbol, market_score)
-
             db.add_analysis(
-                symbol,
-                market_score,
-                analysis.coin_score,
+                symbol, market_score, analysis.coin_score,
                 "BUY" if analysis.entry_ok else "WAIT",
-                analysis.reason,
-                analysis.payload,
+                analysis.reason, analysis.payload,
             )
 
-            # تنبيه تلقائي عند ظهور تدفق مبكر قوي حتى لو لم تكتمل صفقة الدخول بعد.
             try:
                 send_early_flow_alert(analysis)
             except Exception as exc:
                 print(f"Early Flow alert error {symbol}: {exc}", flush=True)
 
-            if analysis.entry_ok and (
-                best is None
-                or analysis.coin_score > best.coin_score
-            ):
-                best = analysis
+            if analysis.entry_ok:
+                candidates.append(analysis)
 
         except Exception as exc:
-            db.add_analysis(
-                symbol,
-                market_score,
-                0,
-                "ERROR",
-                str(exc),
-                {},
-            )
+            db.add_analysis(symbol, market_score, 0, "ERROR", str(exc), {})
 
-    if best:
-        # فحص أخير لحظة التنفيذ: لا Monitoring/Delisting ولا سوق غير آمن.
-        risk = universe.risk_reason(best.symbol, force_refresh=True)
+    candidates.sort(key=lambda a: a.coin_score, reverse=True)
+    entered = 0
+
+    for candidate in candidates:
+        if entered >= free_slots:
+            break
+        if broker.position(candidate.symbol):
+            continue
+
+        risk = universe.risk_reason(candidate.symbol, force_refresh=True)
         market = get_market_context()
         if risk:
-            db.add_analysis(best.symbol, market_score, best.coin_score, "BLOCK", risk, best.payload)
-            print(f"Entry blocked {best.symbol}: {risk}", flush=True)
-            return
+            db.add_analysis(candidate.symbol, market.score, candidate.coin_score, "BLOCK", risk, candidate.payload)
+            continue
         if not market.market_safe:
             print(f"Entry blocked: market unsafe | {market.reason}", flush=True)
-            return
+            break
 
-        # إعادة تحقق لحظة التنفيذ من Chase Guard والمشتقات بدل الاعتماد على Snapshot أقدم.
-        fresh = get_analysis(best.symbol, market.score)
+        fresh = get_analysis(candidate.symbol, market.score)
         if not fresh.entry_ok or fresh.payload.get("chase_guard"):
             reason = fresh.reason or "انتظار — فشل فحص الدخول النهائي"
             db.add_analysis(fresh.symbol, market.score, fresh.coin_score, "BLOCK", reason, fresh.payload)
-            print(f"Entry blocked {fresh.symbol}: {reason}", flush=True)
-            return
+            continue
 
         buy_reason = (
             "دخول Early Flow مبكر — V3"
             if fresh.payload.get("early_flow_entry_ok") and not fresh.payload.get("normal_entry_ok")
             else "دخول مبكر قبل الانطلاق — V3"
         )
-        position = broker.buy(
-            fresh.symbol,
-            fresh.price,
-            buy_reason,
-            fresh.payload,
-        )
-        best = fresh
-        send_buy_message(position, best, averaging=False)
-    else:
+        position = broker.buy(fresh.symbol, fresh.price, buy_reason, fresh.payload)
+        send_buy_message(position, fresh, averaging=False)
+        entered += 1
+
+    if entered == 0:
         print(
-            f"Scan complete: no entry | batch={MAX_ANALYZE_PER_CYCLE} | "
-            f"market={market_score:.1f}",
+            f"Scan complete: no entry | free_slots={free_slots} | "
+            f"batch={MAX_ANALYZE_PER_CYCLE} | market={market_score:.1f}",
             flush=True,
         )
-
 
 def run_forever() -> None:
     print(
@@ -4242,7 +4322,7 @@ def run_forever() -> None:
     )
     notifier.send_once(
         f"STARTUP:{STRATEGY_VERSION}",
-        f"🤖 AI Spot Trader {STRATEGY_VERSION} بدأ العمل\n\n🧪 Paper Trading فقط — لا توجد أموال حقيقية.",
+        f"🤖 AI Spot Trader {STRATEGY_VERSION} بدأ العمل\n\n🧪 Paper Trading فقط — حتى {MAX_OPEN_POSITIONS} صفقات × 1000$، ولا توجد أموال حقيقية.",
         {"version": STRATEGY_VERSION},
     )
 
@@ -4254,7 +4334,8 @@ def run_forever() -> None:
             market_context = get_market_context()
             current_market_score = market_context.score
 
-            if not manage_open_position(current_market_score):
+            open_count = manage_open_positions(current_market_score)
+            if open_count < MAX_OPEN_POSITIONS:
                 scan_for_entry(current_market_score)
 
         except KeyboardInterrupt:
