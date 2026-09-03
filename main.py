@@ -84,6 +84,7 @@ DERIVATIVES_ENABLED = os.getenv("DERIVATIVES_ENABLED", "1") == "1"
 DERIVATIVES_CACHE_SECONDS = int(os.getenv("DERIVATIVES_CACHE_SECONDS", "60"))
 DERIVATIVES_MIN_TECH_SCORE = float(os.getenv("DERIVATIVES_MIN_TECH_SCORE", "64"))
 DERIVATIVES_SCORE_WEIGHT = float(os.getenv("DERIVATIVES_SCORE_WEIGHT", "0.12"))
+MOMENTUM_QUALITY_SCORE_WEIGHT = float(os.getenv("MOMENTUM_QUALITY_SCORE_WEIGHT", "0.06"))
 DERIVATIVES_BLOCK_SCORE = float(os.getenv("DERIVATIVES_BLOCK_SCORE", "38"))
 
 # Chase Guard — يمنع شراء الحركة بعد انطلاقها إذا اجتمع الإجهاد الفني مع ضغط مشتقات سلبي.
@@ -297,6 +298,23 @@ CREATE TABLE IF NOT EXISTS trade_events (
     pnl REAL,
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS derivatives_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    price REAL NOT NULL DEFAULT 0,
+    taker_ratio REAL,
+    oi_change_1h REAL,
+    funding REAL,
+    global_ls REAL,
+    top_positions_ls REAL,
+    futures_spot_ratio REAL,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_derivatives_snapshots_symbol_id
+ON derivatives_snapshots(symbol, id DESC);
 """
 
 
@@ -604,6 +622,31 @@ class Database:
                 FROM trades WHERE status='CLOSED'
                 """
             ).fetchone()
+
+    def last_derivatives_snapshot(self, symbol: str):
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM derivatives_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),),
+            ).fetchone()
+
+    def add_derivatives_snapshot(self, symbol: str, price: float, payload: Dict) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO derivatives_snapshots(
+                    ts,symbol,price,taker_ratio,oi_change_1h,funding,global_ls,
+                    top_positions_ls,futures_spot_ratio,payload
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    utc_now(), symbol.upper(), float(price or 0),
+                    payload.get("taker_ratio"), payload.get("oi_change_1h"),
+                    payload.get("funding"), payload.get("long_short"),
+                    payload.get("top_positions_ls"), payload.get("futures_spot_ratio"),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
 
     def notification_seen(self, event_key: str) -> bool:
         with self.connect() as conn:
@@ -1879,7 +1922,7 @@ class TelegramCommands:
                     f"الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
                     f"المستخدم: {position['total_cost']:.2f} USDT\n"
                     f"المتوسط: {position['avg_price']:.8f}\n"
-                    f"الربح الحالي: {pnl:+.2f} USDT\n"
+                    f"{'الربح الحالي' if pnl >= 0 else 'الخسارة الحالية'}: {pnl:+.2f} USDT\n"
                     f"هدف +10$: {target:.8f}\n"
                     f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}"
                 )
@@ -2085,7 +2128,7 @@ class TelegramCommands:
         # نفس محرك المشتقات المستخدم في قرار بوت المضاربة، حتى لا يختلف /USDT عن التداول الوهمي.
         return get_derivatives_snapshot(symbol)
 
-    def _coin_report(self, symbol: str) -> str:
+    def _coin_report(self, symbol: str, full: bool = False) -> str:
         symbol = symbol.upper().strip()
         if not symbol.endswith("USDT"):
             symbol += "USDT"
@@ -2301,6 +2344,12 @@ class TelegramCommands:
                     lines.append(f"• 🧭 Derivatives Lean: {lean_ar} — {fut['derivatives_score']:.0f}/100 | الثقة {conf_ar}")
                     if fut.get("derivatives_reasons"):
                         lines.append("• السبب: " + " + ".join(fut['derivatives_reasons'][:4]))
+                    if fut.get("momentum_quality") is not None:
+                        mq = float(fut.get("momentum_quality", 50) or 50)
+                        mq_label = str(fut.get("momentum_label") or "مختلط")
+                        lines.append(f"• ⚡ جودة الزخم: {mq:.0f}/100 — {mq_label}")
+                        if fut.get("momentum_reasons"):
+                            lines.append("• تغير الزخم: " + " + ".join(fut["momentum_reasons"][:3]))
 
             lines += ["", "🚨 الحركة اللحظية"]
             if move_1m is None:
@@ -2494,7 +2543,83 @@ class TelegramCommands:
                 lines.append(f"• اختراق {nearest_r:.8f} بإغلاق وفوليوم قوي يقوي استمرار الصعود.")
             if nearest_s: lines.append(f"• كسر {nearest_s:.8f} بإغلاق وفوليوم بيع قوي يرفع خطر الهبوط.")
             lines.append("• الدرجات احتمالية تحليلية وليست ضمانًا لاتجاه السعر.")
-            return "\n".join(lines)
+
+            if full:
+                return "\n".join(lines)
+
+            # التقرير الافتراضي مختصر وموجّه للقرار؛ كل الحسابات التفصيلية أعلاه تبقى فعالة.
+            position = self.broker.position()
+            same_position = bool(position and str(position["symbol"]).upper() == symbol)
+            rescue_mode = bool(same_position and int(position["rescue_mode"] or 0))
+
+            if same_position:
+                current_pnl = self.broker.pnl(position, price)
+                if rescue_mode:
+                    decision = "🛟 إنقاذ — لا تعزيز؛ انتظار خروج آمن بصافي موجب"
+                elif entry_quality.startswith("🔴") or entry_quality.startswith("🟠"):
+                    decision = "🟡 احتفاظ ومراقبة — لا تعزيز الآن"
+                else:
+                    decision = "🟢 الصفقة مدعومة — التعزيز فقط عند تحقق شروط الارتداد"
+            else:
+                current_pnl = None
+                if entry_quality.startswith("🟢"):
+                    decision = "🟢 فرصة جيدة — مع انتظار تأكيد التنفيذ"
+                elif entry_quality.startswith("🔴"):
+                    decision = "🔴 لا تدخل الآن — مطاردة/تشبع"
+                else:
+                    decision = "🟡 انتظار — جودة الدخول غير مكتملة"
+
+            reason_bits = []
+            if overbought:
+                reason_bits.append("تشبع شرائي")
+            if v15 < 0.8:
+                reason_bits.append("فوليوم لحظي ضعيف")
+            if distance_r_pct is not None and 0 <= distance_r_pct <= 0.75:
+                reason_bits.append("مقاومة قريبة")
+            mq = fut.get("momentum_quality") if isinstance(fut, dict) else None
+            if mq is not None and float(mq) < 50:
+                reason_bits.append("الزخم يبرد")
+            if not reason_bits:
+                if trading_trend >= 58:
+                    reason_bits.append("الاتجاه التداولي صاعد")
+                elif trading_trend <= 42:
+                    reason_bits.append("الاتجاه التداولي هابط")
+                else:
+                    reason_bits.append("الإشارات مختلطة وتحتاج تأكيد")
+
+            resistance_show = nearest_r or structural_resistance
+            compact_lines = [
+                f"🔬 {symbol} — {price:.8f}",
+                "",
+            ]
+            if same_position:
+                compact_lines += [
+                    f"💼 الصفقة: مفتوحة — {position['tranches']}/{MAX_TRANCHES} دفعات | المتوسط {float(position['avg_price']):.8f}",
+                    f"💰 {'الربح' if current_pnl >= 0 else 'الخسارة'} الحالية: {current_pnl:+.2f} USDT",
+                ]
+            compact_lines += [
+                f"🎯 القرار: {decision}",
+                f"📈 الاتجاه: {verdict}",
+                f"🚀 قوة الصعود: {upside}/100 | 📉 خطر التصحيح: {downside}/100",
+            ]
+            if mq is not None:
+                compact_lines.append(f"⚡ جودة الزخم: {float(mq):.0f}/100 — {fut.get('momentum_label','مختلط')}")
+            compact_lines += [
+                f"⚠️ السبب: {' + '.join(reason_bits[:3])}",
+                "",
+                f"🛡️ الدعم: {critical_support:.8f}" if critical_support else "🛡️ الدعم: لا يوجد مستوى موثوق قريب",
+                f"🧱 المقاومة: {resistance_show:.8f}" if resistance_show else "🧱 المقاومة: لا توجد مقاومة موثوقة قريبة",
+                f"₿ السوق: {btc_state} — {movement_source}",
+            ]
+            if fut.get("available") is False:
+                compact_lines.append("⚔️ المشتقات: غير متاحة")
+            else:
+                dscore = fut.get("derivatives_score")
+                if dscore is not None:
+                    compact_lines.append(f"⚔️ المشتقات: {fut.get('lean','NEUTRAL')} {float(dscore):.0f}/100")
+            compact_lines.append(f"🏷️ السوق: {market_summary}")
+            compact_lines += ["", "📋 للتفاصيل الكاملة: /full " + symbol]
+            return "\n".join(compact_lines)
         except Exception as exc:
             return f"❌ تعذر تحليل {symbol}: {exc}"
 
@@ -2514,7 +2639,8 @@ class TelegramCommands:
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
-                "🔬 /[رمز العملة]USDT — تحليل شامل من 5M إلى 1W + يوضح Binance Alpha (مثال: /SPKUSDT)\n"
+                "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
+                "📋 /full SYMBOLUSDT — التقرير التحليلي الكامل بكل التفاصيل\n"
                 "🚫 /exclude SYMBOL السبب — إضافة عملة إلى قائمة الاستبعاد\n"
                 "✅ /include SYMBOL — إزالة عملة من قائمة الاستبعاد\n"
                 "📃 /excluded — عرض العملات المستبعدة\n"
@@ -2547,8 +2673,16 @@ class TelegramCommands:
             symbol = parts[1].upper()
             self.db.remove_excluded(symbol)
             self._reply(f"✅ أزيل {symbol} من قائمة الاستبعاد.")
+        elif command == "/full":
+            if len(parts) < 2:
+                self._reply("الاستخدام: /full AKEUSDT")
+                return
+            full_symbol = parts[1].upper().strip().lstrip("/")
+            if not full_symbol.endswith("USDT"):
+                full_symbol += "USDT"
+            self._reply(self._coin_report(full_symbol, full=True))
         elif command.startswith("/") and command[1:].upper().endswith("USDT") and command[1:].replace("_", "").isalnum():
-            self._reply(self._coin_report(command[1:].upper()))
+            self._reply(self._coin_report(command[1:].upper(), full=False))
         elif command == "/excluded":
             rows = self.db.list_excluded()
             if not rows:
@@ -3015,6 +3149,90 @@ def _derivatives_score(snapshot: Dict) -> Tuple[float, str, str, List[str]]:
     return round(score, 1), lean, confidence, reasons
 
 
+def _derivatives_momentum_quality(symbol: str, current: Dict, price: float) -> Tuple[float, str, List[str], Dict]:
+    """يقارن آخر Snapshot مشتقات بالقراءة الحالية لقياس جودة الزخم، لا اتجاه السعر وحده."""
+    previous = db.last_derivatives_snapshot(symbol)
+    score = 50.0
+    reasons: List[str] = []
+    deltas: Dict = {}
+
+    if previous:
+        prev_price = _safe_float(previous["price"], 0.0)
+        price_delta = pct_change(price, prev_price) if prev_price > 0 else 0.0
+        deltas["price_pct"] = round(price_delta, 3)
+
+        def _delta(field: str, previous_field: str) -> Optional[float]:
+            cur = current.get(field)
+            old = previous[previous_field]
+            if cur is None or old is None:
+                return None
+            return float(cur) - float(old)
+
+        taker_delta = _delta("taker_ratio", "taker_ratio")
+        oi_delta = _delta("oi_change_1h", "oi_change_1h")
+        funding_delta = _delta("funding", "funding")
+        top_delta = _delta("top_positions_ls", "top_positions_ls")
+        deltas.update({
+            "taker_delta": None if taker_delta is None else round(taker_delta, 3),
+            "oi_acceleration": None if oi_delta is None else round(oi_delta, 3),
+            "funding_delta": None if funding_delta is None else round(funding_delta, 5),
+            "top_positions_delta": None if top_delta is None else round(top_delta, 3),
+        })
+
+        taker = current.get("taker_ratio")
+        oi1h = current.get("oi_change_1h")
+        funding = current.get("funding")
+
+        if taker_delta is not None:
+            if price_delta > 0.15 and taker_delta <= -0.20:
+                score -= 8; reasons.append("السعر يصعد لكن Taker انقلب للبيع")
+            elif price_delta > 0.15 and taker_delta >= 0.15:
+                score += 9; reasons.append("السعر يصعد وTaker يتحسن")
+            elif price_delta < -0.15 and taker_delta <= -0.15:
+                score -= 8; reasons.append("الهبوط يتزامن مع زيادة ضغط البيع")
+
+        if oi_delta is not None and oi1h is not None:
+            if price_delta > 0.15 and float(oi1h) > 0 and oi_delta <= -2.0:
+                score -= 5; reasons.append("نمو OI يتباطأ أثناء الصعود")
+            elif price_delta > 0.15 and float(oi1h) > 0 and oi_delta >= 2.0:
+                score += 8; reasons.append("OI يتسارع مع الصعود")
+            elif price_delta < -0.15 and float(oi1h) > 2:
+                score -= 8; reasons.append("مراكز جديدة تدخل أثناء الهبوط")
+
+        if funding_delta is not None and funding is not None:
+            if price_delta > 0 and funding_delta > 0.004:
+                score -= 2; reasons.append("Funding يرتفع واللونغ يزدحم تدريجيًا")
+            elif funding_delta < -0.004 and price_delta > 0:
+                score += 3; reasons.append("Funding يهدأ رغم استمرار الصعود")
+
+        global_ls = current.get("long_short")
+        top_pos = current.get("top_positions_ls")
+        if global_ls is not None and top_pos is not None:
+            if float(global_ls) <= 1.0 and 1.15 <= float(top_pos) <= 2.5:
+                score += 6; reasons.append("الكبار Long والجمهور غير مزدحم")
+            elif float(global_ls) <= 1.0 and float(top_pos) > 2.5:
+                score += 3; reasons.append("الكبار ما زالوا Long والجمهور متوازن")
+            elif float(global_ls) >= 1.6 and float(top_pos) >= 2.0:
+                score -= 6; reasons.append("ازدحام Long عند الجمهور والكبار")
+    else:
+        reasons.append("أول قراءة — نحتاج Snapshot لاحق لقياس تغير الزخم")
+
+    fs = current.get("futures_spot_ratio")
+    if previous and fs is not None and float(fs) >= 5:
+        score -= 2; reasons.append("الحركة تقودها العقود أكثر من Spot")
+
+    score = max(0.0, min(100.0, score))
+    if score >= 75:
+        label = "🟢 يتقوى"
+    elif score >= 50:
+        label = "🟡 مستمر/مختلط"
+    elif score >= 30:
+        label = "🟠 يبرد"
+    else:
+        label = "🔴 يتدهور"
+    return round(score, 1), label, reasons, deltas
+
+
 def get_derivatives_snapshot(symbol: str) -> Dict:
     if not DERIVATIVES_ENABLED or api.market_kind(symbol) != "SPOT":
         return {"available": False, "reason": "لا توجد مشتقات Binance Futures موثوقة لهذا السوق"}
@@ -3109,6 +3327,19 @@ def get_derivatives_snapshot(symbol: str) -> Dict:
     out["lean"] = lean
     out["confidence"] = confidence
     out["derivatives_reasons"] = reasons
+
+    # جودة الزخم تقارن القراءة الحالية بالسابقة: Taker/OI/Funding/ازدحام المراكز مع حركة السعر.
+    try:
+        current_price = api.market_price(symbol)
+        mq, mq_label, mq_reasons, mq_deltas = _derivatives_momentum_quality(symbol, out, current_price)
+        out["momentum_quality"] = mq
+        out["momentum_label"] = mq_label
+        out["momentum_reasons"] = mq_reasons
+        out["momentum_deltas"] = mq_deltas
+        db.add_derivatives_snapshot(symbol, current_price, out)
+    except Exception as exc:
+        out["momentum_quality_error"] = str(exc)
+
     return api._cache_set(cache_key, out)
 
 
@@ -3156,6 +3387,16 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         analysis.payload["technical_coin_score"] = round(technical_score, 1)
         analysis.payload["coin_score"] = analysis.coin_score
         analysis.payload["derivatives_adjustment"] = round(analysis.coin_score - technical_score, 1)
+
+    # جودة الزخم طبقة تأكيد ناعمة وليست شرط منع مستقلًا: تؤثر بنطاق صغير فقط.
+    momentum_quality = deriv.get("momentum_quality") if isinstance(deriv, dict) else None
+    if momentum_quality is not None:
+        before_momentum = float(analysis.coin_score)
+        momentum_adjusted = before_momentum + (float(momentum_quality) - 50.0) * MOMENTUM_QUALITY_SCORE_WEIGHT
+        analysis.coin_score = round(max(0.0, min(100.0, momentum_adjusted)), 1)
+        analysis.payload["coin_score"] = analysis.coin_score
+        analysis.payload["momentum_quality"] = float(momentum_quality)
+        analysis.payload["momentum_quality_adjustment"] = round(analysis.coin_score - before_momentum, 1)
 
     derivative_block = bool(
         isinstance(deriv, dict)
