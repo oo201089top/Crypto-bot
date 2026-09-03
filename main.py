@@ -179,6 +179,11 @@ LEARNING_CONTEXT_MIN_SAMPLES = int(os.getenv("LEARNING_CONTEXT_MIN_SAMPLES", "20
 LEARNING_CONTEXT_MAX_ADJUST = float(os.getenv("LEARNING_CONTEXT_MAX_ADJUST", "4.0"))
 LEARNING_SIGNAL_WINDOW = int(os.getenv("LEARNING_SIGNAL_WINDOW", "500"))
 
+# Squeeze Radar — انقسام الكبار/الجمهور + OI + Taker/Volume مع عقوبة هيمنة الرافعة.
+# رادار/ميزة تعلم فقط؛ لا يفتح صفقة بمفرده.
+SQUEEZE_RADAR_ENABLED = os.getenv("SQUEEZE_RADAR_ENABLED", "1") == "1"
+SQUEEZE_STRONG_SCORE = float(os.getenv("SQUEEZE_STRONG_SCORE", "70"))
+
 # فلتر السوق المرن
 MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
 EXCEPTIONAL_MARKET_FLOOR = float(os.getenv("EXCEPTIONAL_MARKET_FLOOR", "48"))
@@ -1756,6 +1761,16 @@ class AdaptiveLearner:
                     scores.append(max(0.0, 1.0 - abs(float(cur_flow[key]) - float(old_flow[key])) / scale))
                 except (TypeError, ValueError):
                     pass
+
+        cur_squeeze = current.get("squeeze") or {}
+        old_squeeze = old.get("squeeze") or {}
+        if cur_squeeze.get("score") is not None and old_squeeze.get("score") is not None:
+            try:
+                scores.append(max(0.0, 1.0 - abs(float(cur_squeeze["score"]) - float(old_squeeze["score"])) / 30.0))
+            except (TypeError, ValueError):
+                pass
+        if cur_squeeze.get("divergence") is not None and old_squeeze.get("divergence") is not None:
+            scores.append(1.0 if bool(cur_squeeze.get("divergence")) == bool(old_squeeze.get("divergence")) else 0.0)
 
         cur_deriv = current.get("derivatives") or {}
         old_deriv = old.get("derivatives") or {}
@@ -3667,6 +3682,132 @@ def _derivatives_momentum_quality(symbol: str, current: Dict, price: float) -> T
     return round(score, 1), label, reasons, deltas
 
 
+def _squeeze_score(analysis: Analysis, deriv: Dict) -> Dict:
+    """
+    Squeeze Radar 0..100.
+    يلتقط النمط: الجمهور Short مقابل الكبار Long + توسع OI + ضغط شراء/Volume.
+    ويعاقب اعتماد الحركة المفرط على Futures مقابل Spot.
+    لا يسمح بالدخول بمفرده؛ يُحفظ كميزة في Learning V4.
+    """
+    if not SQUEEZE_RADAR_ENABLED or not isinstance(deriv, dict) or not deriv.get("available"):
+        return {
+            "score": 0.0, "strong": False, "label": "غير متاح",
+            "divergence": False, "reasons": [], "risk_reasons": [],
+        }
+
+    p = analysis.payload or {}
+    score = 35.0
+    reasons = []
+    risks = []
+
+    crowd = deriv.get("long_short")
+    top_accounts = deriv.get("top_accounts_ls")
+    top_positions = deriv.get("top_positions_ls")
+    oi1h = deriv.get("oi_change_1h")
+    taker = deriv.get("taker_ratio")
+    funding = deriv.get("funding")
+    fs = deriv.get("futures_spot_ratio")
+    mq = deriv.get("momentum_quality")
+
+    crowd_v = _safe_float(crowd, 1.0) if crowd is not None else None
+    top_acc_v = _safe_float(top_accounts, 1.0) if top_accounts is not None else None
+    top_pos_v = _safe_float(top_positions, 1.0) if top_positions is not None else None
+
+    big_ls_candidates = [x for x in (top_acc_v, top_pos_v) if x is not None]
+    big_ls = max(big_ls_candidates) if big_ls_candidates else None
+
+    divergence = bool(crowd_v is not None and big_ls is not None and crowd_v < 1.0 and big_ls > 1.10)
+    if divergence:
+        spread = big_ls - crowd_v
+        score += min(22.0, 10.0 + max(0.0, spread) * 8.0)
+        reasons.append(f"انقسام: الكبار Long {big_ls:.2f} مقابل الجمهور {crowd_v:.2f}")
+    elif crowd_v is not None and crowd_v >= 1.60:
+        score -= 8
+        risks.append(f"الجمهور مزدحم Long {crowd_v:.2f}")
+
+    if oi1h is not None:
+        oi = float(oi1h)
+        if oi >= 10:
+            score += 16; reasons.append(f"OI يتوسع بقوة +{oi:.1f}%")
+        elif oi >= 5:
+            score += 12; reasons.append(f"OI يتوسع +{oi:.1f}%")
+        elif oi >= 2:
+            score += 7; reasons.append(f"OI موجب +{oi:.1f}%")
+        elif oi <= -2:
+            score -= 8; risks.append(f"OI ينكمش {oi:.1f}%")
+
+    if taker is not None:
+        tv = float(taker)
+        if tv >= 1.20:
+            score += 12; reasons.append(f"Taker Buy قوي {tv:.2f}")
+        elif tv >= 1.05:
+            score += 7; reasons.append(f"Taker Buy أعلى {tv:.2f}")
+        elif tv <= 0.85:
+            score -= 10; risks.append(f"Taker Sell قوي {tv:.2f}")
+
+    # Spot volume confirmation from the existing technical engine.
+    vol15 = float(p.get("volume_15m", 0) or 0)
+    vol5 = float(p.get("volume_5m", 0) or 0)
+    vol_build = float(p.get("volume_build", 0) or 0)
+    best_vol = max(vol5, vol15)
+    if best_vol >= 2.0:
+        score += 12; reasons.append(f"Spot Volume مرتفع {best_vol:.1f}x")
+    elif best_vol >= 1.2:
+        score += 7; reasons.append(f"Spot Volume داعم {best_vol:.1f}x")
+    if vol_build >= 1.10:
+        score += 5; reasons.append(f"Volume Build {vol_build:.2f}x")
+
+    if funding is not None:
+        fv = float(funding)
+        if -0.02 <= fv <= 0:
+            score += 5; reasons.append("Funding غير مزدحم ويميل للسالب")
+        elif fv >= 0.05:
+            score -= 8; risks.append("Funding موجب مرتفع")
+
+    # Critical leverage-risk penalty: a Nox-like signal can work, but 64x futures/spot
+    # should not be treated as healthy spot accumulation.
+    if fs is not None:
+        fsv = float(fs)
+        if fsv >= 40:
+            score -= 24; risks.append(f"هيمنة رافعة شديدة Futures/Spot {fsv:.1f}x")
+        elif fsv >= 20:
+            score -= 16; risks.append(f"هيمنة Futures عالية جدًا {fsv:.1f}x")
+        elif fsv >= 10:
+            score -= 10; risks.append(f"Futures/Spot مرتفع {fsv:.1f}x")
+        elif fsv <= 3:
+            score += 5; reasons.append("دعم Spot أفضل من الرافعة")
+
+    if mq is not None:
+        mqv = float(mq)
+        if mqv >= 70:
+            score += 5; reasons.append(f"Momentum Quality {mqv:.0f}/100")
+        elif mqv < 35:
+            score -= 6; risks.append(f"Momentum Quality ضعيف {mqv:.0f}/100")
+
+    score = round(max(0.0, min(100.0, score)), 1)
+    strong = bool(score >= SQUEEZE_STRONG_SCORE and divergence)
+    if score >= 80:
+        label = "ضغط قوي"
+    elif score >= 70:
+        label = "ضغط محتمل"
+    elif score >= 50:
+        label = "مراقبة"
+    else:
+        label = "ضعيف"
+
+    return {
+        "score": score,
+        "strong": strong,
+        "label": label,
+        "divergence": divergence,
+        "crowd_ls": crowd_v,
+        "big_accounts_ls": big_ls,
+        "reasons": reasons,
+        "risk_reasons": risks,
+        "entry_signal": False,  # explicit: never a standalone entry trigger
+    }
+
+
 def _early_flow_score(analysis: Analysis, deriv: Dict) -> Dict:
     """رادار دخول مبكر: يفصل قوة التدفق عن جودة التوقيت حتى لا نطارد حركة متأخرة."""
     p = analysis.payload
@@ -4236,6 +4377,14 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         except Exception as exc:
             early_flow = {"mode": "ERROR", "score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "خطأ", "reasons": [str(exc)]}
     analysis.payload["early_flow"] = early_flow
+
+    # Squeeze Radar: مستقل عن قرار الدخول؛ يدخل كميزة ضمن Learning V4.
+    try:
+        squeeze = _squeeze_score(analysis, deriv)
+    except Exception as exc:
+        squeeze = {"score": 0.0, "strong": False, "label": "خطأ", "divergence": False,
+                   "reasons": [], "risk_reasons": [str(exc)], "entry_signal": False}
+    analysis.payload["squeeze"] = squeeze
 
     # Learning V4: بعد اكتمال سياق السوق/المشتقات/Early Flow، يطبق تعديلًا محافظًا
     # مبنيًا على الأنماط المشابهة السابقة. لا يتجاوز ±4 نقاط ولا يتجاوز حمايات السوق.
