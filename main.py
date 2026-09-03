@@ -4,8 +4,8 @@ AI Spot Trader — Paper Trading V3
 
 مشروع مستقل عن بوت الإشارات:
 - تداول وهمي فقط.
-- رأس مال Paper إجمالي 3000 USDT.
-- حتى 3 صفقات مفتوحة بالتوازي.
+- رأس مال Paper إجمالي 5000 USDT.
+- حتى 5 صفقات مفتوحة بالتوازي.
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد.
 - خروج عند +10 USDT صافي بعد الرسوم.
@@ -45,13 +45,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
 
-PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "3000"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "5000"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 TRANCHE_SIZE = float(os.getenv("TRANCHE_SIZE", "250"))
 MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
-STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "V3")
+STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "V4")
 RESCUE_NET_BUFFER = float(os.getenv("RESCUE_NET_BUFFER", "0.50"))
 TIME_STALL_HOURS = float(os.getenv("TIME_STALL_HOURS", "72"))
 
@@ -169,6 +169,15 @@ LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "1") == "1"
 LEARNING_MIN_TRADES = int(os.getenv("LEARNING_MIN_TRADES", "8"))
 LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "500"))
 LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
+
+# Learning V4 — تعلم سياقي من الصفقات + إشارات Early Flow المرصودة حتى بدون دخول.
+LEARNING_V4_ENABLED = os.getenv("LEARNING_V4_ENABLED", "1") == "1"
+LEARNING_SIGNAL_MIN_FLOW = float(os.getenv("LEARNING_SIGNAL_MIN_FLOW", "70"))
+LEARNING_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("LEARNING_SIGNAL_COOLDOWN_MINUTES", "120"))
+LEARNING_SIGNAL_HORIZONS_HOURS = (1, 3, 6)
+LEARNING_CONTEXT_MIN_SAMPLES = int(os.getenv("LEARNING_CONTEXT_MIN_SAMPLES", "20"))
+LEARNING_CONTEXT_MAX_ADJUST = float(os.getenv("LEARNING_CONTEXT_MAX_ADJUST", "4.0"))
+LEARNING_SIGNAL_WINDOW = int(os.getenv("LEARNING_SIGNAL_WINDOW", "500"))
 
 # فلتر السوق المرن
 MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
@@ -329,6 +338,46 @@ CREATE TABLE IF NOT EXISTS derivatives_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_derivatives_snapshots_symbol_id
 ON derivatives_snapshots(symbol, id DESC);
+
+CREATE TABLE IF NOT EXISTS early_flow_learning (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    sample_key TEXT UNIQUE NOT NULL,
+    symbol TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    price REAL NOT NULL,
+    flow_score REAL NOT NULL,
+    timing REAL NOT NULL,
+    coin_score REAL NOT NULL,
+    market_score REAL NOT NULL,
+    mode TEXT NOT NULL,
+    market_safe INTEGER NOT NULL,
+    btc_trend_score REAL,
+    btc_change_1h REAL,
+    btc_dominance REAL,
+    btc_dominance_change_1h REAL,
+    derivatives_score REAL,
+    oi_change_1h REAL,
+    taker_ratio REAL,
+    funding REAL,
+    momentum_quality REAL,
+    ret_1h REAL,
+    mfe_1h REAL,
+    mae_1h REAL,
+    ret_3h REAL,
+    mfe_3h REAL,
+    mae_3h REAL,
+    ret_6h REAL,
+    mfe_6h REAL,
+    mae_6h REAL,
+    evaluated_1h INTEGER NOT NULL DEFAULT 0,
+    evaluated_3h INTEGER NOT NULL DEFAULT 0,
+    evaluated_6h INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_early_flow_learning_due
+ON early_flow_learning(strategy_version, id DESC);
 """
 
 
@@ -785,6 +834,80 @@ class Database:
                 ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+
+
+    def add_early_flow_learning(self, analysis, sample_key: str) -> bool:
+        """Store an observational Early Flow sample. No trade is required."""
+        p = analysis.payload or {}
+        flow = p.get("early_flow") or {}
+        deriv = p.get("derivatives") or {}
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO early_flow_learning(
+                        ts,sample_key,symbol,strategy_version,price,flow_score,timing,
+                        coin_score,market_score,mode,market_safe,btc_trend_score,
+                        btc_change_1h,btc_dominance,btc_dominance_change_1h,
+                        derivatives_score,oi_change_1h,taker_ratio,funding,momentum_quality,payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        utc_now(), sample_key, analysis.symbol.upper(), STRATEGY_VERSION,
+                        float(analysis.price), float(flow.get("score", 0) or 0),
+                        float(flow.get("timing", 0) or 0), float(analysis.coin_score),
+                        float(analysis.market_score), str(flow.get("mode") or "UNAVAILABLE"),
+                        int(bool(p.get("market_safe"))),
+                        p.get("btc_trend_score"), p.get("btc_change_1h"),
+                        p.get("btc_dominance"), p.get("btc_dominance_change_1h"),
+                        deriv.get("derivatives_score"), deriv.get("oi_change_1h"),
+                        deriv.get("taker_ratio"), deriv.get("funding"),
+                        deriv.get("momentum_quality", p.get("momentum_quality")),
+                        json.dumps(p, ensure_ascii=False),
+                    ),
+                )
+                return conn.total_changes > 0
+        except sqlite3.IntegrityError:
+            return False
+
+    def pending_early_flow_learning(self, limit: int = 40):
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM early_flow_learning
+                WHERE strategy_version=?
+                  AND (evaluated_1h=0 OR evaluated_3h=0 OR evaluated_6h=0)
+                ORDER BY id ASC LIMIT ?
+                """,
+                (STRATEGY_VERSION, int(limit)),
+            ).fetchall()
+
+    def update_early_flow_outcome(
+        self, sample_id: int, horizon: int, ret: float, mfe: float, mae: float
+    ) -> None:
+        if horizon not in {1, 3, 6}:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE early_flow_learning
+                SET ret_{horizon}h=?, mfe_{horizon}h=?, mae_{horizon}h=?,
+                    evaluated_{horizon}h=1
+                WHERE id=?
+                """,
+                (float(ret), float(mfe), float(mae), int(sample_id)),
+            )
+
+    def recent_early_flow_outcomes(self, limit: int = 500):
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM early_flow_learning
+                WHERE strategy_version=? AND evaluated_3h=1 AND ret_3h IS NOT NULL
+                ORDER BY id DESC LIMIT ?
+                """,
+                (STRATEGY_VERSION, int(limit)),
             ).fetchall()
 
 
@@ -1559,8 +1682,11 @@ def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]
 
 class AdaptiveLearner:
     """
-    تعلم محافظ: لا يغير إدارة رأس المال أو عدد الدفعات.
-    فقط يعدل حد تقييم الدخول بعد وجود سجل كافٍ من الصفقات الوهمية.
+    Learning V4:
+    - يحافظ على حد دخول متعلم من نتائج Paper Trading.
+    - يحفظ سياق الدخول الكامل داخل payload: السوق/BTC/BTC.D/المشتقات/Early Flow.
+    - بعد توفر عينات كافية، يطبق تعديلًا سياقيًا صغيرًا على Coin Score
+      بدل تغيير إدارة رأس المال أو كسر شروط الحماية.
     """
 
     def __init__(self, database: Database):
@@ -1577,18 +1703,13 @@ class AdaptiveLearner:
         wins = [r for r in rows if int(r["won"]) == 1]
         losses = [r for r in rows if int(r["won"]) == 0]
         win_rate = len(wins) / len(rows)
-
         adjust = 0.0
 
-        # إذا كانت النتائج ضعيفة، يرفع صرامة الدخول.
         if win_rate < 0.45:
             adjust += min(LEARNING_MAX_ADJUST, (0.45 - win_rate) * 20)
-
-        # إذا كانت النتائج قوية ومستقرة، يسمح بهامش بسيط فقط.
         elif win_rate > 0.70 and len(wins) >= LEARNING_MIN_TRADES // 2:
             adjust -= min(3.0, (win_rate - 0.70) * 10)
 
-        # مقارنة متوسط جودة الصفقات الرابحة والخاسرة.
         if wins and losses:
             avg_win_score = mean(float(r["coin_score"]) for r in wins)
             avg_loss_score = mean(float(r["coin_score"]) for r in losses)
@@ -1596,6 +1717,114 @@ class AdaptiveLearner:
                 adjust += min(2.0, (avg_win_score - avg_loss_score) / 10)
 
         return round(max(66.0, min(82.0, MIN_ENTRY_SCORE + adjust)), 1)
+
+    @staticmethod
+    def _payload(row) -> Dict:
+        try:
+            return json.loads(row["payload"]) if row and row["payload"] else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _similarity(current: Dict, old: Dict) -> float:
+        """0..1 similarity across market, technical, derivatives and Early Flow context."""
+        pairs = [
+            ("rsi_15m", 18.0),
+            ("volume_build", 1.5),
+            ("trend_15m", 30.0),
+            ("trend_1h", 30.0),
+            ("btc_trend_score", 30.0),
+            ("btc_change_1h", 2.5),
+            ("btc_dominance_change_1h", 0.60),
+            ("momentum_quality", 35.0),
+        ]
+        scores = []
+        for key, scale in pairs:
+            a, b = current.get(key), old.get(key)
+            if a is None or b is None:
+                continue
+            try:
+                scores.append(max(0.0, 1.0 - abs(float(a) - float(b)) / scale))
+            except (TypeError, ValueError):
+                continue
+
+        cur_flow = current.get("early_flow") or {}
+        old_flow = old.get("early_flow") or {}
+        for key, scale in (("score", 30.0), ("timing", 35.0)):
+            if cur_flow.get(key) is not None and old_flow.get(key) is not None:
+                try:
+                    scores.append(max(0.0, 1.0 - abs(float(cur_flow[key]) - float(old_flow[key])) / scale))
+                except (TypeError, ValueError):
+                    pass
+
+        cur_deriv = current.get("derivatives") or {}
+        old_deriv = old.get("derivatives") or {}
+        for key, scale in (("derivatives_score", 30.0), ("oi_change_1h", 8.0),
+                           ("taker_ratio", 0.8), ("funding", 0.05)):
+            if cur_deriv.get(key) is not None and old_deriv.get(key) is not None:
+                try:
+                    scores.append(max(0.0, 1.0 - abs(float(cur_deriv[key]) - float(old_deriv[key])) / scale))
+                except (TypeError, ValueError):
+                    pass
+
+        if current.get("market_safe") is not None and old.get("market_safe") is not None:
+            scores.append(1.0 if bool(current.get("market_safe")) == bool(old.get("market_safe")) else 0.0)
+
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def context_adjustment(self, analysis) -> Tuple[float, Dict]:
+        """
+        Conservative adaptive layer. It only activates after enough completed
+        trade/signal samples and can move Coin Score by at most ±4 points.
+        """
+        if not (LEARNING_ENABLED and LEARNING_V4_ENABLED):
+            return 0.0, {"active": False, "reason": "Learning V4 disabled"}
+
+        current = analysis.payload or {}
+        observations = []
+
+        # Closed trades: outcome strength is based on realized net result.
+        for row in self.db.recent_learning(LEARNING_WINDOW, STRATEGY_VERSION):
+            old = self._payload(row)
+            sim = self._similarity(current, old)
+            if sim < 0.55:
+                continue
+            pnl = float(row["pnl"])
+            # +10$ target ~= strong positive; Rescue near +0.50 ~= weak positive.
+            outcome = max(-1.0, min(1.0, (pnl - RESCUE_NET_BUFFER) / max(TARGET_NET_PROFIT, 1.0)))
+            observations.append((sim, outcome, "trade"))
+
+        # Observational Early Flow: 3h forward return, no trade needed.
+        for row in self.db.recent_early_flow_outcomes(LEARNING_SIGNAL_WINDOW):
+            old = self._payload(row)
+            sim = self._similarity(current, old)
+            if sim < 0.55:
+                continue
+            ret3 = float(row["ret_3h"] or 0)
+            outcome = max(-1.0, min(1.0, ret3 / 3.0))
+            observations.append((sim, outcome, "signal"))
+
+        if len(observations) < LEARNING_CONTEXT_MIN_SAMPLES:
+            return 0.0, {
+                "active": False,
+                "samples": len(observations),
+                "required": LEARNING_CONTEXT_MIN_SAMPLES,
+            }
+
+        weight = sum(x[0] for x in observations) or 1.0
+        edge = sum(sim * outcome for sim, outcome, _ in observations) / weight
+        adjustment = max(-LEARNING_CONTEXT_MAX_ADJUST,
+                         min(LEARNING_CONTEXT_MAX_ADJUST, edge * LEARNING_CONTEXT_MAX_ADJUST))
+        trade_n = sum(1 for _, _, k in observations if k == "trade")
+        signal_n = len(observations) - trade_n
+        return round(adjustment, 2), {
+            "active": True,
+            "samples": len(observations),
+            "trade_samples": trade_n,
+            "signal_samples": signal_n,
+            "edge": round(edge, 3),
+            "adjustment": round(adjustment, 2),
+        }
 
     def record_closed_trade(self, position, pnl: float) -> None:
         if not LEARNING_ENABLED:
@@ -1606,13 +1835,33 @@ class AdaptiveLearner:
         if not payload:
             return
 
+        enriched = dict(payload)
+        try:
+            opened = datetime.fromisoformat(str(position["opened_at"]))
+            duration_hours = max(
+                0.0, (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0
+            )
+        except Exception:
+            duration_hours = 0.0
+
+        enriched["trade_management"] = {
+            "duration_hours": round(duration_hours, 2),
+            "tranches": int(position["tranches"] or 0),
+            "rescue_mode": int(position["rescue_mode"] or 0),
+            "rescue_reason": position["rescue_reason"],
+            "max_unrealized_pnl": float(position["max_unrealized_pnl"] or 0),
+            "min_unrealized_pnl": float(position["min_unrealized_pnl"] or 0),
+            "realized_pnl": float(pnl),
+        }
+        enriched["strategy_version"] = STRATEGY_VERSION
+
         self.db.add_learning_snapshot(
             trade_id=trade_id,
             symbol=str(position["symbol"]),
             pnl=float(pnl),
-            market_score=float(payload.get("market_score", 0) or 0),
-            coin_score=float(payload.get("coin_score", 0) or 0),
-            payload=payload,
+            market_score=float(enriched.get("market_score", 0) or 0),
+            coin_score=float(enriched.get("coin_score", 0) or 0),
+            payload=enriched,
         )
 
 
@@ -2033,7 +2282,15 @@ class TelegramCommands:
                 try:
                     price = self.api.market_price(str(position["symbol"]))
                     pnl = self.broker.pnl(position, price)
-                    target = self.broker.target_price(position, TARGET_NET_PROFIT)
+                    rescue_mode = bool(int(position["rescue_mode"] or 0))
+                    active_target_profit = RESCUE_NET_BUFFER if rescue_mode else TARGET_NET_PROFIT
+                    target = self.broker.target_price(position, active_target_profit)
+                    target_text = (
+                        f"🛟 هدف خروج الإنقاذ: {target:.8f}\n"
+                        f"💵 صافي الخروج المطلوب: +{RESCUE_NET_BUFFER:.2f} USDT بعد جميع الرسوم"
+                        if rescue_mode
+                        else f"🎯 هدف الربح +{TARGET_NET_PROFIT:.2f}$: {target:.8f}"
+                    )
                     timing_text = self._trade_timing_text(position)
                     blocks.append(
                         f"🟢 الصفقة {slot}/{MAX_OPEN_POSITIONS}: {position['symbol']}\n"
@@ -2041,8 +2298,8 @@ class TelegramCommands:
                         f"المستخدم: {position['total_cost']:.2f} / {TRANCHE_SIZE * MAX_TRANCHES:.2f} USDT\n"
                         f"المتوسط: {position['avg_price']:.8f}\n"
                         f"{'الربح الحالي' if pnl >= 0 else 'الخسارة الحالية'}: {pnl:+.2f} USDT\n"
-                        f"هدف +10$: {target:.8f}\n"
-                        f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}\n"
+                        f"{target_text}\n"
+                        f"وضع الإنقاذ: {'نعم 🛟' if rescue_mode else 'لا'}\n"
                         f"Time-Stall: {'نعم ⏳ — إعادة تقييم قوية' if time_stall_active(position) else 'لا'}\n\n"
                         f"{timing_text}"
                     )
@@ -3657,6 +3914,72 @@ def _early_flow_alert_allowed(symbol: str) -> bool:
     return True
 
 
+def record_early_flow_learning_signal(analysis: Analysis) -> None:
+    """Record strong/near-strong Early Flow observations even when no trade is opened."""
+    if not (LEARNING_ENABLED and LEARNING_V4_ENABLED and EARLY_FLOW_ENABLED):
+        return
+    flow = analysis.payload.get("early_flow") or {}
+    score = float(flow.get("score", 0) or 0)
+    if score < LEARNING_SIGNAL_MIN_FLOW:
+        return
+
+    bucket = int(time.time() // max(60, LEARNING_SIGNAL_COOLDOWN_MINUTES * 60))
+    sample_key = f"{STRATEGY_VERSION}:{analysis.symbol.upper()}:{bucket}"
+    db.add_early_flow_learning(analysis, sample_key)
+
+
+def evaluate_early_flow_learning(limit: int = 24) -> None:
+    """
+    Complete 1h/3h/6h forward outcomes for stored Early Flow observations.
+    Saves return plus MFE/MAE. This is observational learning only and never
+    opens/closes a trade.
+    """
+    if not (LEARNING_ENABLED and LEARNING_V4_ENABLED):
+        return
+
+    now = datetime.now(timezone.utc)
+    for row in db.pending_early_flow_learning(limit):
+        try:
+            ts = datetime.fromisoformat(str(row["ts"]))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_h = (now - ts).total_seconds() / 3600.0
+            symbol = str(row["symbol"])
+            start_price = float(row["price"])
+            if start_price <= 0:
+                continue
+
+            due = [h for h in LEARNING_SIGNAL_HORIZONS_HOURS
+                   if age_h >= h and not int(row[f"evaluated_{h}h"] or 0)]
+            if not due:
+                continue
+
+            max_h = max(due)
+            start_ms = int(ts.timestamp() * 1000)
+            candles = api.market_klines(
+                symbol, "5m",
+                limit=min(1000, max(30, max_h * 12 + 12)),
+                start_time=start_ms,
+            )
+            if not candles:
+                continue
+
+            for h in due:
+                target_ms = int((ts + timedelta(hours=h)).timestamp() * 1000)
+                usable = [c for c in candles if int(c.get("open_time", 0)) <= target_ms]
+                if not usable:
+                    continue
+                end_price = float(usable[-1]["close"])
+                high = max(float(c["high"]) for c in usable)
+                low = min(float(c["low"]) for c in usable)
+                ret = pct_change(end_price, start_price)
+                mfe = pct_change(high, start_price)
+                mae = pct_change(low, start_price)
+                db.update_early_flow_outcome(int(row["id"]), h, ret, mfe, mae)
+        except Exception as exc:
+            print(f"Learning V4 outcome error id={row['id']}: {exc}", flush=True)
+
+
 def send_early_flow_alert(analysis: Analysis) -> None:
     flow = analysis.payload.get("early_flow") or {}
     if not flow.get("strong") or not _early_flow_alert_allowed(analysis.symbol):
@@ -3913,6 +4236,19 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         except Exception as exc:
             early_flow = {"mode": "ERROR", "score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "خطأ", "reasons": [str(exc)]}
     analysis.payload["early_flow"] = early_flow
+
+    # Learning V4: بعد اكتمال سياق السوق/المشتقات/Early Flow، يطبق تعديلًا محافظًا
+    # مبنيًا على الأنماط المشابهة السابقة. لا يتجاوز ±4 نقاط ولا يتجاوز حمايات السوق.
+    try:
+        learning_adjust, learning_meta = learner.context_adjustment(analysis)
+        analysis.payload["learning_v4"] = learning_meta
+        if learning_adjust:
+            before_learning = float(analysis.coin_score)
+            analysis.coin_score = round(max(0.0, min(100.0, before_learning + learning_adjust)), 1)
+            analysis.payload["coin_score_before_learning_v4"] = round(before_learning, 1)
+            analysis.payload["coin_score"] = analysis.coin_score
+    except Exception as exc:
+        analysis.payload["learning_v4"] = {"active": False, "error": str(exc)}
 
     # قرار الدخول النهائي:
     # setup الفني + التقييم بعد المشتقات + أمان السوق + لا تحذير مشتقات قوي + لا مطاردة مركبة.
@@ -4264,9 +4600,10 @@ def scan_for_entry(market_score: float) -> None:
             )
 
             try:
+                record_early_flow_learning_signal(analysis)
                 send_early_flow_alert(analysis)
             except Exception as exc:
-                print(f"Early Flow alert error {symbol}: {exc}", flush=True)
+                print(f"Early Flow learning/alert error {symbol}: {exc}", flush=True)
 
             if analysis.entry_ok:
                 candidates.append(analysis)
@@ -4299,9 +4636,9 @@ def scan_for_entry(market_score: float) -> None:
             continue
 
         buy_reason = (
-            "دخول Early Flow مبكر — V3"
+            f"دخول Early Flow مبكر — {STRATEGY_VERSION}"
             if fresh.payload.get("early_flow_entry_ok") and not fresh.payload.get("normal_entry_ok")
-            else "دخول مبكر قبل الانطلاق — V3"
+            else f"دخول مبكر قبل الانطلاق — {STRATEGY_VERSION}"
         )
         position = broker.buy(fresh.symbol, fresh.price, buy_reason, fresh.payload)
         send_buy_message(position, fresh, averaging=False)
@@ -4331,6 +4668,8 @@ def run_forever() -> None:
 
         try:
             commands.poll_once()
+            # Learning V4: complete due 1h/3h/6h outcomes before making new decisions.
+            evaluate_early_flow_learning()
             market_context = get_market_context()
             current_market_score = market_context.score
 
