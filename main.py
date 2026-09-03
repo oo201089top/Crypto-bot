@@ -9,7 +9,7 @@ AI Spot Trader — Paper Trading V3
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد، ويشمل Rescue Recovery عند عودة القوة.
 - خروج عند +10 USDT صافي بعد الرسوم.
-- بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ وإلا Rescue عند صافي موجب بعد الرسوم.
+- بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ Smart Rescue الفني يحتاج 90 دقيقة + تأكيدين، مع حماية Monitoring الفورية.
 - إشعارات تيليجرام للدخول والتعزيز والبيع.
 - قاعدة بيانات SQLite كاملة.
 - استبعاد العملات الكبيرة.
@@ -119,6 +119,10 @@ SMART_AVERAGE_MIN_COIN_SCORE = float(os.getenv("SMART_AVERAGE_MIN_COIN_SCORE", "
 RESCUE_COIN_SCORE = float(os.getenv("RESCUE_COIN_SCORE", "48"))
 RESCUE_TREND_15M = float(os.getenv("RESCUE_TREND_15M", "43"))
 RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
+# Smart Rescue — لا نحكم على الصفقة من تذبذب أول الدخول.
+# Monitoring/الحظر الحقيقي يبقى فوريًا، أما الضعف الفني فيحتاج مهلة + سببين مستقلين.
+RESCUE_GRACE_MINUTES = int(os.getenv("RESCUE_GRACE_MINUTES", "90"))
+RESCUE_MIN_CONFIRMATIONS = int(os.getenv("RESCUE_MIN_CONFIRMATIONS", "2"))
 RESCUE_RECOVERY_AVERAGING_ENABLED = os.getenv("RESCUE_RECOVERY_AVERAGING_ENABLED", "1") == "1"
 
 # حماية Monitoring / Delisting من Binance
@@ -4593,24 +4597,45 @@ def averaging_allowed(position, analysis: Analysis) -> bool:
 
 
 def rescue_reason_for(position, analysis: Analysis) -> Optional[str]:
-    reasons = []
+    """
+    Smart Rescue:
+    - Monitoring أو حظر يدوي حقيقي = Rescue فوري.
+    - فشل مؤقت في التحقق من Monitoring لا يقلب صفقة قائمة إلى Rescue بمفرده.
+    - الضعف الفني/السوقي لا يُعتمد خلال مهلة أول الدخول.
+    - بعد المهلة نحتاج حدًا أدنى من التأكيدات المستقلة قبل تثبيت Rescue.
+    """
     risk = universe.risk_reason(str(position["symbol"]))
     if risk:
-        reasons.append(risk)
+        # مخاطر فعلية معروفة يجب ألا تنتظر مهلة 90 دقيقة.
+        if not str(risk).startswith("تعذر التحقق من Binance Monitoring Tag"):
+            return str(risk)
+
+    # امنح الصفقة وقتًا طبيعيًا للتنفس بعد أول دخول.
+    age_minutes = trade_age_hours(position) * 60.0
+    if RESCUE_GRACE_MINUTES > 0 and age_minutes < RESCUE_GRACE_MINUTES:
+        return None
+
+    confirmations = []
     market_safe = bool(analysis.payload.get("market_safe", False))
     dominance_available = analysis.payload.get("btc_dominance") is not None
     trend15 = float(analysis.payload.get("trend_15m", 50) or 50)
     trend1h = float(analysis.payload.get("trend_1h", 50) or 50)
     weak_coin = analysis.coin_score < RESCUE_COIN_SCORE
     weak_structure = trend15 < RESCUE_TREND_15M and trend1h < RESCUE_TREND_1H
-    # لا نحول الصفقة إلى إنقاذ بسبب انقطاع مصدر BTC.D فقط. نحتاج ضعفًا فعليًا في العملة/السوق.
-    if dominance_available and not market_safe and analysis.coin_score < 55:
-        reasons.append("السوق لم يعد آمنًا مع ضعف العملة")
+
+    # كل بند هنا تأكيد مستقل. سبب واحد فقط لا يكفي بعد الآن.
     if weak_coin:
-        reasons.append(f"تقييم العملة هبط إلى {analysis.coin_score:.1f}")
+        confirmations.append(f"تقييم العملة هبط إلى {analysis.coin_score:.1f}")
     if weak_structure:
-        reasons.append("اتجاه 15m و1h ضعيف معًا")
-    return " | ".join(reasons) if reasons else None
+        confirmations.append("اتجاه 15m و1h ضعيف معًا")
+    # لا نحسب غياب BTC.D كضعف للسوق. يلزم توفره + سوق غير آمن + ضعف ملموس بالعملة.
+    if dominance_available and not market_safe and analysis.coin_score < 55:
+        confirmations.append("السوق لم يعد آمنًا مع ضعف العملة")
+
+    required = max(1, RESCUE_MIN_CONFIRMATIONS)
+    if len(confirmations) < required:
+        return None
+    return " | ".join(confirmations)
 
 
 def manage_one_position(position, market_score: float) -> None:
