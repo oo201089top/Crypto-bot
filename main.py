@@ -28,7 +28,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -398,6 +398,15 @@ class Database:
             return conn.execute(
                 "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
             ).fetchone()
+
+    def get_buy_fills(self, trade_id: int):
+        """Return all BUY fills for a trade in execution order."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT id,ts,price,quote_amount,qty,reason FROM fills "
+                "WHERE trade_id=? AND side='BUY' ORDER BY id ASC",
+                (trade_id,),
+            ).fetchall()
 
     def create_trade(self, symbol: str) -> int:
         with self.connect() as conn:
@@ -1919,6 +1928,72 @@ class TelegramCommands:
                 timeout=20,
             )
 
+    @staticmethod
+    def _parse_db_time(value: object) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_riyadh_time(dt: Optional[datetime], include_year: bool = True) -> str:
+        if dt is None:
+            return "غير مسجل"
+        local = dt.astimezone(timezone(timedelta(hours=3)))
+        months = [
+            "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+            "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+        ]
+        hour = local.hour % 12 or 12
+        ampm = "ص" if local.hour < 12 else "م"
+        year_part = f" {local.year}" if include_year else ""
+        return f"{local.day} {months[local.month - 1]}{year_part} - {hour}:{local.minute:02d} {ampm}"
+
+    @staticmethod
+    def _format_elapsed(dt: Optional[datetime]) -> str:
+        if dt is None:
+            return "غير متاحة"
+        seconds = max(0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        parts = []
+        if days:
+            parts.append(f"{days} يوم" if days == 1 else f"{days} أيام")
+        if hours:
+            parts.append(f"{hours} ساعة")
+        if not days and (minutes or not parts):
+            parts.append(f"{minutes} دقيقة")
+        return " و".join(parts)
+
+    def _trade_timing_text(self, position) -> str:
+        fills = self.db.get_buy_fills(int(position["id"]))
+        first_fill_dt = self._parse_db_time(fills[0]["ts"]) if fills else None
+        opened_dt = self._parse_db_time(position["opened_at"])
+        entry_dt = first_fill_dt or opened_dt
+
+        lines = [
+            f"📅 الدخول: {self._format_riyadh_time(entry_dt, include_year=True)}",
+            f"⏳ مدة الصفقة: {self._format_elapsed(entry_dt)}",
+        ]
+
+        for index, fill in enumerate(fills, start=1):
+            fill_dt = self._parse_db_time(fill["ts"])
+            label = "الدفعة 1" if index == 1 else f"التعزيز {index - 1}"
+            lines.extend([
+                "",
+                f"📥 {label}: {self._format_riyadh_time(fill_dt, include_year=False)}",
+                f"💰 السعر: {float(fill['price']):.8f}",
+                f"⏳ المدة: {self._format_elapsed(fill_dt)}",
+            ])
+
+        return "\n".join(lines)
+
     def _status_text(self) -> str:
         position = self.broker.position()
         state = "متوقف مؤقتًا ⏸️" if bot_paused() else "يعمل 🟢"
@@ -1929,6 +2004,7 @@ class TelegramCommands:
                 price = self.api.market_price(str(position["symbol"]))
                 pnl = self.broker.pnl(position, price)
                 target = self.broker.target_price(position, TARGET_NET_PROFIT)
+                timing_text = self._trade_timing_text(position)
                 trade_text = (
                     f"الصفقة: {position['symbol']}\n"
                     f"الدفعات: {position['tranches']}/{MAX_TRANCHES}\n"
@@ -1936,7 +2012,8 @@ class TelegramCommands:
                     f"المتوسط: {position['avg_price']:.8f}\n"
                     f"{'الربح الحالي' if pnl >= 0 else 'الخسارة الحالية'}: {pnl:+.2f} USDT\n"
                     f"هدف +10$: {target:.8f}\n"
-                    f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}"
+                    f"وضع الإنقاذ: {'نعم 🛟' if int(position['rescue_mode'] or 0) else 'لا'}\n\n"
+                    f"{timing_text}"
                 )
             except Exception as exc:
                 trade_text = f"تعذر قراءة الصفقة: {exc}"
