@@ -4775,10 +4775,12 @@ def scan_for_entry(market_score: float) -> None:
             )
 
             try:
+                # Early Flow remains fully active for observation/Learning V4,
+                # but autonomous watch-only Telegram alerts are intentionally silent.
+                # Actual trade-entry notifications are sent by the normal buy path.
                 record_early_flow_learning_signal(analysis)
-                send_early_flow_alert(analysis)
             except Exception as exc:
-                print(f"Early Flow learning/alert error {symbol}: {exc}", flush=True)
+                print(f"Early Flow learning error {symbol}: {exc}", flush=True)
 
             if analysis.entry_ok:
                 candidates.append(analysis)
