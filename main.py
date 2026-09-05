@@ -7,7 +7,7 @@ AI Spot Trader — Paper Trading V3
 - رأس مال Paper إجمالي 10000 USDT.
 - حتى 10 صفقات مفتوحة بالتوازي.
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
-- دخول Spot فقط؛ Binance Alpha Only مستبعدة.
+- الدخول الآلي Spot فقط؛ Binance Alpha Only مستبعدة من الصفقات مع بقاء التحليل اليدوي لها متاحًا.
 - حماية Unlock: منع الدخول عند وجود Cliff Unlock مؤكد خلال 7 أيام عبر Tokenomist.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد، ويشمل Rescue Recovery عند عودة القوة.
 - خروج عند +10 USDT صافي بعد الرسوم.
@@ -74,8 +74,8 @@ BTC_MAX_DOMINANCE_RISE_1H = float(os.getenv("BTC_MAX_DOMINANCE_RISE_1H", "0.30")
 COINGECKO_GLOBAL_URL = os.getenv("COINGECKO_GLOBAL_URL", "https://api.coingecko.com/api/v3/global")
 MARKET_CONTEXT_CACHE_SECONDS = int(os.getenv("MARKET_CONTEXT_CACHE_SECONDS", "300"))
 
-# Binance Alpha — بيانات سوق عامة فقط، وتداولها هنا Paper Trading مثل بقية البوت
-BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "0") == "1"
+# Binance Alpha — التحليل اليدوي متاح فقط؛ الدخول الآلي يبقى Spot Only عبر Universe.candidates().
+BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "1") == "1"
 BINANCE_ALPHA_BASE = os.getenv("BINANCE_ALPHA_BASE", "https://www.binance.com")
 BINANCE_ALPHA_CACHE_SECONDS = int(os.getenv("BINANCE_ALPHA_CACHE_SECONDS", "300"))
 BINANCE_ALPHA_MAX_CANDIDATES = int(os.getenv("BINANCE_ALPHA_MAX_CANDIDATES", "60"))
@@ -111,6 +111,14 @@ EARLY_FLOW_ALERT_COOLDOWN_MINUTES = int(os.getenv("EARLY_FLOW_ALERT_COOLDOWN_MIN
 SPOT_EARLY_FLOW_ALERT_SCORE = float(os.getenv("SPOT_EARLY_FLOW_ALERT_SCORE", "82"))
 SPOT_EARLY_FLOW_MIN_TIMING = float(os.getenv("SPOT_EARLY_FLOW_MIN_TIMING", "75"))
 SPOT_EARLY_FLOW_MIN_TECH_SCORE = float(os.getenv("SPOT_EARLY_FLOW_MIN_TECH_SCORE", "68"))
+
+# Speculation Radar — يرفع أولوية العملات ذات النشاط المبكر داخل Binance Spot فقط.
+# لا يخفف شروط الدخول ولا يفتح صفقة بمفرده؛ هو طبقة اكتشاف/ترتيب وتشخيص.
+SPECULATION_RADAR_ENABLED = os.getenv("SPECULATION_RADAR_ENABLED", "1") == "1"
+SPECULATION_RADAR_MIN_SCORE = float(os.getenv("SPECULATION_RADAR_MIN_SCORE", "65"))
+SPECULATION_MAX_24H_PCT = float(os.getenv("SPECULATION_MAX_24H_PCT", "25"))
+SPECULATION_PRIORITY_QUOTE_WEIGHT = float(os.getenv("SPECULATION_PRIORITY_QUOTE_WEIGHT", "0.45"))
+SPECULATION_PRIORITY_TRADES_WEIGHT = float(os.getenv("SPECULATION_PRIORITY_TRADES_WEIGHT", "0.35"))
 
 # Chase Guard — يمنع شراء الحركة بعد انطلاقها إذا اجتمع الإجهاد الفني مع ضغط مشتقات سلبي.
 # لا يمنع بسبب عامل واحد منفرد حتى لا يقتل الفرص المبكرة الجيدة.
@@ -1701,6 +1709,90 @@ def entry_rejection_reasons(analysis: Analysis, learned_min: float) -> List[str]
     return reasons or ["مؤهلة للدخول"]
 
 
+def speculation_radar_score(analysis: Analysis) -> Dict:
+    """Score early speculative activity without changing the final entry gate."""
+    p = analysis.payload or {}
+    score = 35.0
+    reasons: List[str] = []
+    risks: List[str] = []
+
+    vol5 = float(p.get("volume_5m", 0) or 0)
+    vol15 = float(p.get("volume_15m", 0) or 0)
+    vol_build = float(p.get("volume_build", 0) or 0)
+    trend5 = float(p.get("trend_5m", 0) or 0)
+    trend15 = float(p.get("trend_15m", 0) or 0)
+    trend1h = float(p.get("trend_1h", 0) or 0)
+    rsi15 = float(p.get("rsi_15m", 50) or 50)
+    change15 = float(p.get("change_15m_pct", 0) or 0)
+    change1h = float(p.get("change_1h_pct", 0) or 0)
+    change24h = float(p.get("change_24h_pct", 0) or 0)
+    dist = float(p.get("distance_to_breakout_pct", 999) or 999)
+    ext = float(p.get("extension_atr", 0) or 0)
+
+    vmax = max(vol5, vol15)
+    if vmax >= 1.8:
+        score += 16; reasons.append(f"فوليوم مضاربة قوي {vmax:.2f}x")
+    elif vmax >= 1.25:
+        score += 11; reasons.append(f"الفوليوم يتوسع {vmax:.2f}x")
+    elif vmax >= 1.0:
+        score += 5
+    else:
+        score -= 7; risks.append("الفوليوم دون المتوسط")
+
+    if vol_build >= 1.25:
+        score += 14; reasons.append(f"تسارع فوليوم {vol_build:.2f}x")
+    elif vol_build >= 1.05:
+        score += 8; reasons.append(f"بناء فوليوم {vol_build:.2f}x")
+    elif vol_build < 0.8:
+        score -= 6; risks.append("الفوليوم يتراجع")
+
+    if trend5 >= 55 and trend15 >= 52:
+        score += 10; reasons.append("زخم 5M/15M يتحسن")
+    elif trend5 < 45 and trend15 < 45:
+        score -= 8; risks.append("الزخم القصير ضعيف")
+    if trend1h >= 50:
+        score += 4
+
+    if -0.5 <= change15 <= 1.8 and -1.0 <= change1h <= 3.5:
+        score += 7; reasons.append("الحركة ما زالت مبكرة")
+    if 0 <= dist <= BREAKOUT_NEAR_PCT:
+        score += 8; reasons.append(f"قريب من اختراق {dist:.2f}%")
+    elif dist < -BREAKOUT_MAX_ABOVE_PCT:
+        score -= 8; risks.append("تجاوز الاختراق وأصبح ممتدًا")
+
+    if 44 <= rsi15 <= 64:
+        score += 5
+    elif rsi15 > 70:
+        score -= 8; risks.append(f"RSI مرتفع {rsi15:.1f}")
+    if ext > MAX_ENTRY_EXTENSION_ATR:
+        score -= 10; risks.append(f"امتداد {ext:.2f} ATR")
+
+    # 24h لا يمنع الدخول وحده، لكنه يمنع الرادار من تسمية الحركة المتأخرة فرصة مبكرة.
+    if change24h > SPECULATION_MAX_24H_PCT:
+        score -= 20; risks.append(f"مطاردة محتملة: +{change24h:.1f}% خلال 24h")
+    elif 0 <= change24h <= 12:
+        score += 4
+
+    early = p.get("early_flow") or {}
+    if early.get("mode") in {"FULL", "SPOT_ONLY"}:
+        ef_score = float(early.get("score", 0) or 0)
+        timing = float(early.get("timing", 0) or 0)
+        if ef_score >= 75 and timing >= 70:
+            score += 8; reasons.append(f"Early Flow {ef_score:.0f}/{timing:.0f}")
+        elif timing < 45:
+            score -= 8; risks.append("توقيت Early Flow متأخر")
+
+    score = round(max(0.0, min(100.0, score)), 1)
+    return {
+        "score": score,
+        "strong": bool(score >= SPECULATION_RADAR_MIN_SCORE),
+        "label": "🔥 مضاربة مبكرة" if score >= 75 else "👀 مراقبة" if score >= SPECULATION_RADAR_MIN_SCORE else "هادئ",
+        "reasons": reasons[:6],
+        "risks": risks[:5],
+        "entry_signal": False,
+    }
+
+
 class AdaptiveLearner:
     """
     Learning V4:
@@ -2221,11 +2313,48 @@ class Universe:
             if quote_volume < MIN_QUOTE_VOLUME_24H:
                 continue
 
-            rows.append((symbol, quote_volume))
+            try:
+                trade_count = int(ticker.get("count", 0) or 0)
+            except (TypeError, ValueError):
+                trade_count = 0
+            try:
+                change_24h = float(ticker.get("priceChangePercent", 0) or 0)
+            except (TypeError, ValueError):
+                change_24h = 0.0
+            rows.append((symbol, quote_volume, trade_count, change_24h))
 
         # Spot فقط: لا نضيف Binance Alpha Only إلى قائمة المرشحين.
-        rows.sort(key=lambda item: item[1], reverse=True)
-        return rows[:MAX_SYMBOLS_PER_SCAN]
+        # بدل ترتيب السوق على الفوليوم الخام فقط، نبني قائمة اكتشاف للمضاربة من:
+        # سيولة كافية + كثافة تداول + حركة 24h غير متأخرة. هذا يغير أولوية الفحص فقط،
+        # ولا يغيّر شروط الشراء النهائية.
+        if not rows:
+            return []
+
+        max_qv = max((r[1] for r in rows), default=1.0) or 1.0
+        max_count = max((r[2] for r in rows), default=1) or 1
+
+        ranked = []
+        for symbol, quote_volume, trade_count, change_24h in rows:
+            qv_score = min(1.0, (quote_volume / max_qv) ** 0.25)
+            count_score = min(1.0, (trade_count / max_count) ** 0.25)
+            # نشاط سعري مبكر: حركة موجبة معتدلة أفضل من انفجار متأخر أو هبوط قوي.
+            if 0 <= change_24h <= SPECULATION_MAX_24H_PCT:
+                momentum_score = 1.0 - abs(change_24h - 6.0) / max(18.0, SPECULATION_MAX_24H_PCT)
+                momentum_score = max(0.25, min(1.0, momentum_score))
+            elif change_24h > SPECULATION_MAX_24H_PCT:
+                momentum_score = 0.05
+            else:
+                momentum_score = max(0.05, 0.35 + change_24h / 40.0)
+
+            priority = (
+                qv_score * SPECULATION_PRIORITY_QUOTE_WEIGHT
+                + count_score * SPECULATION_PRIORITY_TRADES_WEIGHT
+                + momentum_score * max(0.0, 1.0 - SPECULATION_PRIORITY_QUOTE_WEIGHT - SPECULATION_PRIORITY_TRADES_WEIGHT)
+            )
+            ranked.append((symbol, quote_volume, priority))
+
+        ranked.sort(key=lambda item: (item[2], item[1]), reverse=True)
+        return [(symbol, quote_volume) for symbol, quote_volume, _priority in ranked[:MAX_SYMBOLS_PER_SCAN]]
 
     def scan_batch(self):
         candidates = self.candidates()
@@ -2503,8 +2632,39 @@ class TelegramCommands:
                 except Exception:
                     errors += 1
 
-            rows.sort(key=lambda item: item[0], reverse=True)
+            # اعرض فرص المضاربة المبكرة أولًا، ثم Coin Score.
+            rows.sort(
+                key=lambda item: (
+                    float((item[2].payload.get("speculation_radar") or {}).get("score", 0) or 0),
+                    item[0],
+                ),
+                reverse=True,
+            )
             top = rows[:10]
+
+            # تشخيص مجمّع: نعرف فورًا ما أكثر شرط يمنع الدخول.
+            rejection_counts: Dict[str, int] = {}
+            for _score, _symbol, _analysis, _reasons, _qv in rows:
+                for reason in _reasons[:3]:
+                    key = str(reason).split(":", 1)[0]
+                    if key.startswith("السوق"):
+                        key = "السوق/BTC"
+                    elif key.startswith("التقييم"):
+                        key = "Coin Score"
+                    elif key.startswith("RSI"):
+                        key = "RSI"
+                    elif key.startswith("امتداد") or key.startswith("ارتفعت") or key.startswith("شمعة"):
+                        key = "مطاردة/امتداد"
+                    elif key.startswith("ليست في منطقة"):
+                        key = "موضع الاختراق"
+                    elif key.startswith("تجميع الحجم"):
+                        key = "Volume Build"
+                    elif key.startswith("المشتقات"):
+                        key = "المشتقات"
+                    elif key.startswith("Chase Guard"):
+                        key = "Chase Guard"
+                    rejection_counts[key] = rejection_counts.get(key, 0) + 1
+            rejection_summary = sorted(rejection_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
 
             lines = [
                 "🔎 تشخيص الفحص الحالي",
@@ -2517,8 +2677,12 @@ class TelegramCommands:
                 f"• تم تحليلهم: {checked}",
                 f"• مرفوضون بسبب سنة الإدراج: {rejected_year}",
                 f"• أخطاء API/تحليل: {errors}",
+                f"• رادار المضاربة: {'مفعل' if SPECULATION_RADAR_ENABLED else 'معطل'} — حد المراقبة {SPECULATION_RADAR_MIN_SCORE:.0f}/100",
                 "",
-                "🏆 أفضل 10 عملات حاليًا:",
+                "🚧 أكثر أسباب الرفض:" if rejection_summary else "🚧 أسباب الرفض: لا توجد بيانات",
+                *([f"• {name}: {count}" for name, count in rejection_summary] if rejection_summary else []),
+                "",
+                "🏆 أفضل 10 عملات حاليًا (أولوية المضاربة المبكرة):",
             ]
 
             if not top:
@@ -2542,9 +2706,13 @@ class TelegramCommands:
                     if flow_info.get("mode") in {"FULL", "SPOT_ONLY"}:
                         flow_mode = "Full" if flow_info.get("mode") == "FULL" else "Spot"
                         flow_text = f" | Early {flow_mode} {float(flow_info.get('score',0)):.0f}/100 توقيت {float(flow_info.get('timing',0)):.0f}"
+                    radar = analysis.payload.get("speculation_radar") or {}
+                    radar_score = float(radar.get("score", 0) or 0)
+                    radar_label = str(radar.get("label") or "هادئ")
+                    change24 = float(analysis.payload.get("change_24h_pct", 0) or 0)
                     lines.append(
-                        f"{i}) {symbol}{market_badge} — {analysis.coin_score:.1f}/100 — {status}{deriv_text}{flow_text}\n"
-                        f"   {reason_text}"
+                        f"{i}) {symbol}{market_badge} — Coin {analysis.coin_score:.1f}/100 — Radar {radar_score:.0f}/100 {radar_label} — {status}{deriv_text}{flow_text}\n"
+                        f"   24H {change24:+.1f}% | {reason_text}"
                     )
 
             return "\n".join(lines)
@@ -3147,7 +3315,7 @@ class TelegramCommands:
                 "🤖 /status أو /الحالة — عرض حالة البوت والصفقة الحالية\n"
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
-                "🔎 /scan أو /فحص — فحص السوق وعرض أفضل المرشحين وأسباب الرفض\n"
+                "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
                 "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
                 "🌊 /early SYMBOLUSDT — اختبار Early Flow فورًا\n"
                 "📋 /full [SYMBOLUSDT] — التقرير الكامل؛ بدون رمز يستخدم آخر عملة\n"
@@ -4481,6 +4649,22 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
             early_flow = {"mode": "ERROR", "score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "خطأ", "reasons": [str(exc)]}
     analysis.payload["early_flow"] = early_flow
 
+    # بيانات نشاط 24h من Binance Spot/Alpha للعرض والرادار فقط.
+    try:
+        tick24 = api.market_ticker_24h(symbol) or {}
+        analysis.payload["change_24h_pct"] = round(float(tick24.get("priceChangePercent", 0) or 0), 2)
+        analysis.payload["trade_count_24h"] = int(tick24.get("count", 0) or 0)
+        analysis.payload["quote_volume_24h"] = float(tick24.get("quoteVolume", 0) or 0)
+    except Exception:
+        analysis.payload.setdefault("change_24h_pct", 0.0)
+        analysis.payload.setdefault("trade_count_24h", 0)
+
+    # Speculation Radar: اكتشاف وترتيب فقط؛ لا يغير entry_ok ولا يتجاوز أي حماية.
+    try:
+        analysis.payload["speculation_radar"] = speculation_radar_score(analysis) if SPECULATION_RADAR_ENABLED else {"score": 0.0, "strong": False, "label": "معطل", "entry_signal": False}
+    except Exception as exc:
+        analysis.payload["speculation_radar"] = {"score": 0.0, "strong": False, "label": "خطأ", "risks": [str(exc)], "entry_signal": False}
+
     # Squeeze Radar: مستقل عن قرار الدخول؛ يدخل كميزة ضمن Learning V4.
     try:
         squeeze = _squeeze_score(analysis, deriv)
@@ -4911,7 +5095,13 @@ def scan_for_entry(market_score: float) -> None:
         except Exception as exc:
             db.add_analysis(symbol, market_score, 0, "ERROR", str(exc), {})
 
-    candidates.sort(key=lambda a: a.coin_score, reverse=True)
+    candidates.sort(
+        key=lambda a: (
+            float((a.payload.get("speculation_radar") or {}).get("score", 0) or 0),
+            a.coin_score,
+        ),
+        reverse=True,
+    )
     entered = 0
 
     for candidate in candidates:
