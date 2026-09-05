@@ -4,9 +4,11 @@ AI Spot Trader — Paper Trading V3
 
 مشروع مستقل عن بوت الإشارات:
 - تداول وهمي فقط.
-- رأس مال Paper إجمالي 5000 USDT.
-- حتى 5 صفقات مفتوحة بالتوازي.
+- رأس مال Paper إجمالي 10000 USDT.
+- حتى 10 صفقات مفتوحة بالتوازي.
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
+- دخول Spot فقط؛ Binance Alpha Only مستبعدة.
+- حماية Unlock: منع الدخول عند وجود Cliff Unlock مؤكد خلال 7 أيام عبر Tokenomist.
 - التعزيز فقط بعد ارتداد حقيقي مؤكد، ويشمل Rescue Recovery عند عودة القوة.
 - خروج عند +10 USDT صافي بعد الرسوم.
 - بعد التعزيز: يستمر لهدف +10$ ما دام السيناريو سليمًا؛ Smart Rescue الفني يحتاج 90 دقيقة + تأكيدين، مع حماية Monitoring الفورية.
@@ -45,8 +47,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
 
-PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "5000"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "10000"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 TRANCHE_SIZE = float(os.getenv("TRANCHE_SIZE", "250"))
 MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
@@ -73,13 +75,22 @@ COINGECKO_GLOBAL_URL = os.getenv("COINGECKO_GLOBAL_URL", "https://api.coingecko.
 MARKET_CONTEXT_CACHE_SECONDS = int(os.getenv("MARKET_CONTEXT_CACHE_SECONDS", "300"))
 
 # Binance Alpha — بيانات سوق عامة فقط، وتداولها هنا Paper Trading مثل بقية البوت
-BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "1") == "1"
+BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "0") == "1"
 BINANCE_ALPHA_BASE = os.getenv("BINANCE_ALPHA_BASE", "https://www.binance.com")
 BINANCE_ALPHA_CACHE_SECONDS = int(os.getenv("BINANCE_ALPHA_CACHE_SECONDS", "300"))
 BINANCE_ALPHA_MAX_CANDIDATES = int(os.getenv("BINANCE_ALPHA_MAX_CANDIDATES", "60"))
 BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H = float(os.getenv("BINANCE_ALPHA_MIN_QUOTE_VOLUME_24H", "500000"))
 # إذا تعذر معرفة سنة إدراج Alpha-only نرفضها من المضاربة بدل افتراض أنها حديثة.
 ALPHA_UNKNOWN_LISTING_FAIL_CLOSED = os.getenv("ALPHA_UNKNOWN_LISTING_FAIL_CLOSED", "1") == "1"
+
+# Token Unlock Guard — يمنع الدخول الجديد إذا كان هناك Cliff Unlock مؤكد خلال النافذة القادمة.
+# Tokenomist يحتاج API Key. Fail-Closed افتراضيًا: بدون تحقق موثوق لا ندخل صفقة جديدة.
+UNLOCK_FILTER_ENABLED = os.getenv("UNLOCK_FILTER_ENABLED", "0") == "1"
+UNLOCK_LOOKAHEAD_DAYS = int(os.getenv("UNLOCK_LOOKAHEAD_DAYS", "7"))
+UNLOCK_FAIL_CLOSED = os.getenv("UNLOCK_FAIL_CLOSED", "1") == "1"
+UNLOCK_CACHE_SECONDS = int(os.getenv("UNLOCK_CACHE_SECONDS", "21600"))
+TOKENOMIST_API_KEY = os.getenv("TOKENOMIST_API_KEY", "").strip()
+TOKENOMIST_BASE = os.getenv("TOKENOMIST_BASE", "https://api.tokenomist.ai").rstrip("/")
 
 # مشتقات — رادار مساعد لقرارات Spot/Paper فقط، ولا يفتح أي صفقة Futures.
 DERIVATIVES_ENABLED = os.getenv("DERIVATIVES_ENABLED", "1") == "1"
@@ -2057,6 +2068,109 @@ class Universe:
         self.db = database
         self.listing_year_cache: Dict[str, Optional[int]] = {}
         self.scan_cursor = 0
+        self._unlock_token_map_cache: Optional[Tuple[float, Dict[str, str]]] = None
+        self._unlock_reason_cache: Dict[str, Tuple[float, Optional[str]]] = {}
+
+    def _tokenomist_token_map(self) -> Dict[str, str]:
+        now = time.time()
+        cached = self._unlock_token_map_cache
+        if cached and now - cached[0] <= UNLOCK_CACHE_SECONDS:
+            return cached[1]
+        if not TOKENOMIST_API_KEY:
+            raise RuntimeError("TOKENOMIST_API_KEY غير موجود")
+        response = requests.get(
+            TOKENOMIST_BASE + "/v4/token/list",
+            headers={"x-api-key": TOKENOMIST_API_KEY},
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        token_map: Dict[str, str] = {}
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            token_id = str(row.get("id") or "").strip()
+            token_symbol = str(row.get("symbol") or "").upper().strip()
+            if token_id and token_symbol and token_symbol not in token_map:
+                token_map[token_symbol] = token_id
+        self._unlock_token_map_cache = (now, token_map)
+        return token_map
+
+    def unlock_reason(self, symbol: str, force_refresh: bool = False) -> Optional[str]:
+        """Entry-only guard: block confirmed cliff unlocks within the next N days."""
+        if not UNLOCK_FILTER_ENABLED:
+            return None
+        symbol = symbol.upper().strip()
+        now_ts = time.time()
+        if not force_refresh:
+            cached = self._unlock_reason_cache.get(symbol)
+            if cached and now_ts - cached[0] <= UNLOCK_CACHE_SECONDS:
+                return cached[1]
+
+        try:
+            token_map = self._tokenomist_token_map()
+            base = symbol.removesuffix("USDT")
+            token_id = token_map.get(base)
+            # عدم وجود العملة لدى المزود يعني أن جدول Unlock غير متحقق منه.
+            if not token_id:
+                reason = (
+                    "تعذر التحقق من Token Unlock — العملة غير مغطاة لدى Tokenomist"
+                    if UNLOCK_FAIL_CLOSED else None
+                )
+                self._unlock_reason_cache[symbol] = (now_ts, reason)
+                return reason
+
+            start_dt = datetime.now(timezone.utc)
+            end_dt = start_dt + timedelta(days=max(1, UNLOCK_LOOKAHEAD_DAYS))
+            response = requests.get(
+                TOKENOMIST_BASE + "/v4/unlock/events",
+                headers={"x-api-key": TOKENOMIST_API_KEY},
+                params={
+                    "tokenId": token_id,
+                    "start": start_dt.date().isoformat(),
+                    "end": end_dt.date().isoformat(),
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            upcoming = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                raw_date = row.get("unlockDate")
+                if not raw_date:
+                    continue
+                try:
+                    unlock_dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                    if unlock_dt.tzinfo is None:
+                        unlock_dt = unlock_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if start_dt <= unlock_dt <= end_dt:
+                    upcoming.append(unlock_dt)
+
+            if upcoming:
+                nearest = min(upcoming)
+                days_left = max(0.0, (nearest - start_dt).total_seconds() / 86400.0)
+                reason = (
+                    f"Token Unlock قريب خلال {days_left:.1f} يوم "
+                    f"({nearest.strftime('%Y-%m-%d')} UTC) — دخول ممنوع"
+                )
+            else:
+                reason = None
+            self._unlock_reason_cache[symbol] = (now_ts, reason)
+            return reason
+        except Exception as exc:
+            print(f"Unlock Guard error {symbol}: {exc}", flush=True)
+            reason = (
+                "تعذر التحقق من Token Unlock — دخول ممنوع احترازيًا"
+                if UNLOCK_FAIL_CLOSED else None
+            )
+            self._unlock_reason_cache[symbol] = (now_ts, reason)
+            return reason
 
     def risk_reason(self, symbol: str, force_refresh: bool = False) -> Optional[str]:
         manual = self.db.is_excluded(symbol)
@@ -2109,25 +2223,9 @@ class Universe:
 
             rows.append((symbol, quote_volume))
 
-        # احتفظ بأفضل Spot أولًا، ثم أضف Alpha كحصة مستقلة حتى لا تختفي عملات Alpha
-        # لمجرد أن أحجام Spot الكبيرة ملأت أول MAX_SYMBOLS_PER_SCAN مركز.
+        # Spot فقط: لا نضيف Binance Alpha Only إلى قائمة المرشحين.
         rows.sort(key=lambda item: item[1], reverse=True)
-        combined = rows[:MAX_SYMBOLS_PER_SCAN]
-        seen = {symbol for symbol, _ in combined}
-        try:
-            for alpha_symbol, alpha_quote_volume in self.api.alpha_candidates():
-                if alpha_symbol in seen or alpha_symbol in EXCLUDED_MAJORS:
-                    continue
-                if self.risk_reason(alpha_symbol):
-                    continue
-                combined.append((alpha_symbol, alpha_quote_volume))
-                seen.add(alpha_symbol)
-        except Exception as exc:
-            print(f"تعذر تحديث Binance Alpha candidates: {exc}", flush=True)
-
-        # scan_batch يدور على القائمة على دفعات؛ لذلك Alpha ستأخذ دورها في الفحص
-        # حتى لو كان حجمها أقل من أكبر أزواج Spot.
-        return combined
+        return rows[:MAX_SYMBOLS_PER_SCAN]
 
     def scan_batch(self):
         candidates = self.candidates()
@@ -4826,6 +4924,11 @@ def scan_for_entry(market_score: float) -> None:
         market = get_market_context()
         if risk:
             db.add_analysis(candidate.symbol, market.score, candidate.coin_score, "BLOCK", risk, candidate.payload)
+            continue
+        unlock_risk = universe.unlock_reason(candidate.symbol, force_refresh=True)
+        if unlock_risk:
+            db.add_analysis(candidate.symbol, market.score, candidate.coin_score, "BLOCK", unlock_risk, candidate.payload)
+            print(f"Entry blocked: {candidate.symbol} | {unlock_risk}", flush=True)
             continue
         if not market.market_safe:
             print(f"Entry blocked: market unsafe | {market.reason}", flush=True)
