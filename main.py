@@ -2736,6 +2736,116 @@ class TelegramCommands:
             + open_text
         )
 
+    def _scan_symbol_history_text(self, symbol: str) -> str:
+        """Explain whether/when the autonomous scanner saw a symbol and why it did not enter."""
+        try:
+            symbol = str(symbol or "").upper().strip().lstrip("/")
+            if not symbol.endswith("USDT"):
+                symbol += "USDT"
+
+            with self.db.connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM analyses WHERE symbol=? ORDER BY id DESC LIMIT 300",
+                    (symbol,),
+                ).fetchall()
+
+            # Current state is useful even if the historical scanner never saw the symbol.
+            current = None
+            current_reasons = []
+            current_error = None
+            try:
+                market_score = get_market_score()
+                current = get_analysis(symbol, market_score)
+                current_reasons = entry_rejection_reasons(current, self.learner.effective_entry_score())
+            except Exception as exc:
+                current_error = str(exc)
+
+            if not rows:
+                lines = [
+                    f"🕵️ سجل اكتشاف {symbol}", "",
+                    "• لم أجد أي مشاهدة محفوظة لهذه العملة في سجل الفحص الآلي.",
+                    "• هذا يعني أنها لم تُحلل آليًا منذ بدء حفظ السجل الحالي، أو أن قاعدة البيانات أُعيد إنشاؤها.",
+                ]
+                if current is not None:
+                    radar = current.payload.get("speculation_radar") or {}
+                    flow = current.payload.get("early_flow") or {}
+                    lines += ["", "📍 وضعها الآن:",
+                              f"• Coin {current.coin_score:.1f}/100 | Radar {float(radar.get('score',0) or 0):.0f}/100 | Early {float(flow.get('score',0) or 0):.0f}/100",
+                              f"• 24H {float(current.payload.get('change_24h_pct',0) or 0):+.1f}%",
+                              f"• القرار الآن: {'✅ دخول' if current.entry_ok else '⏳ لا دخول'}"]
+                    if current_reasons:
+                        lines.append("• السبب الآن: " + " | ".join(current_reasons[:5]))
+                elif current_error:
+                    lines += ["", f"⚠️ تعذر تحليلها الآن: {current_error}"]
+                return "\n".join(lines)
+
+            parsed = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                except Exception:
+                    payload = {}
+                parsed.append((row, payload))
+
+            chronological = list(reversed(parsed))
+            first_row, first_p = chronological[0]
+            last_row, last_p = parsed[0]
+
+            def _flow(p):
+                return float((p.get("early_flow") or {}).get("score", 0) or 0)
+            def _timing(p):
+                return float((p.get("early_flow") or {}).get("timing", 0) or 0)
+            def _radar(p):
+                return float((p.get("speculation_radar") or {}).get("score", 0) or 0)
+            def _chg(p):
+                return float(p.get("change_24h_pct", 0) or 0)
+
+            best_flow_row, best_flow_p = max(parsed, key=lambda rp: _flow(rp[1]))
+            best_radar_row, best_radar_p = max(parsed, key=lambda rp: _radar(rp[1]))
+            decisions: Dict[str, int] = {}
+            for row, _p in parsed:
+                d = str(row["decision"] or "?")
+                decisions[d] = decisions.get(d, 0) + 1
+
+            # Prefer the exact persisted rejection gates from the newest observation.
+            last_reasons = list(last_p.get("scan_rejection_reasons") or [])
+            if not last_reasons and str(last_row["reason"] or "").strip():
+                last_reasons = [str(last_row["reason"])]
+
+            first_dt = self._parse_db_time(first_row["ts"])
+            last_dt = self._parse_db_time(last_row["ts"])
+            lines = [
+                f"🕵️ سجل اكتشاف {symbol}", "",
+                f"• مرات المشاهدة المحفوظة: {len(rows)}",
+                f"• أول مشاهدة: {self._format_riyadh_time(first_dt)} | 24H {_chg(first_p):+.1f}%",
+                f"• آخر مشاهدة: {self._format_riyadh_time(last_dt)} | 24H {_chg(last_p):+.1f}%",
+                f"• القرارات: " + " | ".join(f"{k}={v}" for k,v in sorted(decisions.items())),
+                "",
+                "🚀 أعلى إشارات رصدها البوت:",
+                f"• Early Flow: {_flow(best_flow_p):.0f}/100 | توقيت {_timing(best_flow_p):.0f} | 24H {_chg(best_flow_p):+.1f}% | {self._format_riyadh_time(self._parse_db_time(best_flow_row['ts']))}",
+                f"• Speculation Radar: {_radar(best_radar_p):.0f}/100 | 24H {_chg(best_radar_p):+.1f}% | {self._format_riyadh_time(self._parse_db_time(best_radar_row['ts']))}",
+                "",
+                f"🧱 آخر قرار محفوظ: {str(last_row['decision'])} | Coin {float(last_row['coin_score'] or 0):.1f}/100",
+            ]
+            if last_reasons:
+                lines.append("• لماذا لم يدخل/ما الذي منعه: " + " | ".join(str(x) for x in last_reasons[:6]))
+            else:
+                lines.append("• لا يوجد سبب رفض تفصيلي محفوظ في هذه المشاهدة القديمة.")
+
+            if current is not None:
+                radar = current.payload.get("speculation_radar") or {}
+                flow = current.payload.get("early_flow") or {}
+                lines += ["", "📍 وضعها الآن:",
+                          f"• Coin {current.coin_score:.1f}/100 | Radar {float(radar.get('score',0) or 0):.0f}/100 | Early {float(flow.get('score',0) or 0):.0f}/100 | 24H {float(current.payload.get('change_24h_pct',0) or 0):+.1f}%",
+                          f"• القرار الآن: {'✅ دخول' if current.entry_ok else '⏳ لا دخول'}"]
+                if current_reasons:
+                    lines.append("• أسباب الرفض الآن: " + " | ".join(current_reasons[:6]))
+
+            lines += ["", "ℹ️ السجل تشخيصي فقط ولا يخفف شروط الدخول ولا يطارد العملة بعد ارتفاعها."]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"تعذر تشخيص سجل {symbol}: {exc}"
+
     def _scan_text(self) -> str:
         try:
             market_score = get_market_score()
@@ -3546,6 +3656,7 @@ class TelegramCommands:
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🧠 /learning [SYMBOLUSDT] — عرض ما تعلمه Learning V4 وتأثيره على الدخول\n"
                 "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
+                "🕵️ /scan SYMBOLUSDT — هل شاهده البوت؟ متى؟ أعلى Early/Radar ولماذا لم يدخل\n"
                 "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
                 "🌊 /early SYMBOLUSDT — اختبار Early Flow فورًا\n"
                 "📋 /full [SYMBOLUSDT] — التقرير الكامل؛ بدون رمز يستخدم آخر عملة\n"
@@ -3562,7 +3673,8 @@ class TelegramCommands:
             learning_symbol = parts[1] if len(parts) >= 2 else None
             self._reply(self._learning_text(learning_symbol))
         elif command in {"/scan", "/فحص"}:
-            self._reply(self._scan_text())
+            scan_symbol = parts[1] if len(parts) >= 2 else None
+            self._reply(self._scan_symbol_history_text(scan_symbol) if scan_symbol else self._scan_text())
         elif command in {"/start", "/resume", "/تشغيل"}:
             self.db.set_runtime("paused", "0")
             self._reply("▶️ تم تشغيل البوت واستئناف الدخول والتعزيز.")
@@ -5319,10 +5431,21 @@ def scan_for_entry(market_score: float) -> None:
                 continue
 
             analysis = get_analysis(symbol, market_score)
+            # Persist the exact gate diagnostics seen by the autonomous scanner.
+            # This lets /scan SYMBOL explain later why a mover was watched but not bought.
+            learned_min = learner.effective_entry_score()
+            scan_rejections = entry_rejection_reasons(analysis, learned_min)
+            scan_payload = dict(analysis.payload)
+            scan_payload["scan_rejection_reasons"] = list(scan_rejections)
+            scan_payload["scan_learned_min_entry"] = float(learned_min)
+            scan_payload["scan_entry_ok"] = bool(analysis.entry_ok)
+            scan_reason = analysis.reason
+            if scan_rejections:
+                scan_reason = " | ".join(str(x) for x in scan_rejections[:6])
             db.add_analysis(
                 symbol, market_score, analysis.coin_score,
                 "BUY" if analysis.entry_ok else "WAIT",
-                analysis.reason, analysis.payload,
+                scan_reason, scan_payload,
             )
 
             try:
