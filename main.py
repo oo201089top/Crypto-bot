@@ -499,6 +499,14 @@ class Database:
                 "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
             ).fetchone()
 
+    def get_trade_by_id(self, trade_id: int):
+        """Return a trade by id regardless of OPEN/CLOSED status."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM trades WHERE id=? LIMIT 1",
+                (int(trade_id),),
+            ).fetchone()
+
     def get_buy_fills(self, trade_id: int):
         """Return all BUY fills for a trade in execution order."""
         with self.connect() as conn:
@@ -872,6 +880,64 @@ class Database:
                 (limit,),
             ).fetchall()
 
+
+    def repair_learning_trade_management(self) -> int:
+        """
+        Backfill/refresh management metadata in closed-trade learning snapshots
+        from the authoritative trades table. This repairs historical snapshots
+        that were created from a stale in-memory position row and therefore
+        showed MAE=0 even though trades.min_unrealized_pnl was tracked correctly.
+        """
+        repaired = 0
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ls.id AS snapshot_id, ls.payload AS snapshot_payload,
+                       t.id AS trade_id, t.opened_at, t.closed_at, t.total_cost,
+                       t.tranches, t.rescue_mode, t.rescue_reason,
+                       t.max_unrealized_pnl, t.min_unrealized_pnl, t.realized_pnl
+                FROM learning_snapshots ls
+                JOIN trades t ON t.id=ls.trade_id
+                WHERE t.status='CLOSED'
+                """
+            ).fetchall()
+
+            for row in rows:
+                try:
+                    payload = json.loads(row["snapshot_payload"]) if row["snapshot_payload"] else {}
+                except Exception:
+                    payload = {}
+
+                try:
+                    opened = datetime.fromisoformat(str(row["opened_at"]))
+                    closed = datetime.fromisoformat(str(row["closed_at"])) if row["closed_at"] else datetime.now(timezone.utc)
+                    duration_hours = max(0.0, (closed - opened).total_seconds() / 3600.0)
+                except Exception:
+                    duration_hours = 0.0
+
+                total_cost = float(row["total_cost"] or 0)
+                min_unrealized = float(row["min_unrealized_pnl"] or 0)
+                mae_pct = (
+                    abs(min(0.0, min_unrealized)) / total_cost * 100.0
+                    if total_cost > 0 else 0.0
+                )
+                payload["trade_management"] = {
+                    "duration_hours": round(duration_hours, 2),
+                    "tranches": int(row["tranches"] or 0),
+                    "total_cost": round(total_cost, 8),
+                    "rescue_mode": int(row["rescue_mode"] or 0),
+                    "rescue_reason": row["rescue_reason"],
+                    "max_unrealized_pnl": float(row["max_unrealized_pnl"] or 0),
+                    "min_unrealized_pnl": min_unrealized,
+                    "mae_pct": round(mae_pct, 2),
+                    "realized_pnl": float(row["realized_pnl"] or 0),
+                }
+                conn.execute(
+                    "UPDATE learning_snapshots SET payload=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), int(row["snapshot_id"])),
+                )
+                repaired += 1
+        return repaired
 
     def add_early_flow_learning(self, analysis, sample_key: str) -> bool:
         """Store an observational Early Flow sample. No trade is required."""
@@ -2012,6 +2078,12 @@ class AdaptiveLearner:
             return
 
         trade_id = int(position["id"])
+        # Re-fetch from SQLite after SELL/update_excursions so MAE/MFE, tranches
+        # and Rescue state cannot be lost because of a stale sqlite Row object.
+        latest_position = self.db.get_trade_by_id(trade_id)
+        if latest_position is not None:
+            position = latest_position
+
         payload = self.db.get_first_buy_payload(trade_id)
         if not payload:
             return
@@ -3812,6 +3884,12 @@ class TelegramCommands:
 # =========================
 
 db = Database(DATABASE_PATH)
+try:
+    _learning_repaired = db.repair_learning_trade_management()
+    if _learning_repaired:
+        print(f"Learning V4 MAE backfill: refreshed {_learning_repaired} closed-trade snapshots", flush=True)
+except Exception as exc:
+    print(f"Learning V4 MAE backfill warning: {exc}", flush=True)
 api = BinancePublic()
 broker = PaperBroker(db)
 notifier = Notifier(db)
@@ -5088,6 +5166,11 @@ def manage_one_position(position, market_score: float) -> None:
     pnl = broker.pnl(position, current_price)
 
     db.update_excursions(int(position["id"]), pnl)
+    # update_excursions writes to SQLite; refresh the local Row so any immediate
+    # close in this same cycle carries the true MAE/MFE into Learning V4.
+    refreshed_position = db.get_trade_by_id(int(position["id"]))
+    if refreshed_position is not None:
+        position = refreshed_position
 
     # الهدف الأساسي: +10$ صافي.
     if pnl >= TARGET_NET_PROFIT:
