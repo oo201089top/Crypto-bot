@@ -2814,6 +2814,36 @@ class TelegramCommands:
 
             first_dt = self._parse_db_time(first_row["ts"])
             last_dt = self._parse_db_time(last_row["ts"])
+            def _snapshot_lines(title: str, row, p: Dict) -> List[str]:
+                deriv = p.get("derivatives") or {}
+                flow = p.get("early_flow") or {}
+                reasons = list(p.get("scan_rejection_reasons") or [])
+                if not reasons and str(row["reason"] or "").strip():
+                    reasons = [str(row["reason"])]
+
+                deriv_score = deriv.get("derivatives_score")
+                deriv_text = "غير متاح" if deriv_score is None else f"{float(deriv_score):.0f}/100 {str(deriv.get('lean') or 'NEUTRAL')}"
+                chase = "نعم" if bool(p.get("chase_guard")) else "لا"
+                learned = float(p.get("scan_learned_min_entry", self.learner.effective_entry_score()) or self.learner.effective_entry_score())
+                result = [
+                    "",
+                    title,
+                    f"• الوقت: {self._format_riyadh_time(self._parse_db_time(row['ts']))} | 24H {_chg(p):+.1f}%",
+                    f"• Coin {float(row['coin_score'] or p.get('coin_score',0) or 0):.1f}/100 | حد الدخول {learned:.1f}",
+                    f"• Radar {_radar(p):.0f}/100 | Early {_flow(p):.0f}/100 | Timing {_timing(p):.0f}/100",
+                    f"• RSI15 {float(p.get('rsi_15m',0) or 0):.1f} | RSI1H {float(p.get('rsi_1h',0) or 0):.1f} | ATR {float(p.get('extension_atr',0) or 0):.2f}",
+                    f"• Volume Build {float(p.get('volume_build',0) or 0):.2f}x | Vol5M {float(p.get('volume_5m',0) or 0):.2f}x | Vol15M {float(p.get('volume_15m',0) or 0):.2f}x",
+                    f"• Trend 5M/15M/1H: {float(p.get('trend_5m',0) or 0):.0f}/{float(p.get('trend_15m',0) or 0):.0f}/{float(p.get('trend_1h',0) or 0):.0f}",
+                    f"• تغير 15M {float(p.get('change_15m_pct',0) or 0):+.1f}% | 1H {float(p.get('change_1h_pct',0) or 0):+.1f}% | بعد الاختراق {float(p.get('distance_to_breakout_pct',0) or 0):+.1f}%",
+                    f"• المشتقات: {deriv_text} | Chase Guard: {chase}",
+                    f"• القرار وقتها: {str(row['decision'])}",
+                ]
+                if reasons:
+                    result.append("• سبب WAIT/BLOCK وقتها: " + " | ".join(str(x) for x in reasons[:6]))
+                else:
+                    result.append("• لا يوجد سبب رفض تفصيلي محفوظ لهذه المشاهدة القديمة.")
+                return result
+
             lines = [
                 f"🕵️ سجل اكتشاف {symbol}", "",
                 f"• مرات المشاهدة المحفوظة: {len(rows)}",
@@ -2824,6 +2854,11 @@ class TelegramCommands:
                 "🚀 أعلى إشارات رصدها البوت:",
                 f"• Early Flow: {_flow(best_flow_p):.0f}/100 | توقيت {_timing(best_flow_p):.0f} | 24H {_chg(best_flow_p):+.1f}% | {self._format_riyadh_time(self._parse_db_time(best_flow_row['ts']))}",
                 f"• Speculation Radar: {_radar(best_radar_p):.0f}/100 | 24H {_chg(best_radar_p):+.1f}% | {self._format_riyadh_time(self._parse_db_time(best_radar_row['ts']))}",
+            ]
+            lines += _snapshot_lines("🎯 لقطة لحظة أعلى Speculation Radar:", best_radar_row, best_radar_p)
+            if int(best_flow_row["id"]) != int(best_radar_row["id"]):
+                lines += _snapshot_lines("🌊 لقطة لحظة أعلى Early Flow:", best_flow_row, best_flow_p)
+            lines += [
                 "",
                 f"🧱 آخر قرار محفوظ: {str(last_row['decision'])} | Coin {float(last_row['coin_score'] or 0):.1f}/100",
             ]
@@ -3656,7 +3691,7 @@ class TelegramCommands:
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
                 "🧠 /learning [SYMBOLUSDT] — عرض ما تعلمه Learning V4 وتأثيره على الدخول\n"
                 "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
-                "🕵️ /scan SYMBOLUSDT — هل شاهده البوت؟ متى؟ أعلى Early/Radar ولماذا لم يدخل\n"
+                "🕵️ /scan SYMBOLUSDT — سجل الاكتشاف + لقطة كاملة عند أعلى Radar/Early وسبب الرفض وقتها\n"
                 "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
                 "🌊 /early SYMBOLUSDT — اختبار Early Flow فورًا\n"
                 "📋 /full [SYMBOLUSDT] — التقرير الكامل؛ بدون رمز يستخدم آخر عملة\n"
