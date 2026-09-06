@@ -193,6 +193,13 @@ LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "1") == "1"
 LEARNING_MIN_TRADES = int(os.getenv("LEARNING_MIN_TRADES", "8"))
 LEARNING_WINDOW = int(os.getenv("LEARNING_WINDOW", "500"))
 LEARNING_MAX_ADJUST = float(os.getenv("LEARNING_MAX_ADJUST", "6"))
+# جودة الصفقة للتعلم: الربح النهائي وحده لا يكفي. نعاقب التراجع العميق، طول التعليق وكثرة التعزيزات.
+LEARNING_MAE_PENALTY_START_PCT = float(os.getenv("LEARNING_MAE_PENALTY_START_PCT", "5"))
+LEARNING_MAE_MAX_PENALTY = float(os.getenv("LEARNING_MAE_MAX_PENALTY", "0.65"))
+LEARNING_DURATION_PENALTY_START_HOURS = float(os.getenv("LEARNING_DURATION_PENALTY_START_HOURS", "24"))
+LEARNING_DURATION_MAX_PENALTY = float(os.getenv("LEARNING_DURATION_MAX_PENALTY", "0.35"))
+LEARNING_EXTRA_TRANCHE_PENALTY = float(os.getenv("LEARNING_EXTRA_TRANCHE_PENALTY", "0.08"))
+LEARNING_RESCUE_PENALTY = float(os.getenv("LEARNING_RESCUE_PENALTY", "0.08"))
 
 # Learning V4 — تعلم سياقي من الصفقات + إشارات Early Flow المرصودة حتى بدون دخول.
 LEARNING_V4_ENABLED = os.getenv("LEARNING_V4_ENABLED", "1") == "1"
@@ -1813,21 +1820,24 @@ class AdaptiveLearner:
         if len(rows) < LEARNING_MIN_TRADES:
             return MIN_ENTRY_SCORE
 
-        wins = [r for r in rows if int(r["won"]) == 1]
-        losses = [r for r in rows if int(r["won"]) == 0]
-        win_rate = len(wins) / len(rows)
+        # لا نعتبر كل إغلاق موجب صفقة ممتازة. الصفقة التي علقت طويلًا أو مرت
+        # بتراجع عميق قد تكون ربحًا ماليًا لكنها مثال دخول سيئ للتعلم.
+        quality = [(r, self._trade_quality_outcome(r)) for r in rows]
+        avg_quality = mean(q for _, q in quality) if quality else 0.0
+        good = [r for r, q in quality if q >= 0.20]
+        poor = [r for r, q in quality if q <= -0.20]
         adjust = 0.0
 
-        if win_rate < 0.45:
-            adjust += min(LEARNING_MAX_ADJUST, (0.45 - win_rate) * 20)
-        elif win_rate > 0.70 and len(wins) >= LEARNING_MIN_TRADES // 2:
-            adjust -= min(3.0, (win_rate - 0.70) * 10)
+        if avg_quality < -0.10:
+            adjust += min(LEARNING_MAX_ADJUST, abs(avg_quality) * 8.0)
+        elif avg_quality > 0.35 and len(good) >= LEARNING_MIN_TRADES // 2:
+            adjust -= min(2.0, (avg_quality - 0.35) * 4.0)
 
-        if wins and losses:
-            avg_win_score = mean(float(r["coin_score"]) for r in wins)
-            avg_loss_score = mean(float(r["coin_score"]) for r in losses)
-            if avg_win_score > avg_loss_score + 4:
-                adjust += min(2.0, (avg_win_score - avg_loss_score) / 10)
+        if good and poor:
+            avg_good_score = mean(float(r["coin_score"]) for r in good)
+            avg_poor_score = mean(float(r["coin_score"]) for r in poor)
+            if avg_good_score > avg_poor_score + 4:
+                adjust += min(2.0, (avg_good_score - avg_poor_score) / 10.0)
 
         return round(max(66.0, min(82.0, MIN_ENTRY_SCORE + adjust)), 1)
 
@@ -1837,6 +1847,55 @@ class AdaptiveLearner:
             return json.loads(row["payload"]) if row and row["payload"] else {}
         except Exception:
             return {}
+
+    def _trade_quality_outcome(self, row) -> float:
+        """
+        -1..+1 quality score for a closed trade.
+        Realized PnL is the base result, then we penalize capital stress:
+        deep MAE, long duration, extra tranches and Rescue usage.
+        Older rows without management metadata remain backward-compatible.
+        """
+        pnl = float(row["pnl"] or 0)
+        base = max(-1.0, min(1.0, (pnl - RESCUE_NET_BUFFER) / max(TARGET_NET_PROFIT, 1.0)))
+        payload = self._payload(row)
+        mgmt = payload.get("trade_management") or {}
+        if not mgmt:
+            return base
+
+        try:
+            total_cost = float(mgmt.get("total_cost", 0) or 0)
+            min_pnl = float(mgmt.get("min_unrealized_pnl", 0) or 0)
+            mae_pct = abs(min(0.0, min_pnl)) / total_cost * 100.0 if total_cost > 0 else 0.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            mae_pct = 0.0
+
+        try:
+            duration = max(0.0, float(mgmt.get("duration_hours", 0) or 0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        try:
+            tranches = max(1, int(mgmt.get("tranches", 1) or 1))
+        except (TypeError, ValueError):
+            tranches = 1
+
+        mae_penalty = 0.0
+        if mae_pct > LEARNING_MAE_PENALTY_START_PCT:
+            # Full MAE penalty is reached around 20% adverse excursion.
+            span = max(1.0, 20.0 - LEARNING_MAE_PENALTY_START_PCT)
+            mae_penalty = min(LEARNING_MAE_MAX_PENALTY,
+                              ((mae_pct - LEARNING_MAE_PENALTY_START_PCT) / span) * LEARNING_MAE_MAX_PENALTY)
+
+        duration_penalty = 0.0
+        if duration > LEARNING_DURATION_PENALTY_START_HOURS:
+            # Full duration penalty is reached after roughly 96 hours.
+            span = max(1.0, 96.0 - LEARNING_DURATION_PENALTY_START_HOURS)
+            duration_penalty = min(LEARNING_DURATION_MAX_PENALTY,
+                                   ((duration - LEARNING_DURATION_PENALTY_START_HOURS) / span) * LEARNING_DURATION_MAX_PENALTY)
+
+        tranche_penalty = min(0.24, max(0, tranches - 1) * LEARNING_EXTRA_TRANCHE_PENALTY)
+        rescue_penalty = LEARNING_RESCUE_PENALTY if int(mgmt.get("rescue_mode", 0) or 0) else 0.0
+        quality = base - mae_penalty - duration_penalty - tranche_penalty - rescue_penalty
+        return max(-1.0, min(1.0, quality))
 
     @staticmethod
     def _similarity(current: Dict, old: Dict) -> float:
@@ -1912,9 +1971,8 @@ class AdaptiveLearner:
             sim = self._similarity(current, old)
             if sim < 0.55:
                 continue
-            pnl = float(row["pnl"])
-            # +10$ target ~= strong positive; Rescue near +0.50 ~= weak positive.
-            outcome = max(-1.0, min(1.0, (pnl - RESCUE_NET_BUFFER) / max(TARGET_NET_PROFIT, 1.0)))
+            # Trade quality includes realized result + MAE + duration + tranches + Rescue.
+            outcome = self._trade_quality_outcome(row)
             observations.append((sim, outcome, "trade"))
 
         # Observational Early Flow: 3h forward return, no trade needed.
@@ -1967,13 +2025,18 @@ class AdaptiveLearner:
         except Exception:
             duration_hours = 0.0
 
+        total_cost = float(position["total_cost"] or 0)
+        min_unrealized = float(position["min_unrealized_pnl"] or 0)
+        mae_pct = abs(min(0.0, min_unrealized)) / total_cost * 100.0 if total_cost > 0 else 0.0
         enriched["trade_management"] = {
             "duration_hours": round(duration_hours, 2),
             "tranches": int(position["tranches"] or 0),
+            "total_cost": round(total_cost, 8),
             "rescue_mode": int(position["rescue_mode"] or 0),
             "rescue_reason": position["rescue_reason"],
             "max_unrealized_pnl": float(position["max_unrealized_pnl"] or 0),
-            "min_unrealized_pnl": float(position["min_unrealized_pnl"] or 0),
+            "min_unrealized_pnl": min_unrealized,
+            "mae_pct": round(mae_pct, 2),
             "realized_pnl": float(pnl),
         }
         enriched["strategy_version"] = STRATEGY_VERSION
