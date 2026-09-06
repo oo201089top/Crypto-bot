@@ -3363,6 +3363,100 @@ class TelegramCommands:
         except Exception as exc:
             return f"❌ تعذر تحليل {symbol}: {exc}"
 
+    def _learning_text(self, symbol: Optional[str] = None) -> str:
+        """Human-readable Learning V4 diagnostics. Read-only; never changes strategy state."""
+        try:
+            rows = self.db.recent_learning(LEARNING_WINDOW, STRATEGY_VERSION)
+            effective = self.learner.effective_entry_score()
+            threshold_delta = effective - MIN_ENTRY_SCORE
+
+            with self.db.connect() as conn:
+                ef_total = int(conn.execute(
+                    "SELECT COUNT(*) AS n FROM early_flow_learning WHERE strategy_version=?",
+                    (STRATEGY_VERSION,),
+                ).fetchone()["n"] or 0)
+                ef_done = int(conn.execute(
+                    "SELECT COUNT(*) AS n FROM early_flow_learning "
+                    "WHERE strategy_version=? AND evaluated_3h=1 AND ret_3h IS NOT NULL",
+                    (STRATEGY_VERSION,),
+                ).fetchone()["n"] or 0)
+
+            if symbol:
+                symbol = symbol.upper().strip().lstrip("/")
+                if not symbol.endswith("USDT"):
+                    symbol += "USDT"
+                rows = [r for r in rows if str(r["symbol"]).upper() == symbol]
+                if not rows:
+                    return (
+                        f"🧠 Learning V4 — {symbol}\n\n"
+                        "لا توجد صفقة مغلقة مسجلة لهذه العملة ضمن نافذة التعلم الحالية.\n"
+                        "الصفقة المفتوحة لا تحصل على تقييم جودة نهائي حتى تُغلق."
+                    )
+
+            quality_rows = [(r, self.learner._trade_quality_outcome(r)) for r in rows]
+            good = sum(1 for _, q in quality_rows if q >= 0.20)
+            poor = sum(1 for _, q in quality_rows if q <= -0.20)
+            neutral = len(quality_rows) - good - poor
+            avg_q = mean(q for _, q in quality_rows) if quality_rows else 0.0
+
+            if threshold_delta > 0.05:
+                threshold_state = f"🔒 أشد من الأساسي بـ +{threshold_delta:.1f} نقطة"
+            elif threshold_delta < -0.05:
+                threshold_state = f"🟢 أخف من الأساسي بـ {threshold_delta:.1f} نقطة"
+            else:
+                threshold_state = "⚪ بدون تعديل على الحد الأساسي"
+
+            lines = [
+                "🧠 حالة Learning V4" + (f" — {symbol}" if symbol else ""),
+                "",
+                f"• التعلم: {'مفعل' if LEARNING_ENABLED and LEARNING_V4_ENABLED else 'متوقف'}",
+                f"• صفقات التعلم: {len(quality_rows)}",
+                f"• جودة جيدة/محايدة/سيئة: {good}/{neutral}/{poor}",
+                f"• متوسط جودة التعلم: {avg_q:+.2f} من -1 إلى +1",
+                f"• حد الدخول الأساسي: {MIN_ENTRY_SCORE:.1f}",
+                f"• حد الدخول المتعلم: {effective:.1f}",
+                f"• تأثير التعلم: {threshold_state}",
+            ]
+            if not symbol:
+                lines += [
+                    f"• عينات Early Flow: {ef_total} | مكتملة 3H: {ef_done}",
+                    f"• الحد الأدنى لتفعيل التعلم العام: {LEARNING_MIN_TRADES} صفقات",
+                    f"• الحد الأدنى للتعلم السياقي: {LEARNING_CONTEXT_MIN_SAMPLES} عينة مشابهة",
+                ]
+
+            if quality_rows:
+                lines += ["", "🧾 آخر نتائج التعلم:"]
+                for row, q in quality_rows[:5]:
+                    payload = self.learner._payload(row)
+                    mgmt = payload.get("trade_management") or {}
+                    total_cost = float(mgmt.get("total_cost", 0) or 0)
+                    min_pnl = float(mgmt.get("min_unrealized_pnl", 0) or 0)
+                    mae_pct = abs(min(0.0, min_pnl)) / total_cost * 100.0 if total_cost > 0 else 0.0
+                    duration = float(mgmt.get("duration_hours", 0) or 0)
+                    tranches = int(mgmt.get("tranches", 1) or 1)
+                    rescue = bool(int(mgmt.get("rescue_mode", 0) or 0))
+                    label = "جيدة" if q >= 0.20 else "سيئة" if q <= -0.20 else "محايدة"
+                    details = []
+                    if mgmt:
+                        details.append(f"MAE {mae_pct:.1f}%")
+                        details.append(f"{duration:.1f}h")
+                        details.append(f"{tranches} دفعة")
+                        if rescue:
+                            details.append("Rescue")
+                    suffix = " | " + " | ".join(details) if details else " | بيانات إدارة قديمة/غير مكتملة"
+                    lines.append(
+                        f"• {row['symbol']}: PnL {float(row['pnl'] or 0):+.2f}$ | جودة {q:+.2f} ({label}){suffix}"
+                    )
+
+            lines += [
+                "",
+                "ℹ️ جودة التعلم تحسب الربح + MAE + مدة التعليق + عدد الدفعات + Rescue.",
+                "هذا الأمر للعرض فقط ولا يفتح أو يغلق أي صفقة.",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"تعذر عرض Learning V4: {exc}"
+
     def handle(self, text: str) -> None:
         raw = text.strip()
         if not raw:
@@ -3378,6 +3472,7 @@ class TelegramCommands:
                 "🤖 /status أو /الحالة — عرض حالة البوت والصفقة الحالية\n"
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
+                "🧠 /learning [SYMBOLUSDT] — عرض ما تعلمه Learning V4 وتأثيره على الدخول\n"
                 "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
                 "🔬 /[رمز العملة]USDT — تقرير قرار مختصر (مثال: /SPKUSDT)\n"
                 "🌊 /early SYMBOLUSDT — اختبار Early Flow فورًا\n"
@@ -3391,6 +3486,9 @@ class TelegramCommands:
             self._reply(self._status_text())
         elif command in {"/stats", "/الإحصائيات"}:
             self._reply(self._stats_text())
+        elif command in {"/learning", "/تعلم"}:
+            learning_symbol = parts[1] if len(parts) >= 2 else None
+            self._reply(self._learning_text(learning_symbol))
         elif command in {"/scan", "/فحص"}:
             self._reply(self._scan_text())
         elif command in {"/start", "/resume", "/تشغيل"}:
