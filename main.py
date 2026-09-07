@@ -220,6 +220,11 @@ SMART_MONEY_DIVERGENCE_ENABLED = os.getenv("SMART_MONEY_DIVERGENCE_ENABLED", "1"
 SMART_MONEY_DIVERGENCE_MIN_SCORE = float(os.getenv("SMART_MONEY_DIVERGENCE_MIN_SCORE", "70"))
 SMART_MONEY_DIVERGENCE_MAX_BOOST = float(os.getenv("SMART_MONEY_DIVERGENCE_MAX_BOOST", "8"))
 
+# Relative Strength vs BTC — عامل محافظ داخل Early Flow فقط، وليس إشارة دخول مستقلة.
+BTC_RELATIVE_STRENGTH_ENABLED = os.getenv("BTC_RELATIVE_STRENGTH_ENABLED", "1") == "1"
+BTC_RELATIVE_STRENGTH_MAX_BOOST = float(os.getenv("BTC_RELATIVE_STRENGTH_MAX_BOOST", "5"))
+BTC_RELATIVE_STRENGTH_MAX_PENALTY = float(os.getenv("BTC_RELATIVE_STRENGTH_MAX_PENALTY", "8"))
+
 # فلتر السوق المرن
 MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
 EXCEPTIONAL_MARKET_FLOOR = float(os.getenv("EXCEPTIONAL_MARKET_FLOOR", "48"))
@@ -1566,6 +1571,7 @@ class MarketContext:
     btc_price: float
     btc_trend_score: float
     btc_change_1h: float
+    btc_change_15m: float
     btc_dominance: Optional[float]
     btc_dominance_change_1h: Optional[float]
     market_safe: bool
@@ -4065,6 +4071,7 @@ def get_market_context() -> MarketContext:
     btc_price = float(btc_15m[-1]["close"])
     btc_trend = trend_score([c["close"] for c in btc_1h])
     btc_change_1h = pct_change(btc_15m[-1]["close"], btc_15m[-5]["close"]) if len(btc_15m) >= 5 else 0.0
+    btc_change_15m = pct_change(btc_15m[-1]["close"], btc_15m[-2]["close"]) if len(btc_15m) >= 2 else 0.0
 
     dominance: Optional[float] = None
     dominance_change: Optional[float] = None
@@ -4097,11 +4104,12 @@ def get_market_context() -> MarketContext:
 
     context = MarketContext(
         score=score, btc_price=btc_price, btc_trend_score=btc_trend,
-        btc_change_1h=btc_change_1h, btc_dominance=dominance,
+        btc_change_1h=btc_change_1h, btc_change_15m=btc_change_15m, btc_dominance=dominance,
         btc_dominance_change_1h=dominance_change, market_safe=market_safe, reason=reason,
     )
     db.add_market_snapshot({
         "btc_price": btc_price, "btc_trend_score": btc_trend, "btc_change_1h": btc_change_1h,
+        "btc_change_15m": btc_change_15m,
         "btc_dominance": dominance, "btc_dominance_change_1h": dominance_change,
         "market_safe": market_safe, "market_score": score, "reason": reason,
     })
@@ -4553,6 +4561,32 @@ def _early_flow_score(analysis: Analysis, deriv: Dict, smart_money: Optional[Dic
             score += smart_money_boost
             reasons.append(f"Smart Money Divergence +{smart_money_boost:.1f}: كبار Long مقابل جمهور Short")
 
+    # Relative Strength vs BTC: نقيس هل العملة تقود الحركة أم تتأخر عن BTC.
+    # لا يفتح صفقة وحده ولا يتجاوز Coin Score/Market Safety/Derivatives/Chase Guard.
+    btc_relative_adjust = 0.0
+    btc_relative_label = "محايد"
+    coin_change15 = float(p.get("change_15m_pct", 0) or 0)
+    coin_change1h = float(p.get("change_1h_pct", 0) or 0)
+    btc_change15 = float(p.get("btc_change_15m", 0) or 0)
+    btc_change1h = float(p.get("btc_change_1h", 0) or 0)
+    rel15 = coin_change15 - btc_change15
+    rel1h = coin_change1h - btc_change1h
+    relative_strength = 0.40 * rel15 + 0.60 * rel1h
+
+    if BTC_RELATIVE_STRENGTH_ENABLED:
+        # تعزيز صغير فقط عندما تتفوق العملة بوضوح على BTC على الفريمين.
+        if rel15 >= 0.20 and rel1h >= 0.40:
+            btc_relative_adjust = min(BTC_RELATIVE_STRENGTH_MAX_BOOST, 1.5 + relative_strength * 1.5)
+            score += btc_relative_adjust
+            btc_relative_label = "قوة مستقلة"
+            reasons.append(f"قوة نسبية أمام BTC +{btc_relative_adjust:.1f}")
+        # عقوبة أقوى عندما تتأخر العملة عن BTC على الفريمين؛ هذا يعالج العملات التي تفقد قوتها الذاتية.
+        elif rel15 <= -0.25 and rel1h <= -0.50:
+            btc_relative_adjust = -min(BTC_RELATIVE_STRENGTH_MAX_PENALTY, 2.0 + abs(relative_strength) * 1.8)
+            score += btc_relative_adjust
+            btc_relative_label = "ضعف مقابل BTC"
+            reasons.append(f"ضعف نسبي أمام BTC {btc_relative_adjust:.1f}")
+
     # Entry Timing مستقل: 100 = مبكر/قريب من البنية، 0 = مطاردة متأخرة.
     timing = 100.0
     late_reasons: List[str] = []
@@ -4603,6 +4637,13 @@ def _early_flow_score(analysis: Analysis, deriv: Dict, smart_money: Optional[Dic
         "smart_money_boost": round(smart_money_boost, 1),
         "smart_money_divergence": bool(sm.get("divergence")),
         "smart_money_score": float(sm.get("score", 0) or 0),
+        "btc_relative_adjust": round(btc_relative_adjust, 1),
+        "btc_relative_label": btc_relative_label,
+        "relative_strength_vs_btc": round(relative_strength, 2),
+        "coin_change_15m": round(coin_change15, 2),
+        "coin_change_1h": round(coin_change1h, 2),
+        "btc_change_15m": round(btc_change15, 2),
+        "btc_change_1h": round(btc_change1h, 2),
     }
 
 
@@ -4956,6 +4997,7 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         "btc_price": market.btc_price,
         "btc_trend_score": round(market.btc_trend_score, 1),
         "btc_change_1h": round(market.btc_change_1h, 2),
+        "btc_change_15m": round(market.btc_change_15m, 2),
         "btc_dominance": market.btc_dominance,
         "btc_dominance_change_1h": market.btc_dominance_change_1h,
         "market_reason": market.reason,
@@ -5111,7 +5153,7 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         analysis.reason = "انتظار — Chase Guard: " + " + ".join(chase_reasons[:4])
     elif analysis.entry_ok:
         if early_entry_ok and not normal_entry_ok:
-            analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100" + (f" | Smart Money +{float(early_flow.get('smart_money_boost',0)):.0f}" if float(early_flow.get("smart_money_boost",0) or 0) > 0 else "")
+            analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100" + (f" | Smart Money +{float(early_flow.get('smart_money_boost',0)):.0f}" if float(early_flow.get("smart_money_boost",0) or 0) > 0 else "") + (f" | BTC RS {float(early_flow.get('btc_relative_adjust',0)):+.1f}" if abs(float(early_flow.get("btc_relative_adjust",0) or 0)) > 0 else "")
         else:
             analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
     return analysis
