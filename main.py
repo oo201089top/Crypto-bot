@@ -105,7 +105,7 @@ EARLY_FLOW_ENABLED = os.getenv("EARLY_FLOW_ENABLED", "1") == "1"
 EARLY_FLOW_ALERT_SCORE = float(os.getenv("EARLY_FLOW_ALERT_SCORE", "75"))
 EARLY_FLOW_ENTRY_SCORE = float(os.getenv("EARLY_FLOW_ENTRY_SCORE", "82"))
 EARLY_FLOW_MIN_TIMING = float(os.getenv("EARLY_FLOW_MIN_TIMING", "72"))
-EARLY_FLOW_MIN_TECH_SCORE = float(os.getenv("EARLY_FLOW_MIN_TECH_SCORE", "64"))
+EARLY_FLOW_MIN_TECH_SCORE = float(os.getenv("EARLY_FLOW_MIN_TECH_SCORE", "70"))
 EARLY_FLOW_ALERT_COOLDOWN_MINUTES = int(os.getenv("EARLY_FLOW_ALERT_COOLDOWN_MINUTES", "120"))
 # وضع احتياطي Spot-only عند غياب بيانات Futures: تنبيه فقط، ولا يسمح بالدخول وحده.
 SPOT_EARLY_FLOW_ALERT_SCORE = float(os.getenv("SPOT_EARLY_FLOW_ALERT_SCORE", "82"))
