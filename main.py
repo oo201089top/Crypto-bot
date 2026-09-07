@@ -215,6 +215,11 @@ LEARNING_SIGNAL_WINDOW = int(os.getenv("LEARNING_SIGNAL_WINDOW", "500"))
 SQUEEZE_RADAR_ENABLED = os.getenv("SQUEEZE_RADAR_ENABLED", "1") == "1"
 SQUEEZE_STRONG_SCORE = float(os.getenv("SQUEEZE_STRONG_SCORE", "70"))
 
+# Smart Money Divergence — تعزيز محافظ لـ Early Flow فقط، وليس إشارة دخول مستقلة.
+SMART_MONEY_DIVERGENCE_ENABLED = os.getenv("SMART_MONEY_DIVERGENCE_ENABLED", "1") == "1"
+SMART_MONEY_DIVERGENCE_MIN_SCORE = float(os.getenv("SMART_MONEY_DIVERGENCE_MIN_SCORE", "70"))
+SMART_MONEY_DIVERGENCE_MAX_BOOST = float(os.getenv("SMART_MONEY_DIVERGENCE_MAX_BOOST", "8"))
+
 # فلتر السوق المرن
 MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "50"))
 EXCEPTIONAL_MARKET_FLOOR = float(os.getenv("EXCEPTIONAL_MARKET_FLOOR", "48"))
@@ -4465,7 +4470,7 @@ def _squeeze_score(analysis: Analysis, deriv: Dict) -> Dict:
     }
 
 
-def _early_flow_score(analysis: Analysis, deriv: Dict) -> Dict:
+def _early_flow_score(analysis: Analysis, deriv: Dict, smart_money: Optional[Dict] = None) -> Dict:
     """رادار دخول مبكر: يفصل قوة التدفق عن جودة التوقيت حتى لا نطارد حركة متأخرة."""
     p = analysis.payload
     score = 45.0
@@ -4535,6 +4540,19 @@ def _early_flow_score(analysis: Analysis, deriv: Dict) -> Dict:
     if fs is not None and float(fs) >= 8:
         score -= 5; reasons.append("العقود تهيمن على Spot")
 
+    # Smart Money Divergence: لا يفتح صفقة وحده. فقط يعزز Early Flow عندما
+    # يكون الكبار Long مقابل جمهور Short مع توسع OI، مع إبقاء التوقيت/الفني/الحمايات إلزامية.
+    smart_money_boost = 0.0
+    sm = smart_money or {}
+    if SMART_MONEY_DIVERGENCE_ENABLED and sm.get("divergence"):
+        sm_score = float(sm.get("score", 0) or 0)
+        oi_now = float(deriv.get("oi_change_1h", 0) or 0)
+        if sm_score >= SMART_MONEY_DIVERGENCE_MIN_SCORE and oi_now > 0:
+            strength = min(1.0, max(0.0, (sm_score - SMART_MONEY_DIVERGENCE_MIN_SCORE) / 20.0))
+            smart_money_boost = min(SMART_MONEY_DIVERGENCE_MAX_BOOST, 4.0 + 4.0 * strength)
+            score += smart_money_boost
+            reasons.append(f"Smart Money Divergence +{smart_money_boost:.1f}: كبار Long مقابل جمهور Short")
+
     # Entry Timing مستقل: 100 = مبكر/قريب من البنية، 0 = مطاردة متأخرة.
     timing = 100.0
     late_reasons: List[str] = []
@@ -4582,6 +4600,9 @@ def _early_flow_score(analysis: Analysis, deriv: Dict) -> Dict:
         "score": round(score, 1), "strong": strong, "entry_ok": entry_ok,
         "reasons": reasons[:6], "timing": round(timing, 1),
         "timing_label": timing_label, "late_reasons": late_reasons[:5],
+        "smart_money_boost": round(smart_money_boost, 1),
+        "smart_money_divergence": bool(sm.get("divergence")),
+        "smart_money_score": float(sm.get("score", 0) or 0),
     }
 
 
@@ -5021,12 +5042,20 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     analysis.payload["chase_guard"] = chase_guard
     analysis.payload["chase_guard_reasons"] = chase_reasons
 
+    # Smart Money / Squeeze context يُحسب قبل Early Flow كي يعمل كتعزيز فقط.
+    try:
+        squeeze = _squeeze_score(analysis, deriv)
+    except Exception as exc:
+        squeeze = {"score": 0.0, "strong": False, "label": "خطأ", "divergence": False,
+                   "reasons": [], "risk_reasons": [str(exc)], "entry_signal": False}
+    analysis.payload["squeeze"] = squeeze
+
     # Early Flow: Full عند توفر Futures، وإلا Spot-only للتنبيه والمراقبة فقط.
     early_flow = {"mode": "UNAVAILABLE", "score": 0.0, "strong": False, "entry_ok": False, "timing": 0.0, "timing_label": "غير متاح", "reasons": []}
     if EARLY_FLOW_ENABLED:
         try:
             if isinstance(deriv, dict) and deriv.get("available"):
-                early_flow = _early_flow_score(analysis, deriv)
+                early_flow = _early_flow_score(analysis, deriv, squeeze)
                 early_flow["mode"] = "FULL"
                 early_flow["confidence"] = "high"
             else:
@@ -5050,14 +5079,6 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         analysis.payload["speculation_radar"] = speculation_radar_score(analysis) if SPECULATION_RADAR_ENABLED else {"score": 0.0, "strong": False, "label": "معطل", "entry_signal": False}
     except Exception as exc:
         analysis.payload["speculation_radar"] = {"score": 0.0, "strong": False, "label": "خطأ", "risks": [str(exc)], "entry_signal": False}
-
-    # Squeeze Radar: مستقل عن قرار الدخول؛ يدخل كميزة ضمن Learning V4.
-    try:
-        squeeze = _squeeze_score(analysis, deriv)
-    except Exception as exc:
-        squeeze = {"score": 0.0, "strong": False, "label": "خطأ", "divergence": False,
-                   "reasons": [], "risk_reasons": [str(exc)], "entry_signal": False}
-    analysis.payload["squeeze"] = squeeze
 
     # Learning V4: بعد اكتمال سياق السوق/المشتقات/Early Flow، يطبق تعديلًا محافظًا
     # مبنيًا على الأنماط المشابهة السابقة. لا يتجاوز ±4 نقاط ولا يتجاوز حمايات السوق.
@@ -5090,7 +5111,7 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
         analysis.reason = "انتظار — Chase Guard: " + " + ".join(chase_reasons[:4])
     elif analysis.entry_ok:
         if early_entry_ok and not normal_entry_ok:
-            analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100"
+            analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100" + (f" | Smart Money +{float(early_flow.get('smart_money_boost',0)):.0f}" if float(early_flow.get("smart_money_boost",0) or 0) > 0 else "")
         else:
             analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
     return analysis
