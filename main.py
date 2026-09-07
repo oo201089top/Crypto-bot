@@ -143,6 +143,11 @@ RESCUE_TREND_1H = float(os.getenv("RESCUE_TREND_1H", "43"))
 RESCUE_GRACE_MINUTES = int(os.getenv("RESCUE_GRACE_MINUTES", "90"))
 RESCUE_MIN_CONFIRMATIONS = int(os.getenv("RESCUE_MIN_CONFIRMATIONS", "2"))
 RESCUE_RECOVERY_AVERAGING_ENABLED = os.getenv("RESCUE_RECOVERY_AVERAGING_ENABLED", "1") == "1"
+# Rescue Recovery الكامل: إذا استعادت الصفقة قوتها فعليًا نلغي Rescue ونعود لهدف +10$.
+RESCUE_FULL_RECOVERY_ENABLED = os.getenv("RESCUE_FULL_RECOVERY_ENABLED", "1") == "1"
+RESCUE_FULL_RECOVERY_CONFIRMATIONS = int(os.getenv("RESCUE_FULL_RECOVERY_CONFIRMATIONS", "2"))
+RESCUE_FULL_RECOVERY_MIN_COIN_SCORE = float(os.getenv("RESCUE_FULL_RECOVERY_MIN_COIN_SCORE", "70"))
+RESCUE_FULL_RECOVERY_MIN_EVIDENCE = int(os.getenv("RESCUE_FULL_RECOVERY_MIN_EVIDENCE", "4"))
 
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
@@ -691,6 +696,13 @@ class Database:
             conn.execute(
                 "UPDATE trades SET rescue_mode=1,rescue_reason=? WHERE id=?",
                 (reason, trade_id),
+            )
+
+    def clear_rescue_mode(self, trade_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE trades SET rescue_mode=0,rescue_reason=NULL WHERE id=?",
+                (trade_id,),
             )
 
     def add_trade_event(
@@ -5369,6 +5381,82 @@ def rescue_reason_for(position, analysis: Analysis) -> Optional[str]:
     return " | ".join(confirmations)
 
 
+def rescue_full_recovery_state(position, analysis: Analysis) -> Tuple[bool, List[str], List[str]]:
+    """
+    Multi-factor Rescue recovery. BTC is only one input, never the sole trigger.
+    Requires independent evidence from the coin, rebound/volume, flow, derivatives/Smart Money,
+    relative strength, and market/BTC dominance. Known Monitoring/Delisting risk is a hard veto.
+    """
+    if not RESCUE_FULL_RECOVERY_ENABLED:
+        return False, [], ["Recovery معطل"]
+
+    risk = universe.risk_reason(str(position["symbol"]))
+    if risk and not str(risk).startswith("تعذر التحقق من Binance Monitoring Tag"):
+        return False, [], [f"مخاطرة فعلية: {risk}"]
+
+    p = analysis.payload or {}
+    flow = p.get("early_flow") or {}
+    deriv = p.get("derivatives") or {}
+    evidence: List[str] = []
+    blockers: List[str] = []
+
+    coin = float(analysis.coin_score or 0)
+    t5 = float(p.get("trend_5m", 0) or 0)
+    t15 = float(p.get("trend_15m", 0) or 0)
+    t1h = float(p.get("trend_1h", 0) or 0)
+    rsi15 = float(p.get("rsi_15m", 50) or 50)
+    vol = max(float(p.get("volume_5m", 0) or 0), float(p.get("volume_15m", 0) or 0))
+    rebound = float(p.get("rebound_score", 0) or 0)
+
+    # 1) جودة فنية مستقلة للعملة.
+    if coin >= RESCUE_FULL_RECOVERY_MIN_COIN_SCORE and t5 >= 52 and t15 >= 52 and t1h >= 48 and 40 <= rsi15 <= 68:
+        evidence.append(f"الفني عاد قويًا {coin:.1f}/100")
+
+    # 2) ارتداد مدعوم بالحجم، وليس شمعة خضراء منفردة.
+    if rebound >= 72 and vol >= 1.10:
+        evidence.append(f"ارتداد وحجم مؤكدان {rebound:.0f}/100")
+
+    # 3) Early Flow عاد صالحًا/قويًا.
+    if float(flow.get("score", 0) or 0) >= 78 and float(flow.get("timing", 0) or 0) >= 65:
+        evidence.append(f"Early Flow عاد {float(flow.get('score',0)):.0f}/100")
+
+    # 4) مشتقات/Smart Money: يكفي دعم واضح من أحدهما.
+    dscore = deriv.get("derivatives_score")
+    sm_score = float(flow.get("smart_money_score", 0) or 0)
+    sm_div = bool(flow.get("smart_money_divergence"))
+    if (dscore is not None and float(dscore) >= 55) or (sm_div and sm_score >= 70):
+        evidence.append("المشتقات/Smart Money تدعم التعافي")
+    if dscore is not None and float(dscore) <= DERIVATIVES_BLOCK_SCORE:
+        blockers.append(f"المشتقات ما زالت سلبية {float(dscore):.0f}/100")
+
+    # 5) قوة مستقلة أمام BTC. BTC ليس شرطًا: هذه مجرد شهادة إضافية.
+    rs = float(flow.get("relative_strength_vs_btc", 0) or 0)
+    if rs >= 0.35:
+        evidence.append(f"قوة مستقلة أمام BTC {rs:+.2f}")
+
+    # 6) سياق السوق/الهيمنة. ارتفاع BTC.D السريع يمنع إلغاء Rescue حتى يهدأ.
+    dom_change = p.get("btc_dominance_change_1h")
+    if dom_change is not None and float(dom_change) > BTC_MAX_DOMINANCE_RISE_1H:
+        blockers.append(f"استحواذ BTC يرتفع بسرعة {float(dom_change):+.2f}%")
+    elif bool(p.get("market_safe", False)):
+        evidence.append("سياق السوق آمن للألتكوين")
+
+    ok = len(evidence) >= max(1, RESCUE_FULL_RECOVERY_MIN_EVIDENCE) and not blockers
+    return ok, evidence, blockers
+
+
+def rescue_recovery_confirmed(position, analysis: Analysis) -> Tuple[bool, List[str], List[str], int]:
+    ok, evidence, blockers = rescue_full_recovery_state(position, analysis)
+    key = f"rescue_recovery_confirm:{int(position['id'])}"
+    count = int(db.get_runtime(key, "0") or 0)
+    if ok:
+        count += 1
+    else:
+        count = 0
+    db.set_runtime(key, str(count))
+    return count >= max(1, RESCUE_FULL_RECOVERY_CONFIRMATIONS), evidence, blockers, count
+
+
 def manage_one_position(position, market_score: float) -> None:
 
     symbol = str(position["symbol"])
@@ -5446,7 +5534,33 @@ def manage_one_position(position, market_score: float) -> None:
         )
         position = broker.position(symbol)
 
-    # وضع الإنقاذ: لا بيع بخسارة؛ الخروج فقط بصافي موجب بعد كل الرسوم.
+    # قبل خروج Rescue المبكر، افحص هل السيناريو تعافى فعليًا.
+    # نحتاج عدة أدلة مستقلة + تأكيدين متتاليين. BTC مجرد عامل ضمن الصورة،
+    # وارتفاع BTC Dominance السريع أو مشتقات شديدة السلبية يمنع إلغاء Rescue.
+    if int(position["rescue_mode"] or 0):
+        recovered, recovery_evidence, recovery_blockers, recovery_count = rescue_recovery_confirmed(position, analysis)
+        if recovered:
+            db.clear_rescue_mode(int(position["id"]))
+            db.add_trade_event(
+                int(position["id"]), symbol, "RESCUE_RECOVERED", current_price, pnl,
+                {"evidence": recovery_evidence, "confirmations": recovery_count, **analysis.payload},
+            )
+            db.set_runtime(f"rescue_recovery_confirm:{int(position['id'])}", "0")
+            position = db.get_trade_by_id(int(position["id"])) or position
+            notifier.send_once(
+                f"RESCUE_RECOVERED:{position['id']}",
+                (
+                    f"💚 تعافي مؤكد — {symbol}\n\n"
+                    f"• تم إلغاء وضع الإنقاذ بعد {recovery_count} تأكيدات متتالية\n"
+                    f"• الأدلة: {' | '.join(recovery_evidence[:5])}\n"
+                    f"• الربح/الخسارة الحالية: {pnl:+.2f} USDT\n"
+                    f"• عاد الهدف إلى +{TARGET_NET_PROFIT:.0f}$ صافي بعد الرسوم.\n\n"
+                    "🔎 BTC ليس شرطًا منفردًا؛ القرار مبني على تعافي العملة والحجم/التدفق والمشتقات والقوة النسبية وسياق الهيمنة."
+                ),
+                {"evidence": recovery_evidence, "pnl": pnl, **analysis.payload},
+            )
+
+    # إذا بقي Rescue فعالًا بعد فحص التعافي، نخرج فقط بأول صافي موجب آمن.
     if int(position["rescue_mode"] or 0) and pnl >= RESCUE_NET_BUFFER:
         reason = f"خروج إنقاذ بصافي {RESCUE_NET_BUFFER:.2f}$ بعد الرسوم"
         realized = broker.sell_all(position, current_price, reason, {"pnl": pnl})
