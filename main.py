@@ -120,6 +120,19 @@ SPECULATION_MAX_24H_PCT = float(os.getenv("SPECULATION_MAX_24H_PCT", "25"))
 SPECULATION_PRIORITY_QUOTE_WEIGHT = float(os.getenv("SPECULATION_PRIORITY_QUOTE_WEIGHT", "0.45"))
 SPECULATION_PRIORITY_TRADES_WEIGHT = float(os.getenv("SPECULATION_PRIORITY_TRADES_WEIGHT", "0.35"))
 
+# Exceptional Early Setup — ممر دخول جراحي للحركات المبكرة جدًا مثل FORM.
+# لا يخفض شروط الدخول العامة ولا يتجاوز أمان السوق/المشتقات/Chase Guard.
+EXCEPTIONAL_EARLY_ENABLED = os.getenv("EXCEPTIONAL_EARLY_ENABLED", "1") == "1"
+EXCEPTIONAL_EARLY_MIN_RADAR = float(os.getenv("EXCEPTIONAL_EARLY_MIN_RADAR", "90"))
+EXCEPTIONAL_EARLY_MIN_FLOW = float(os.getenv("EXCEPTIONAL_EARLY_MIN_FLOW", "78"))
+EXCEPTIONAL_EARLY_MIN_TIMING = float(os.getenv("EXCEPTIONAL_EARLY_MIN_TIMING", "85"))
+EXCEPTIONAL_EARLY_MIN_COIN = float(os.getenv("EXCEPTIONAL_EARLY_MIN_COIN", "60"))
+EXCEPTIONAL_EARLY_MIN_VOLUME_BUILD = float(os.getenv("EXCEPTIONAL_EARLY_MIN_VOLUME_BUILD", "1.50"))
+EXCEPTIONAL_EARLY_MIN_VOLUME = float(os.getenv("EXCEPTIONAL_EARLY_MIN_VOLUME", "1.50"))
+EXCEPTIONAL_EARLY_MAX_EXTENSION_ATR = float(os.getenv("EXCEPTIONAL_EARLY_MAX_EXTENSION_ATR", "0.65"))
+EXCEPTIONAL_EARLY_MAX_CHANGE_1H = float(os.getenv("EXCEPTIONAL_EARLY_MAX_CHANGE_1H", "3.0"))
+EXCEPTIONAL_EARLY_MAX_CHANGE_15M = float(os.getenv("EXCEPTIONAL_EARLY_MAX_CHANGE_15M", "1.8"))
+
 # Chase Guard — يمنع شراء الحركة بعد انطلاقها إذا اجتمع الإجهاد الفني مع ضغط مشتقات سلبي.
 # لا يمنع بسبب عامل واحد منفرد حتى لا يقتل الفرص المبكرة الجيدة.
 CHASE_GUARD_ENABLED = os.getenv("CHASE_GUARD_ENABLED", "1") == "1"
@@ -1886,6 +1899,46 @@ def speculation_radar_score(analysis: Analysis) -> Dict:
         "reasons": reasons[:6],
         "risks": risks[:5],
         "entry_signal": False,
+    }
+
+
+def exceptional_early_setup(analysis: Analysis) -> Dict:
+    """Strict pre-breakout exception: catches exceptional early flow without weakening normal gates."""
+    p = analysis.payload or {}
+    radar = p.get("speculation_radar") or {}
+    early = p.get("early_flow") or {}
+    radar_score = float(radar.get("score", 0) or 0)
+    flow_score = float(early.get("score", 0) or 0)
+    timing = float(early.get("timing", 0) or 0)
+    rsi15 = float(p.get("rsi_15m", 0) or 0)
+    ext = float(p.get("extension_atr", 999) or 999)
+    vol5 = float(p.get("volume_5m", 0) or 0)
+    vol15 = float(p.get("volume_15m", 0) or 0)
+    vol_build = float(p.get("volume_build", 0) or 0)
+    change1h = float(p.get("change_1h_pct", 0) or 0)
+    change15 = float(p.get("change_15m_pct", 0) or 0)
+    dist = float(p.get("distance_to_breakout_pct", 999) or 999)
+    change24 = float(p.get("change_24h_pct", 0) or 0)
+
+    checks = {
+        "radar": radar_score >= EXCEPTIONAL_EARLY_MIN_RADAR,
+        "flow": early.get("mode") == "FULL" and flow_score >= EXCEPTIONAL_EARLY_MIN_FLOW,
+        "timing": timing >= EXCEPTIONAL_EARLY_MIN_TIMING,
+        "coin": float(analysis.coin_score) >= EXCEPTIONAL_EARLY_MIN_COIN,
+        "rsi": 46 <= rsi15 <= 66,
+        "extension": -0.75 <= ext <= EXCEPTIONAL_EARLY_MAX_EXTENSION_ATR,
+        "volume_build": vol_build >= EXCEPTIONAL_EARLY_MIN_VOLUME_BUILD,
+        "volume": max(vol5, vol15) >= EXCEPTIONAL_EARLY_MIN_VOLUME,
+        "change_1h": -2.0 <= change1h <= EXCEPTIONAL_EARLY_MAX_CHANGE_1H,
+        "change_15m": -1.0 <= change15 <= EXCEPTIONAL_EARLY_MAX_CHANGE_15M,
+        "breakout": -BREAKOUT_MAX_ABOVE_PCT <= dist <= BREAKOUT_NEAR_PCT,
+        "not_chasing_24h": change24 <= 12.0,
+    }
+    ok = bool(EXCEPTIONAL_EARLY_ENABLED and all(checks.values()))
+    return {
+        "entry_ok": ok, "checks": checks, "radar": radar_score, "flow": flow_score,
+        "timing": timing, "coin": float(analysis.coin_score), "volume_build": vol_build,
+        "max_volume": max(vol5, vol15), "extension_atr": ext, "change_24h_pct": change24,
     }
 
 
@@ -5151,10 +5204,14 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     # setup الفني + التقييم بعد المشتقات + أمان السوق + لا تحذير مشتقات قوي + لا مطاردة مركبة.
     normal_entry_ok = bool(analysis.payload.get("entry_setup_ok") and analysis.coin_score >= learned_min)
     early_entry_ok = bool(early_flow.get("entry_ok"))
+    exceptional_early = exceptional_early_setup(analysis)
+    exceptional_early_ok = bool(exceptional_early.get("entry_ok"))
     analysis.payload["normal_entry_ok"] = normal_entry_ok
     analysis.payload["early_flow_entry_ok"] = early_entry_ok
+    analysis.payload["exceptional_early"] = exceptional_early
+    analysis.payload["exceptional_early_entry_ok"] = exceptional_early_ok
     analysis.entry_ok = bool(
-        (normal_entry_ok or early_entry_ok)
+        (normal_entry_ok or early_entry_ok or exceptional_early_ok)
         and market.market_safe
         and not derivative_block
         and not chase_guard
@@ -5164,7 +5221,10 @@ def get_analysis(symbol: str, market_score: float) -> Analysis:
     elif chase_guard:
         analysis.reason = "انتظار — Chase Guard: " + " + ".join(chase_reasons[:4])
     elif analysis.entry_ok:
-        if early_entry_ok and not normal_entry_ok:
+        if exceptional_early_ok and not normal_entry_ok and not early_entry_ok:
+            radar_score = float((analysis.payload.get("speculation_radar") or {}).get("score", 0) or 0)
+            analysis.reason = f"دخول Exceptional Early — Radar {radar_score:.0f}/100 | Early {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100"
+        elif early_entry_ok and not normal_entry_ok:
             analysis.reason = f"دخول Early Flow مبكر — {float(early_flow.get('score',0)):.0f}/100 | توقيت {float(early_flow.get('timing',0)):.0f}/100" + (f" | Smart Money +{float(early_flow.get('smart_money_boost',0)):.0f}" if float(early_flow.get("smart_money_boost",0) or 0) > 0 else "") + (f" | BTC RS {float(early_flow.get('btc_relative_adjust',0)):+.1f}" if abs(float(early_flow.get("btc_relative_adjust",0) or 0)) > 0 else "")
         else:
             analysis.reason = "دخول أول عالي الجودة — مؤكد برادار المشتقات" if deriv_score is not None else "دخول أول عالي الجودة"
@@ -5710,7 +5770,9 @@ def scan_for_entry(market_score: float) -> None:
             continue
 
         buy_reason = (
-            f"دخول Early Flow مبكر — {STRATEGY_VERSION}"
+            f"دخول Exceptional Early — {STRATEGY_VERSION}"
+            if fresh.payload.get("exceptional_early_entry_ok") and not fresh.payload.get("normal_entry_ok") and not fresh.payload.get("early_flow_entry_ok")
+            else f"دخول Early Flow مبكر — {STRATEGY_VERSION}"
             if fresh.payload.get("early_flow_entry_ok") and not fresh.payload.get("normal_entry_ok")
             else f"دخول مبكر قبل الانطلاق — {STRATEGY_VERSION}"
         )
