@@ -161,6 +161,10 @@ RESCUE_FULL_RECOVERY_ENABLED = os.getenv("RESCUE_FULL_RECOVERY_ENABLED", "1") ==
 RESCUE_FULL_RECOVERY_CONFIRMATIONS = int(os.getenv("RESCUE_FULL_RECOVERY_CONFIRMATIONS", "2"))
 RESCUE_FULL_RECOVERY_MIN_COIN_SCORE = float(os.getenv("RESCUE_FULL_RECOVERY_MIN_COIN_SCORE", "70"))
 RESCUE_FULL_RECOVERY_MIN_EVIDENCE = int(os.getenv("RESCUE_FULL_RECOVERY_MIN_EVIDENCE", "4"))
+# مرحلتان للخروج من Rescue: أولاً تعافٍ جارٍ، ثم استعادة اتجاه فعلية قبل إلغاء Rescue.
+RESCUE_TREND_RESTORE_CONFIRMATIONS = int(os.getenv("RESCUE_TREND_RESTORE_CONFIRMATIONS", "2"))
+RESCUE_TREND_RESTORE_MIN_COIN = float(os.getenv("RESCUE_TREND_RESTORE_MIN_COIN", "72"))
+RESCUE_TREND_RESTORE_MIN_REBOUND = float(os.getenv("RESCUE_TREND_RESTORE_MIN_REBOUND", "75"))
 
 # حماية Monitoring / Delisting من Binance
 RISK_CACHE_SECONDS = int(os.getenv("RISK_CACHE_SECONDS", "300"))
@@ -5505,16 +5509,66 @@ def rescue_full_recovery_state(position, analysis: Analysis) -> Tuple[bool, List
     return ok, evidence, blockers
 
 
-def rescue_recovery_confirmed(position, analysis: Analysis) -> Tuple[bool, List[str], List[str], int]:
+def rescue_trend_restored_state(position, analysis: Analysis) -> Tuple[bool, List[str]]:
+    """Second-stage Rescue recovery: require the trend itself to be restored, not only a rebound."""
+    p = analysis.payload or {}
+    flow = p.get("early_flow") or {}
+    deriv = p.get("derivatives") or {}
+    coin = float(analysis.coin_score or 0)
+    t5 = float(p.get("trend_5m", 0) or 0)
+    t15 = float(p.get("trend_15m", 0) or 0)
+    t1h = float(p.get("trend_1h", 0) or 0)
+    rsi15 = float(p.get("rsi_15m", 50) or 50)
+    rebound = float(p.get("rebound_score", 0) or 0)
+    vol5 = float(p.get("volume_5m", 0) or 0)
+    vol15 = float(p.get("volume_15m", 0) or 0)
+    dscore = deriv.get("derivatives_score")
+
+    reasons: List[str] = []
+    if coin < RESCUE_TREND_RESTORE_MIN_COIN:
+        reasons.append(f"Coin {coin:.1f}<{RESCUE_TREND_RESTORE_MIN_COIN:.0f}")
+    if t5 < 55 or t15 < 55 or t1h < 52:
+        reasons.append(f"الاتجاه لم يستعد بنيته 5M/15M/1H={t5:.0f}/{t15:.0f}/{t1h:.0f}")
+    if rebound < RESCUE_TREND_RESTORE_MIN_REBOUND:
+        reasons.append(f"الارتداد {rebound:.0f}<{RESCUE_TREND_RESTORE_MIN_REBOUND:.0f}")
+    if max(vol5, vol15) < 1.10:
+        reasons.append("الحجم لا يؤكد استعادة الاتجاه")
+    if not (42 <= rsi15 <= 68):
+        reasons.append(f"RSI15 {rsi15:.1f} خارج نطاق الاستعادة")
+    if float(flow.get("score", 0) or 0) < 78 or float(flow.get("timing", 0) or 0) < 65:
+        reasons.append("Early Flow/Timing غير مؤكدين")
+    if dscore is not None and float(dscore) <= DERIVATIVES_BLOCK_SCORE:
+        reasons.append(f"المشتقات سلبية {float(dscore):.0f}/100")
+    dom_change = p.get("btc_dominance_change_1h")
+    if dom_change is not None and float(dom_change) > BTC_MAX_DOMINANCE_RISE_1H:
+        reasons.append("BTC.D يرتفع بسرعة")
+    return not reasons, reasons
+
+
+def rescue_recovery_confirmed(position, analysis: Analysis) -> Tuple[bool, List[str], List[str], int, bool, int, List[str]]:
+    # المرحلة 1: الأدلة الحالية تعلن فقط أن التعافي جارٍ، ولا تلغي Rescue.
     ok, evidence, blockers = rescue_full_recovery_state(position, analysis)
-    key = f"rescue_recovery_confirm:{int(position['id'])}"
+    trade_id = int(position['id'])
+    key = f"rescue_recovery_confirm:{trade_id}"
     count = int(db.get_runtime(key, "0") or 0)
     if ok:
         count += 1
     else:
         count = 0
     db.set_runtime(key, str(count))
-    return count >= max(1, RESCUE_FULL_RECOVERY_CONFIRMATIONS), evidence, blockers, count
+    preliminary = count >= max(1, RESCUE_FULL_RECOVERY_CONFIRMATIONS)
+
+    # المرحلة 2: بعد ثبوت التعافي الأولي، نطلب استعادة اتجاه فعلية ومتتالية.
+    restore_key = f"rescue_trend_restore_confirm:{trade_id}"
+    restore_count = int(db.get_runtime(restore_key, "0") or 0)
+    restored_now, restore_blockers = rescue_trend_restored_state(position, analysis)
+    if preliminary and restored_now:
+        restore_count += 1
+    else:
+        restore_count = 0
+    db.set_runtime(restore_key, str(restore_count))
+    fully_recovered = preliminary and restore_count >= max(1, RESCUE_TREND_RESTORE_CONFIRMATIONS)
+    return fully_recovered, evidence, blockers, count, preliminary, restore_count, restore_blockers
 
 
 def manage_one_position(position, market_score: float) -> None:
@@ -5598,7 +5652,20 @@ def manage_one_position(position, market_score: float) -> None:
     # نحتاج عدة أدلة مستقلة + تأكيدين متتاليين. BTC مجرد عامل ضمن الصورة،
     # وارتفاع BTC Dominance السريع أو مشتقات شديدة السلبية يمنع إلغاء Rescue.
     if int(position["rescue_mode"] or 0):
-        recovered, recovery_evidence, recovery_blockers, recovery_count = rescue_recovery_confirmed(position, analysis)
+        recovered, recovery_evidence, recovery_blockers, recovery_count, recovery_preliminary, restore_count, restore_blockers = rescue_recovery_confirmed(position, analysis)
+        if recovery_preliminary and not recovered:
+            notifier.send_once(
+                f"RESCUE_RECOVERING:{position['id']}",
+                (
+                    f"🟡 تعافٍ جارٍ — {symbol}\n\n"
+                    f"• تحقق التعافي الأولي بعد {recovery_count} تأكيدات متتالية، لكن Rescue ما زال فعالًا.\n"
+                    f"• الأدلة: {' | '.join(recovery_evidence[:5])}\n"
+                    f"• تأكيد استعادة الاتجاه: {restore_count}/{max(1, RESCUE_TREND_RESTORE_CONFIRMATIONS)}\n"
+                    f"• الربح/الخسارة الحالية: {pnl:+.2f} USDT\n\n"
+                    "🔎 لن يعود هدف +10$ إلا بعد استعادة الاتجاه فعليًا؛ الارتداد المؤقت وحده لا يكفي."
+                ),
+                {"evidence": recovery_evidence, "restore_blockers": restore_blockers, "pnl": pnl, **analysis.payload},
+            )
         if recovered:
             db.clear_rescue_mode(int(position["id"]))
             db.add_trade_event(
@@ -5606,12 +5673,13 @@ def manage_one_position(position, market_score: float) -> None:
                 {"evidence": recovery_evidence, "confirmations": recovery_count, **analysis.payload},
             )
             db.set_runtime(f"rescue_recovery_confirm:{int(position['id'])}", "0")
+            db.set_runtime(f"rescue_trend_restore_confirm:{int(position['id'])}", "0")
             position = db.get_trade_by_id(int(position["id"])) or position
             notifier.send_once(
                 f"RESCUE_RECOVERED:{position['id']}",
                 (
                     f"💚 تعافي مؤكد — {symbol}\n\n"
-                    f"• تم إلغاء وضع الإنقاذ بعد {recovery_count} تأكيدات متتالية\n"
+                    f"• تم إلغاء وضع الإنقاذ بعد تعافٍ أولي + {restore_count} تأكيدات لاستعادة الاتجاه\n"
                     f"• الأدلة: {' | '.join(recovery_evidence[:5])}\n"
                     f"• الربح/الخسارة الحالية: {pnl:+.2f} USDT\n"
                     f"• عاد الهدف إلى +{TARGET_NET_PROFIT:.0f}$ صافي بعد الرسوم.\n\n"
