@@ -5376,14 +5376,33 @@ def averaging_allowed(position, analysis: Analysis) -> bool:
     required_drop = MIN_AVERAGE_DROP_PCT + max(0, int(position["tranches"]) - 1) * 1.25
     if drop_pct < required_drop:
         return False
-    if analysis.coin_score < max(MIN_AVERAGE_COIN_SCORE, SMART_AVERAGE_MIN_COIN_SCORE):
+    # شروط التعزيز تتكيف مع عمق الهبوط، لكن لا يوجد DCA أعمى:
+    # - هبوط عادي (<10%): نحافظ على الشروط الأصلية الصارمة.
+    # - هبوط متوسط (10-25%): نسمح بالتقاط تعافٍ مبكر مؤكد بشروط أخف قليلًا.
+    # - هبوط عميق (>=25%): لا نشتري لمجرد أن السعر رخيص؛ نطلب ارتدادًا قويًا،
+    #   بينما نسمح بأن يكون اتجاه الساعة/درجة العملة ما زالا في طور التعافي.
+    if drop_pct < 10.0:
+        min_coin_score = max(MIN_AVERAGE_COIN_SCORE, SMART_AVERAGE_MIN_COIN_SCORE)
+        min_rebound_score = max(MIN_AVERAGE_REBOUND_SCORE, SMART_AVERAGE_MIN_REBOUND)
+        min_trend_1h = 45.0
+    elif drop_pct < 25.0:
+        min_coin_score = 55.0
+        min_rebound_score = 72.0
+        min_trend_1h = 42.0
+    else:
+        min_coin_score = 52.0
+        min_rebound_score = 76.0
+        min_trend_1h = 40.0
+
+    if analysis.coin_score < min_coin_score:
         return False
-    if float(analysis.payload.get("rebound_score", 0) or 0) < max(MIN_AVERAGE_REBOUND_SCORE, SMART_AVERAGE_MIN_REBOUND):
+    if float(analysis.payload.get("rebound_score", 0) or 0) < min_rebound_score:
         return False
     if not bool(analysis.payload.get("market_safe", False)):
         return False
-    # لا نعزز أثناء سقوط قوي على الساعة؛ نريد ارتدادًا حقيقيًا لا سكينًا ساقطًا.
-    if float(analysis.payload.get("trend_1h", 0) or 0) < 45:
+    # analysis.rebound_ok في طبقة التنفيذ يبقى شرطًا إضافيًا: reclaim EMA20 + RSI صاعد + عودة الحجم.
+    # لذلك حتى في الهبوط العميق لا يتم التعزيز أثناء السقوط الحر.
+    if float(analysis.payload.get("trend_1h", 0) or 0) < min_trend_1h:
         return False
     if not (32 <= float(analysis.payload.get("rsi_15m", 50) or 50) <= 64):
         return False
