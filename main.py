@@ -5691,8 +5691,12 @@ def manage_one_position(position, market_score: float) -> None:
     # إذا بقي Rescue فعالًا بعد فحص التعافي، نخرج فقط بأول صافي موجب آمن.
     if int(position["rescue_mode"] or 0) and pnl >= RESCUE_NET_BUFFER:
         reason = f"خروج إنقاذ بصافي {RESCUE_NET_BUFFER:.2f}$ بعد الرسوم"
-        realized = broker.sell_all(position, current_price, reason, {"pnl": pnl})
-        send_sell_message(position, current_price, realized, reason)
+        rescue_reason = str(position["rescue_reason"] or "").strip()
+        display_reason = reason
+        if rescue_reason:
+            display_reason += f"\n• سبب تفعيل Rescue: {rescue_reason}"
+        realized = broker.sell_all(position, current_price, reason, {"pnl": pnl, "rescue_reason": rescue_reason})
+        send_sell_message(position, current_price, realized, display_reason)
         learner.record_closed_trade(position, realized)
         return
 
