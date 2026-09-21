@@ -182,6 +182,14 @@ MONITORING_FALLBACK_ASSETS = {
 }
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
+
+# صيانة SQLite — تمنع تضخم قاعدة البيانات مع إبقاء بيانات التداول والتعلم المهمة.
+DB_MAINTENANCE_ENABLED = os.getenv("DB_MAINTENANCE_ENABLED", "1") == "1"
+DB_MAINTENANCE_INTERVAL_HOURS = int(os.getenv("DB_MAINTENANCE_INTERVAL_HOURS", "6"))
+ANALYSES_RETENTION_DAYS = int(os.getenv("ANALYSES_RETENTION_DAYS", "14"))
+MARKET_SNAPSHOTS_RETENTION_DAYS = int(os.getenv("MARKET_SNAPSHOTS_RETENTION_DAYS", "30"))
+DERIVATIVES_RETENTION_DAYS = int(os.getenv("DERIVATIVES_RETENTION_DAYS", "30"))
+EARLY_FLOW_RETENTION_DAYS = int(os.getenv("EARLY_FLOW_RETENTION_DAYS", "30"))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "500000"))
 MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "200"))
 MIN_LISTING_YEAR = int(os.getenv("MIN_LISTING_YEAR", "2021"))
@@ -484,6 +492,33 @@ class Database:
             conn.commit()
         finally:
             conn.close()
+
+    def maintenance_cleanup(self) -> Dict[str, int]:
+        """Prune high-frequency history while preserving trades, fills and learning snapshots."""
+        if not DB_MAINTENANCE_ENABLED:
+            return {}
+        deleted: Dict[str, int] = {}
+        with self.connect() as conn:
+            rules = [
+                ("analyses", ANALYSES_RETENTION_DAYS, "1=1"),
+                ("market_snapshots", MARKET_SNAPSHOTS_RETENTION_DAYS, "1=1"),
+                ("derivatives_snapshots", DERIVATIVES_RETENTION_DAYS, "1=1"),
+                # Never remove an Early Flow sample until all 1h/3h/6h outcomes are complete.
+                ("early_flow_learning", EARLY_FLOW_RETENTION_DAYS,
+                 "evaluated_1h=1 AND evaluated_3h=1 AND evaluated_6h=1"),
+            ]
+            for table, days, extra in rules:
+                before = conn.total_changes
+                conn.execute(
+                    f"DELETE FROM {table} WHERE {extra} AND julianday(ts) < julianday('now', ?)",
+                    (f"-{max(1, int(days))} days",),
+                )
+                deleted[table] = conn.total_changes - before
+            # Keep WAL/SHM small. Freed pages in the main DB are reused by SQLite,
+            # so the database stops growing even when VACUUM is not possible.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA optimize")
+        return deleted
 
     def add_analysis(
         self,
@@ -5890,10 +5925,25 @@ def run_forever() -> None:
         {"version": STRATEGY_VERSION},
     )
 
+    last_db_maintenance = 0.0
+
     while True:
         started = time.time()
 
         try:
+            if DB_MAINTENANCE_ENABLED and (
+                last_db_maintenance <= 0
+                or time.time() - last_db_maintenance >= DB_MAINTENANCE_INTERVAL_HOURS * 3600
+            ):
+                try:
+                    removed = db.maintenance_cleanup()
+                    total_removed = sum(removed.values())
+                    print(f"DB maintenance: removed {total_removed} old rows | {removed}", flush=True)
+                except Exception as exc:
+                    print(f"DB maintenance error: {exc}", flush=True)
+                finally:
+                    last_db_maintenance = time.time()
+
             commands.poll_once()
             # Learning V4: complete due 1h/3h/6h outcomes before making new decisions.
             evaluate_early_flow_learning()
