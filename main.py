@@ -5442,6 +5442,15 @@ def averaging_allowed(position, analysis: Analysis) -> bool:
     if not (32 <= float(analysis.payload.get("rsi_15m", 50) or 50) <= 64):
         return False
 
+    # حماية من تكرار سيناريو استنزاف 4/4 أثناء اتجاه هابط:
+    # الدفعتان الثالثة والرابعة لا يكفي لهما ارتداد لحظي. يجب أن تكون بنية الاتجاه
+    # قد استعادت شروط Rescue Trend Restore نفسها (اتجاه + حجم + Early Flow + مشتقات).
+    # الدفعة الثانية تبقى على منطق التعزيز الحالي حتى لا نقتل تحسين المتوسط المبكر.
+    if int(position["tranches"] or 0) >= 2:
+        restored, _restore_blockers = rescue_trend_restored_state(position, analysis)
+        if not restored:
+            return False
+
     last_buy_at = position["last_buy_at"]
     if last_buy_at:
         try:
