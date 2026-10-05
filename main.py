@@ -28,6 +28,8 @@ import re
 import sqlite3
 import time
 import traceback
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -73,6 +75,12 @@ BTC_MAX_DOMINANCE = float(os.getenv("BTC_MAX_DOMINANCE", "62.0"))
 BTC_MAX_DOMINANCE_RISE_1H = float(os.getenv("BTC_MAX_DOMINANCE_RISE_1H", "0.30"))
 COINGECKO_GLOBAL_URL = os.getenv("COINGECKO_GLOBAL_URL", "https://api.coingecko.com/api/v3/global")
 MARKET_CONTEXT_CACHE_SECONDS = int(os.getenv("MARKET_CONTEXT_CACHE_SECONDS", "300"))
+
+# Market Intelligence — أخبار عامة/ماكرو للعرض في /market. لا تفتح صفقة بمفردها.
+MARKET_NEWS_ENABLED = os.getenv("MARKET_NEWS_ENABLED", "1") == "1"
+MARKET_NEWS_CACHE_SECONDS = int(os.getenv("MARKET_NEWS_CACHE_SECONDS", "600"))
+MARKET_NEWS_LOOKBACK_HOURS = int(os.getenv("MARKET_NEWS_LOOKBACK_HOURS", "18"))
+MARKET_NEWS_MAX_ITEMS = int(os.getenv("MARKET_NEWS_MAX_ITEMS", "5"))
 
 # Binance Alpha — التحليل اليدوي متاح فقط؛ الدخول الآلي يبقى Spot Only عبر Universe.candidates().
 BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "1") == "1"
@@ -3789,6 +3797,189 @@ class TelegramCommands:
         except Exception as exc:
             return f"تعذر عرض Learning V4: {exc}"
 
+    def _market_news(self) -> Dict:
+        """Fetch recent market-moving headlines from Google News RSS and score risk conservatively."""
+        if not MARKET_NEWS_ENABLED:
+            return {"available": False, "risk": "غير متاح", "score": 0, "items": [], "reason": "ميزة الأخبار متوقفة"}
+
+        now = time.time()
+        cache = getattr(self, "_market_news_cache", None)
+        if cache and now - cache[0] <= MARKET_NEWS_CACHE_SECONDS:
+            return cache[1]
+
+        queries = [
+            'Bitcoin crypto market Fed inflation CPI jobs interest rates',
+            'Bitcoin ETF crypto regulation SEC Binance hack exploit',
+        ]
+        items = []
+        seen = set()
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, MARKET_NEWS_LOOKBACK_HOURS))
+        errors = []
+        for query in queries:
+            try:
+                r = requests.get(
+                    "https://news.google.com/rss/search",
+                    params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                    timeout=12,
+                    headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"},
+                )
+                r.raise_for_status()
+                root = ET.fromstring(r.content)
+                for node in root.findall(".//item"):
+                    title = (node.findtext("title") or "").strip()
+                    pub = (node.findtext("pubDate") or "").strip()
+                    if not title or title.lower() in seen:
+                        continue
+                    try:
+                        dt = parsedate_to_datetime(pub)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        dt = dt.astimezone(timezone.utc)
+                    except Exception:
+                        continue
+                    if dt < cutoff:
+                        continue
+                    seen.add(title.lower())
+                    items.append({"title": title, "dt": dt})
+            except Exception as exc:
+                errors.append(str(exc))
+
+        # Risk is intentionally conservative: macro-event/hack/regulatory stress raises caution;
+        # generic price headlines do not receive a high-risk classification.
+        high_terms = (
+            "hack", "hacked", "exploit", "breach", "attack", "liquidation", "liquidations",
+            "ban", "shutdown", "insolvency", "bankruptcy", "emergency", "war", "tariff",
+            "fomc", "fed decision", "interest rate decision", "cpi", "inflation report",
+            "jobs report", "nonfarm", "payrolls", "sec lawsuit", "etf rejection",
+        )
+        medium_terms = (
+            "federal reserve", "fed", "inflation", "interest rate", "jobs", "employment",
+            "sec", "regulation", "etf", "binance", "coinbase", "outflow", "selloff",
+            "volatility", "geopolitical",
+        )
+        positive_terms = (
+            "etf approval", "approved", "inflows", "rate cut", "cuts rates", "adoption",
+            "reserve", "institutional demand",
+        )
+
+        scored = []
+        for item in items:
+            low = item["title"].lower()
+            severity = 0
+            if any(k in low for k in high_terms):
+                severity = 3
+            elif any(k in low for k in medium_terms):
+                severity = 2
+            elif any(k in low for k in positive_terms):
+                severity = 1
+            if severity:
+                scored.append((severity, item))
+
+        scored.sort(key=lambda x: (x[0], x[1]["dt"]), reverse=True)
+        selected = [x[1] for x in scored[:MARKET_NEWS_MAX_ITEMS]]
+        max_sev = max([x[0] for x in scored], default=0)
+        high_count = sum(1 for x in scored if x[0] >= 3)
+        med_count = sum(1 for x in scored if x[0] == 2)
+        if high_count >= 1:
+            risk, score = "مرتفع", 3
+        elif med_count >= 2:
+            risk, score = "متوسط", 2
+        elif med_count == 1 or selected:
+            risk, score = "منخفض", 1
+        else:
+            risk, score = "منخفض", 0
+
+        result = {
+            "available": bool(items), "risk": risk, "score": score, "items": selected,
+            "reason": "" if items else ("تعذر جلب الأخبار" + (f": {errors[0]}" if errors else "")),
+        }
+        self._market_news_cache = (now, result)
+        return result
+
+    def _market_intelligence_text(self) -> str:
+        try:
+            market = get_market_context()
+            news = self._market_news()
+            trend = float(market.btc_trend_score or 0)
+            btc1h = float(market.btc_change_1h or 0)
+            dom = market.btc_dominance
+            dom_chg = market.btc_dominance_change_1h
+
+            if trend >= 65 and btc1h >= 0:
+                btc_label = "صاعد 🟢"
+            elif trend >= BTC_MIN_TREND_SCORE and btc1h >= -0.20:
+                btc_label = "متماسك/إيجابي 🟢"
+            elif btc1h <= -1.0 or trend < 45:
+                btc_label = "ضعيف 🔴"
+            else:
+                btc_label = "محايد 🟡"
+
+            if dom is None:
+                dom_label = "غير متاحة ⚪"
+                alt_effect = "غير محسوم"
+            elif dom_chg is not None and dom_chg > BTC_MAX_DOMINANCE_RISE_1H:
+                dom_label = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🔴"
+                alt_effect = "ضغط على Altcoins"
+            elif dom_chg is not None and dom_chg < -0.10:
+                dom_label = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🟢"
+                alt_effect = "داعم نسبيًا للـ Altcoins"
+            else:
+                dom_label = f"{dom:.2f}% | 1H {(dom_chg or 0):+.2f} 🟡"
+                alt_effect = "محايد"
+
+            news_score = int(news.get("score", 0) or 0)
+            if news_score >= 3:
+                verdict = "🔴 تجنب فتح صفقات جديدة حاليًا"
+                why = "مخاطر الأخبار/الماكرو مرتفعة وقد تسبب حركة مفاجئة حتى لو كان الشارت جيدًا."
+            elif not market.market_safe:
+                verdict = "🔴 السوق غير مناسب للدخول حاليًا"
+                why = market.reason
+            elif news_score == 2:
+                verdict = "🟡 الانتظار أفضل حاليًا"
+                why = "الوضع الفني مقبول، لكن الأخبار/الماكرو ترفع مخاطر التذبذب."
+            elif market.score < MIN_MARKET_SCORE:
+                verdict = "🟡 دخول انتقائي فقط"
+                why = f"السوق آمن نسبيًا لكن Market Score ما زال {market.score:.1f}/100."
+            else:
+                verdict = "🟢 السوق مناسب حاليًا للبحث عن فرص"
+                why = "BTC وBTC.D يسمحان نسبيًا، ولا توجد إشارة أخبار عالية المخاطر في الرصد الحالي."
+
+            lines = [
+                "🌐 MARKET INTELLIGENCE", "",
+                "₿ Bitcoin",
+                f"• السعر: {market.btc_price:,.2f} USDT",
+                f"• الاتجاه: {btc_label}",
+                f"• قوة الاتجاه: {trend:.1f}/100",
+                f"• حركة 1H: {btc1h:+.2f}%", "",
+                "📊 BTC Dominance",
+                f"• الهيمنة: {dom_label}",
+                f"• التأثير على Altcoins: {alt_effect}", "",
+                "📰 News & Macro Risk",
+                f"• مستوى المخاطر: {news.get('risk','غير متاح')}",
+            ]
+            if news.get("items"):
+                for item in news["items"][:3]:
+                    age_h = max(0.0, (datetime.now(timezone.utc) - item["dt"]).total_seconds() / 3600.0)
+                    title = item["title"]
+                    if len(title) > 125:
+                        title = title[:122] + "..."
+                    lines.append(f"• {title} ({age_h:.1f}h)")
+            else:
+                lines.append(f"• {news.get('reason') or 'لا توجد عناوين مؤثرة حديثة في الرصد الحالي'}")
+
+            regime = "إيجابي" if market.market_safe and market.score >= MIN_MARKET_SCORE else ("حذر" if market.score >= 45 else "ضعيف")
+            lines += [
+                "", "🧭 Market Regime",
+                f"• قوة السوق: {market.score:.1f}/100",
+                f"• الحالة: {regime}",
+                f"• Market Safe: {'نعم ✅' if market.market_safe else 'لا ❌'}",
+                "", "🎯 قرار البوت", verdict, "", f"السبب: {why}",
+                "", "ℹ️ الأخبار طبقة مخاطر وليست إشارة شراء مستقلة. التقرير لا يفتح أو يغلق صفقة.",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"❌ تعذر إنشاء Market Intelligence: {exc}"
+
     def handle(self, text: str) -> None:
         raw = text.strip()
         if not raw:
@@ -3804,6 +3995,7 @@ class TelegramCommands:
                 "🤖 /status أو /الحالة — عرض حالة البوت والصفقة الحالية\n"
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
+                "🌐 /market أو /السوق — Market Intelligence: BTC + BTC.D + الأخبار والمخاطر + قرار السوق\n"
                 "🧠 /learning [SYMBOLUSDT] — عرض ما تعلمه Learning V4 وتأثيره على الدخول\n"
                 "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
                 "🕵️ /scan SYMBOLUSDT — سجل الاكتشاف + لقطة كاملة عند أعلى Radar/Early وسبب الرفض وقتها\n"
@@ -3819,6 +4011,8 @@ class TelegramCommands:
             self._reply(self._status_text())
         elif command in {"/stats", "/الإحصائيات"}:
             self._reply(self._stats_text())
+        elif command in {"/market", "/السوق"}:
+            self._reply(self._market_intelligence_text())
         elif command in {"/learning", "/تعلم"}:
             learning_symbol = parts[1] if len(parts) >= 2 else None
             self._reply(self._learning_text(learning_symbol))
