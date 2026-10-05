@@ -81,6 +81,8 @@ MARKET_NEWS_ENABLED = os.getenv("MARKET_NEWS_ENABLED", "1") == "1"
 MARKET_NEWS_CACHE_SECONDS = int(os.getenv("MARKET_NEWS_CACHE_SECONDS", "600"))
 MARKET_NEWS_LOOKBACK_HOURS = int(os.getenv("MARKET_NEWS_LOOKBACK_HOURS", "18"))
 MARKET_NEWS_MAX_ITEMS = int(os.getenv("MARKET_NEWS_MAX_ITEMS", "5"))
+MARKET_NEWS_TIMEOUT_SECONDS = float(os.getenv("MARKET_NEWS_TIMEOUT_SECONDS", "4"))
+BTC_DOMINANCE_STALE_MAX_MINUTES = int(os.getenv("BTC_DOMINANCE_STALE_MAX_MINUTES", "180"))
 
 # Binance Alpha — التحليل اليدوي متاح فقط؛ الدخول الآلي يبقى Spot Only عبر Universe.candidates().
 BINANCE_ALPHA_ENABLED = os.getenv("BINANCE_ALPHA_ENABLED", "1") == "1"
@@ -818,6 +820,29 @@ class Database:
                 """
             ).fetchone()
             return float(row["btc_dominance"]) if row and row["btc_dominance"] is not None else None
+
+    def latest_btc_dominance(self, max_age_minutes: int = 180) -> Optional[Tuple[float, float]]:
+        """Return the latest trusted BTC.D snapshot and its age in minutes."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ts, btc_dominance FROM market_snapshots
+                WHERE btc_dominance IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        if not row or row["btc_dominance"] is None:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(row["ts"]))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60.0)
+        except Exception:
+            return None
+        if age > max(1, int(max_age_minutes)):
+            return None
+        return float(row["btc_dominance"]), age
 
     def trade_stats(self):
         with self.connect() as conn:
@@ -3798,7 +3823,7 @@ class TelegramCommands:
             return f"تعذر عرض Learning V4: {exc}"
 
     def _market_news(self) -> Dict:
-        """Fetch recent market-moving headlines from Google News RSS and score risk conservatively."""
+        """Fetch Arabic market-moving headlines quickly, with fallback and stale-cache protection."""
         if not MARKET_NEWS_ENABLED:
             return {"available": False, "risk": "غير متاح", "score": 0, "items": [], "reason": "ميزة الأخبار متوقفة"}
 
@@ -3808,79 +3833,71 @@ class TelegramCommands:
             return cache[1]
 
         queries = [
-            'Bitcoin crypto market Fed inflation CPI jobs interest rates',
-            'Bitcoin ETF crypto regulation SEC Binance hack exploit',
+            "بيتكوين الفيدرالي التضخم الوظائف الفائدة العملات الرقمية",
+            "بيتكوين ETF تنظيم العملات الرقمية SEC بينانس اختراق",
         ]
-        items = []
-        seen = set()
+        sources = [
+            ("Google News", "https://news.google.com/rss/search", lambda q: {"q": q, "hl": "ar", "gl": "SA", "ceid": "SA:ar"}),
+            ("Bing News", "https://www.bing.com/news/search", lambda q: {"q": q, "format": "rss", "setlang": "ar-SA"}),
+        ]
+        items, seen, errors = [], set(), []
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, MARKET_NEWS_LOOKBACK_HOURS))
-        errors = []
-        for query in queries:
-            try:
-                r = requests.get(
-                    "https://news.google.com/rss/search",
-                    params={"q": query, "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
-                    timeout=12,
-                    headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"},
-                )
-                r.raise_for_status()
-                root = ET.fromstring(r.content)
-                for node in root.findall(".//item"):
-                    title = (node.findtext("title") or "").strip()
-                    pub = (node.findtext("pubDate") or "").strip()
-                    if not title or title.lower() in seen:
-                        continue
-                    try:
-                        dt = parsedate_to_datetime(pub)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        dt = dt.astimezone(timezone.utc)
-                    except Exception:
-                        continue
-                    if dt < cutoff:
-                        continue
-                    seen.add(title.lower())
-                    items.append({"title": title, "dt": dt})
-            except Exception as exc:
-                errors.append(str(exc))
+        arabic_re = re.compile(r"[\u0600-\u06FF]")
 
-        # Risk is intentionally conservative: macro-event/hack/regulatory stress raises caution;
-        # generic price headlines do not receive a high-risk classification.
+        for source_name, url, params_fn in sources:
+            for query in queries:
+                try:
+                    r = requests.get(
+                        url, params=params_fn(query), timeout=MARKET_NEWS_TIMEOUT_SECONDS,
+                        headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"},
+                    )
+                    r.raise_for_status()
+                    root = ET.fromstring(r.content)
+                    for node in root.findall(".//item"):
+                        title = (node.findtext("title") or "").strip()
+                        pub = (node.findtext("pubDate") or "").strip()
+                        if not title or title.lower() in seen or not arabic_re.search(title):
+                            continue
+                        try:
+                            dt = parsedate_to_datetime(pub)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            dt = dt.astimezone(timezone.utc)
+                        except Exception:
+                            continue
+                        if dt < cutoff:
+                            continue
+                        seen.add(title.lower())
+                        items.append({"title": title, "dt": dt, "source": source_name})
+                    if items:
+                        break
+                except Exception as exc:
+                    errors.append(f"{source_name}: {exc}")
+            if items:
+                break
+
         high_terms = (
-            "hack", "hacked", "exploit", "breach", "attack", "liquidation", "liquidations",
-            "ban", "shutdown", "insolvency", "bankruptcy", "emergency", "war", "tariff",
-            "fomc", "fed decision", "interest rate decision", "cpi", "inflation report",
-            "jobs report", "nonfarm", "payrolls", "sec lawsuit", "etf rejection",
+            "اختراق", "هجوم", "إفلاس", "تصفية", "حظر", "طوارئ", "حرب", "رسوم جمركية",
+            "قرار الفائدة", "قرار الاحتياطي", "الفيدرالي", "التضخم", "مؤشر أسعار المستهلك",
+            "تقرير الوظائف", "الوظائف الأمريكية", "رفض الصندوق", "دعوى",
         )
         medium_terms = (
-            "federal reserve", "fed", "inflation", "interest rate", "jobs", "employment",
-            "sec", "regulation", "etf", "binance", "coinbase", "outflow", "selloff",
-            "volatility", "geopolitical",
+            "الفائدة", "الاحتياطي الفيدرالي", "وظائف", "توظيف", "تنظيم", "هيئة الأوراق",
+            "صندوق متداول", "بينانس", "تدفقات خارجة", "بيع مكثف", "تقلب", "جيوسياسي",
         )
-        positive_terms = (
-            "etf approval", "approved", "inflows", "rate cut", "cuts rates", "adoption",
-            "reserve", "institutional demand",
-        )
+        positive_terms = ("موافقة", "تدفقات داخلة", "خفض الفائدة", "تبني", "طلب مؤسسي")
 
         scored = []
         for item in items:
             low = item["title"].lower()
-            severity = 0
-            if any(k in low for k in high_terms):
-                severity = 3
-            elif any(k in low for k in medium_terms):
-                severity = 2
-            elif any(k in low for k in positive_terms):
-                severity = 1
+            severity = 3 if any(k in low for k in high_terms) else 2 if any(k in low for k in medium_terms) else 1 if any(k in low for k in positive_terms) else 0
             if severity:
                 scored.append((severity, item))
-
         scored.sort(key=lambda x: (x[0], x[1]["dt"]), reverse=True)
         selected = [x[1] for x in scored[:MARKET_NEWS_MAX_ITEMS]]
-        max_sev = max([x[0] for x in scored], default=0)
         high_count = sum(1 for x in scored if x[0] >= 3)
         med_count = sum(1 for x in scored if x[0] == 2)
-        if high_count >= 1:
+        if high_count:
             risk, score = "مرتفع", 3
         elif med_count >= 2:
             risk, score = "متوسط", 2
@@ -3889,12 +3906,20 @@ class TelegramCommands:
         else:
             risk, score = "منخفض", 0
 
-        result = {
-            "available": bool(items), "risk": risk, "score": score, "items": selected,
-            "reason": "" if items else ("تعذر جلب الأخبار" + (f": {errors[0]}" if errors else "")),
-        }
-        self._market_news_cache = (now, result)
-        return result
+        if items:
+            result = {"available": True, "risk": risk, "score": score, "items": selected,
+                      "reason": "" if selected else "لا توجد عناوين عالية التأثير ضمن الرصد الحالي"}
+            self._market_news_cache = (now, result)
+            return result
+
+        # If providers fail, keep the last successful in-process snapshot instead of blocking /market.
+        if cache and cache[1].get("available"):
+            stale = dict(cache[1])
+            stale["stale"] = True
+            stale["reason"] = "تعذر التحديث اللحظي؛ يتم عرض آخر أخبار موثوقة محفوظة"
+            return stale
+        return {"available": False, "risk": "غير متاح", "score": 0, "items": [],
+                "reason": "تعذر تحديث الأخبار حاليًا؛ لم تُحتسب الأخبار في القرار"}
 
     def _market_intelligence_text(self) -> str:
         try:
@@ -4376,12 +4401,18 @@ def get_market_context() -> MarketContext:
     dominance: Optional[float] = None
     dominance_change: Optional[float] = None
     dominance_error = ""
+    dominance_stale_age: Optional[float] = None
     try:
         dominance = api.btc_dominance()
         previous = db.dominance_about_an_hour_ago()
         dominance_change = dominance - previous if previous is not None else 0.0
     except Exception as exc:
         dominance_error = str(exc)
+        fallback = db.latest_btc_dominance(BTC_DOMINANCE_STALE_MAX_MINUTES)
+        if fallback is not None:
+            dominance, dominance_stale_age = fallback
+            previous = db.dominance_about_an_hour_ago()
+            dominance_change = dominance - previous if previous is not None else 0.0
 
     btc_ok = btc_trend >= BTC_MIN_TREND_SCORE and btc_change_1h >= -0.20
     dominance_ok = (
@@ -4396,11 +4427,22 @@ def get_market_context() -> MarketContext:
         reasons.append(f"BTC غير آمن: trend={btc_trend:.1f}, 1h={btc_change_1h:+.2f}%")
     if dominance is None:
         reasons.append(f"تعذر قراءة BTC.D: {dominance_error}")
+    elif dominance_stale_age is not None:
+        reasons.append(f"BTC.D من آخر قراءة موثوقة قبل {dominance_stale_age:.0f} دقيقة")
+        if dominance > BTC_MAX_DOMINANCE:
+            reasons.append(f"BTC.D مرتفعة {dominance:.2f}%")
+        elif dominance_change is not None and dominance_change > BTC_MAX_DOMINANCE_RISE_1H:
+            reasons.append(f"BTC.D ترتفع +{dominance_change:.2f} نقطة/ساعة")
     elif dominance > BTC_MAX_DOMINANCE:
         reasons.append(f"BTC.D مرتفعة {dominance:.2f}%")
     elif dominance_change is not None and dominance_change > BTC_MAX_DOMINANCE_RISE_1H:
         reasons.append(f"BTC.D ترتفع +{dominance_change:.2f} نقطة/ساعة")
-    reason = "السوق آمن نسبيًا للألتكوين" if market_safe else " | ".join(reasons)
+    if market_safe:
+        reason = "السوق آمن نسبيًا للألتكوين"
+        if dominance_stale_age is not None:
+            reason += f" | BTC.D آخر قراءة موثوقة قبل {dominance_stale_age:.0f} دقيقة"
+    else:
+        reason = " | ".join(reasons)
 
     context = MarketContext(
         score=score, btc_price=btc_price, btc_trend_score=btc_trend,
