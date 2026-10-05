@@ -3819,7 +3819,7 @@ class TelegramCommands:
             try:
                 r = requests.get(
                     "https://news.google.com/rss/search",
-                    params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                    params={"q": query, "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
                     timeout=12,
                     headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"},
                 )
@@ -3958,12 +3958,14 @@ class TelegramCommands:
                 f"• مستوى المخاطر: {news.get('risk','غير متاح')}",
             ]
             if news.get("items"):
+                saudi_tz = timezone(timedelta(hours=3))
                 for item in news["items"][:3]:
-                    age_h = max(0.0, (datetime.now(timezone.utc) - item["dt"]).total_seconds() / 3600.0)
                     title = item["title"]
                     if len(title) > 125:
                         title = title[:122] + "..."
-                    lines.append(f"• {title} ({age_h:.1f}h)")
+                    saudi_dt = item["dt"].astimezone(saudi_tz)
+                    saudi_time = saudi_dt.strftime("%Y-%m-%d %H:%M")
+                    lines.append(f"• {title} — {saudi_time} بتوقيت السعودية")
             else:
                 lines.append(f"• {news.get('reason') or 'لا توجد عناوين مؤثرة حديثة في الرصد الحالي'}")
 
