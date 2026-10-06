@@ -3822,35 +3822,59 @@ class TelegramCommands:
         except Exception as exc:
             return f"تعذر عرض Learning V4: {exc}"
 
+    @staticmethod
+    def _news_explanation(title: str) -> Tuple[str, str, int]:
+        """Return (impact_label, simple Arabic explanation, risk_score). Risk is event volatility, not sentiment."""
+        t = (title or "").lower()
+        # Critical crypto/systemic risks.
+        if any(k in t for k in ("اختراق", "هجوم", "إفلاس", "تجميد السحب", "حظر", "تصفية جماعية", "دعوى قضائية")):
+            return "🔴 سلبي/خطر", "قد يضغط على سوق الكريبتو مباشرة ويرفع احتمال الهبوط والتذبذب.", 3
+        # Scheduled/high-impact macro: direction may be unknown before the release, so treat as volatility risk.
+        if any(k in t for k in ("قرار الفائدة", "الفيدرالي", "الاحتياطي الفيدرالي", "التضخم", "مؤشر أسعار المستهلك", "تقرير الوظائف", "الوظائف الأمريكية", "البطالة")):
+            if any(k in t for k in ("خفض الفائدة", "تراجع توقعات رفع الفائدة", "أضعف من المتوقع", "ضعف الوظائف", "تباطؤ التضخم")):
+                return "🟢 داعم غالبًا", "الخبر يميل لدعم بيتكوين لأنه يقلل ضغط الفائدة أو التشدد النقدي، مع بقاء احتمال التذبذب.", 1
+            if any(k in t for k in ("رفع الفائدة", "أقوى من المتوقع", "تسارع التضخم", "ارتفاع التضخم")):
+                return "🔴 ضاغط غالبًا", "الخبر قد يضغط على بيتكوين لأنه يزيد احتمال بقاء الفائدة مرتفعة أو تشدد السياسة النقدية.", 2
+            return "🟡 حدث عالي التأثير", "النتيجة قد تحرك بيتكوين بقوة؛ الأفضل الحذر قرب وقت صدور البيانات.", 2
+        if any(k in t for k in ("موافقة", "تدفقات داخلة", "تبني", "طلب مؤسسي", "صندوق متداول")):
+            return "🟢 إيجابي", "يميل لدعم الطلب والثقة في سوق الكريبتو، لكنه لا يكفي وحده للدخول.", 0
+        if any(k in t for k in ("رسوم جمركية", "حرب", "جيوسياسي", "بيع مكثف", "تدفقات خارجة")):
+            return "🟡 مخاطرة", "قد يرفع التذبذب ويضغط على الأصول عالية المخاطر مثل بيتكوين.", 2
+        return "⚪ محايد", "لا يظهر من العنوان وحده تأثير قوي وواضح على قرار الدخول.", 0
+
     def _market_news(self) -> Dict:
-        """Fetch Arabic market-moving headlines quickly, with fallback and stale-cache protection."""
+        """Arabic market headlines limited to Saudi today/tomorrow, with short explanations."""
         if not MARKET_NEWS_ENABLED:
             return {"available": False, "risk": "غير متاح", "score": 0, "items": [], "reason": "ميزة الأخبار متوقفة"}
 
-        now = time.time()
+        now_ts = time.time()
         cache = getattr(self, "_market_news_cache", None)
-        if cache and now - cache[0] <= MARKET_NEWS_CACHE_SECONDS:
+        if cache and now_ts - cache[0] <= MARKET_NEWS_CACHE_SECONDS:
             return cache[1]
 
+        saudi_tz = timezone(timedelta(hours=3))
+        now_sa = datetime.now(saudi_tz)
+        today = now_sa.date()
+        tomorrow = today + timedelta(days=1)
+        start_utc = datetime.combine(today, datetime.min.time(), tzinfo=saudi_tz).astimezone(timezone.utc)
+        end_utc = datetime.combine(tomorrow, datetime.max.time(), tzinfo=saudi_tz).astimezone(timezone.utc)
+
         queries = [
-            "بيتكوين الفيدرالي التضخم الوظائف الفائدة العملات الرقمية",
-            "بيتكوين ETF تنظيم العملات الرقمية SEC بينانس اختراق",
+            "بيتكوين الفيدرالي التضخم الوظائف الفائدة العملات الرقمية اليوم غدا",
+            "بيتكوين ETF تنظيم العملات الرقمية SEC بينانس اختراق اليوم غدا",
         ]
         sources = [
             ("Google News", "https://news.google.com/rss/search", lambda q: {"q": q, "hl": "ar", "gl": "SA", "ceid": "SA:ar"}),
             ("Bing News", "https://www.bing.com/news/search", lambda q: {"q": q, "format": "rss", "setlang": "ar-SA"}),
         ]
-        items, seen, errors = [], set(), []
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, MARKET_NEWS_LOOKBACK_HOURS))
+        items, seen = [], set()
         arabic_re = re.compile(r"[\u0600-\u06FF]")
 
         for source_name, url, params_fn in sources:
             for query in queries:
                 try:
-                    r = requests.get(
-                        url, params=params_fn(query), timeout=MARKET_NEWS_TIMEOUT_SECONDS,
-                        headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"},
-                    )
+                    r = requests.get(url, params=params_fn(query), timeout=MARKET_NEWS_TIMEOUT_SECONDS,
+                                     headers={"User-Agent": "Mozilla/5.0 MarketIntelligenceBot/1.0"})
                     r.raise_for_status()
                     root = ET.fromstring(r.content)
                     for node in root.findall(".//item"):
@@ -3865,61 +3889,38 @@ class TelegramCommands:
                             dt = dt.astimezone(timezone.utc)
                         except Exception:
                             continue
-                        if dt < cutoff:
+                        # Strict display window: Saudi today + tomorrow only.
+                        if not (start_utc <= dt <= end_utc):
                             continue
                         seen.add(title.lower())
-                        items.append({"title": title, "dt": dt, "source": source_name})
-                    if items:
-                        break
-                except Exception as exc:
-                    errors.append(f"{source_name}: {exc}")
+                        impact, explanation, risk_score = self._news_explanation(title)
+                        items.append({"title": title, "dt": dt, "source": source_name,
+                                      "impact": impact, "explanation": explanation, "risk_score": risk_score})
+                except Exception:
+                    continue
             if items:
                 break
 
-        high_terms = (
-            "اختراق", "هجوم", "إفلاس", "تصفية", "حظر", "طوارئ", "حرب", "رسوم جمركية",
-            "قرار الفائدة", "قرار الاحتياطي", "الفيدرالي", "التضخم", "مؤشر أسعار المستهلك",
-            "تقرير الوظائف", "الوظائف الأمريكية", "رفض الصندوق", "دعوى",
-        )
-        medium_terms = (
-            "الفائدة", "الاحتياطي الفيدرالي", "وظائف", "توظيف", "تنظيم", "هيئة الأوراق",
-            "صندوق متداول", "بينانس", "تدفقات خارجة", "بيع مكثف", "تقلب", "جيوسياسي",
-        )
-        positive_terms = ("موافقة", "تدفقات داخلة", "خفض الفائدة", "تبني", "طلب مؤسسي")
-
-        scored = []
-        for item in items:
-            low = item["title"].lower()
-            severity = 3 if any(k in low for k in high_terms) else 2 if any(k in low for k in medium_terms) else 1 if any(k in low for k in positive_terms) else 0
-            if severity:
-                scored.append((severity, item))
-        scored.sort(key=lambda x: (x[0], x[1]["dt"]), reverse=True)
-        selected = [x[1] for x in scored[:MARKET_NEWS_MAX_ITEMS]]
-        high_count = sum(1 for x in scored if x[0] >= 3)
-        med_count = sum(1 for x in scored if x[0] == 2)
-        if high_count:
-            risk, score = "مرتفع", 3
-        elif med_count >= 2:
-            risk, score = "متوسط", 2
-        elif med_count == 1 or selected:
-            risk, score = "منخفض", 1
-        else:
-            risk, score = "منخفض", 0
-
-        if items:
-            result = {"available": True, "risk": risk, "score": score, "items": selected,
-                      "reason": "" if selected else "لا توجد عناوين عالية التأثير ضمن الرصد الحالي"}
-            self._market_news_cache = (now, result)
+        items.sort(key=lambda x: (x.get("risk_score", 0), x["dt"]), reverse=True)
+        selected = items[:MARKET_NEWS_MAX_ITEMS]
+        score = max((int(x.get("risk_score", 0)) for x in selected), default=0)
+        risk = "مرتفع" if score >= 3 else "متوسط" if score == 2 else "منخفض"
+        if selected:
+            result = {"available": True, "risk": risk, "score": score, "items": selected, "reason": "",
+                      "today": today.isoformat(), "tomorrow": tomorrow.isoformat()}
+            self._market_news_cache = (now_ts, result)
             return result
-
-        # If providers fail, keep the last successful in-process snapshot instead of blocking /market.
         if cache and cache[1].get("available"):
-            stale = dict(cache[1])
-            stale["stale"] = True
-            stale["reason"] = "تعذر التحديث اللحظي؛ يتم عرض آخر أخبار موثوقة محفوظة"
-            return stale
+            # Do not show yesterday's cached headlines after the Saudi date changes.
+            cached = cache[1]
+            if cached.get("today") == today.isoformat():
+                stale = dict(cached)
+                stale["stale"] = True
+                stale["reason"] = "تعذر التحديث اللحظي؛ آخر رصد اليوم معروض مؤقتًا"
+                return stale
         return {"available": False, "risk": "غير متاح", "score": 0, "items": [],
-                "reason": "تعذر تحديث الأخبار حاليًا؛ لم تُحتسب الأخبار في القرار"}
+                "reason": "لا توجد أخبار مؤثرة منشورة اليوم أو غدًا في المصادر الحالية",
+                "today": today.isoformat(), "tomorrow": tomorrow.isoformat()}
 
     def _market_intelligence_text(self) -> str:
         try:
@@ -3940,69 +3941,59 @@ class TelegramCommands:
                 btc_label = "محايد 🟡"
 
             if dom is None:
-                dom_label = "غير متاحة ⚪"
-                alt_effect = "غير محسوم"
+                dom_label, alt_effect = "غير متاحة ⚪", "غير محسوم"
             elif dom_chg is not None and dom_chg > BTC_MAX_DOMINANCE_RISE_1H:
-                dom_label = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🔴"
-                alt_effect = "ضغط على Altcoins"
+                dom_label, alt_effect = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🔴", "ضغط على Altcoins"
             elif dom_chg is not None and dom_chg < -0.10:
-                dom_label = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🟢"
-                alt_effect = "داعم نسبيًا للـ Altcoins"
+                dom_label, alt_effect = f"{dom:.2f}% | 1H {dom_chg:+.2f} 🟢", "داعم نسبيًا للـ Altcoins"
             else:
-                dom_label = f"{dom:.2f}% | 1H {(dom_chg or 0):+.2f} 🟡"
-                alt_effect = "محايد"
+                dom_label, alt_effect = f"{dom:.2f}% | 1H {(dom_chg or 0):+.2f} 🟡", "محايد"
 
             news_score = int(news.get("score", 0) or 0)
             if news_score >= 3:
                 verdict = "🔴 تجنب فتح صفقات جديدة حاليًا"
-                why = "مخاطر الأخبار/الماكرو مرتفعة وقد تسبب حركة مفاجئة حتى لو كان الشارت جيدًا."
+                why = "يوجد خبر/حدث عالي الخطورة قد يسبب حركة مفاجئة في السوق."
             elif not market.market_safe:
                 verdict = "🔴 السوق غير مناسب للدخول حاليًا"
                 why = market.reason
             elif news_score == 2:
                 verdict = "🟡 الانتظار أفضل حاليًا"
-                why = "الوضع الفني مقبول، لكن الأخبار/الماكرو ترفع مخاطر التذبذب."
+                why = "الوضع الفني مقبول، لكن يوجد حدث اقتصادي/خبري قد يرفع التذبذب."
             elif market.score < MIN_MARKET_SCORE:
                 verdict = "🟡 دخول انتقائي فقط"
                 why = f"السوق آمن نسبيًا لكن Market Score ما زال {market.score:.1f}/100."
             else:
                 verdict = "🟢 السوق مناسب حاليًا للبحث عن فرص"
-                why = "BTC وBTC.D يسمحان نسبيًا، ولا توجد إشارة أخبار عالية المخاطر في الرصد الحالي."
+                why = "BTC وBTC.D يسمحان نسبيًا، ولا توجد مخاطرة خبرية قوية في رصد اليوم وبكرة."
 
             lines = [
                 "🌐 MARKET INTELLIGENCE", "",
-                "₿ Bitcoin",
-                f"• السعر: {market.btc_price:,.2f} USDT",
-                f"• الاتجاه: {btc_label}",
-                f"• قوة الاتجاه: {trend:.1f}/100",
-                f"• حركة 1H: {btc1h:+.2f}%", "",
-                "📊 BTC Dominance",
-                f"• الهيمنة: {dom_label}",
-                f"• التأثير على Altcoins: {alt_effect}", "",
-                "📰 News & Macro Risk",
-                f"• مستوى المخاطر: {news.get('risk','غير متاح')}",
+                "₿ Bitcoin", f"• السعر: {market.btc_price:,.2f} USDT", f"• الاتجاه: {btc_label}",
+                f"• قوة الاتجاه: {trend:.1f}/100", f"• حركة 1H: {btc1h:+.2f}%", "",
+                "📊 BTC Dominance", f"• الهيمنة: {dom_label}", f"• التأثير على Altcoins: {alt_effect}", "",
+                "📰 أخبار وأحداث السوق — اليوم وبكرة فقط",
             ]
             if news.get("items"):
                 saudi_tz = timezone(timedelta(hours=3))
-                for item in news["items"][:3]:
-                    title = item["title"]
-                    if len(title) > 125:
-                        title = title[:122] + "..."
+                current_day = None
+                for item in news["items"][:MARKET_NEWS_MAX_ITEMS]:
                     saudi_dt = item["dt"].astimezone(saudi_tz)
-                    saudi_time = saudi_dt.strftime("%Y-%m-%d %H:%M")
-                    lines.append(f"• {title} — {saudi_time} بتوقيت السعودية")
+                    day_key = saudi_dt.date()
+                    if day_key != current_day:
+                        label = "اليوم" if day_key == datetime.now(saudi_tz).date() else "بكرة"
+                        lines += ["", f"📅 {label} — {saudi_dt.strftime('%d/%m/%Y')}"]
+                        current_day = day_key
+                    title = item["title"] if len(item["title"]) <= 105 else item["title"][:102] + "..."
+                    lines += [f"{item.get('impact','⚪ محايد')} — {saudi_dt.strftime('%I:%M %p').replace('AM','ص').replace('PM','م')} 🇸🇦",
+                              f"• {title}", f"• ببساطة: {item.get('explanation','')}"]
+                lines += ["", f"🧠 الخلاصة الإخبارية: مخاطر {news.get('risk','غير متاح')}"]
             else:
-                lines.append(f"• {news.get('reason') or 'لا توجد عناوين مؤثرة حديثة في الرصد الحالي'}")
+                lines.append(f"• {news.get('reason') or 'لا توجد أخبار مؤثرة ضمن اليوم وبكرة'}")
 
             regime = "إيجابي" if market.market_safe and market.score >= MIN_MARKET_SCORE else ("حذر" if market.score >= 45 else "ضعيف")
-            lines += [
-                "", "🧭 Market Regime",
-                f"• قوة السوق: {market.score:.1f}/100",
-                f"• الحالة: {regime}",
-                f"• Market Safe: {'نعم ✅' if market.market_safe else 'لا ❌'}",
-                "", "🎯 قرار البوت", verdict, "", f"السبب: {why}",
-                "", "ℹ️ الأخبار طبقة مخاطر وليست إشارة شراء مستقلة. التقرير لا يفتح أو يغلق صفقة.",
-            ]
+            lines += ["", "🧭 Market Regime", f"• قوة السوق: {market.score:.1f}/100", f"• الحالة: {regime}",
+                      f"• Market Safe: {'نعم ✅' if market.market_safe else 'لا ❌'}", "", "🎯 قرار البوت", verdict, "", f"السبب: {why}",
+                      "", "ℹ️ الأخبار طبقة مخاطر وليست إشارة شراء مستقلة. التقرير لا يفتح أو يغلق صفقة."]
             return "\n".join(lines)
         except Exception as exc:
             return f"❌ تعذر إنشاء Market Intelligence: {exc}"
