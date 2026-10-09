@@ -2847,6 +2847,48 @@ class TelegramCommands:
             f"{trade_text}"
         )
 
+    def _balance_text(self) -> str:
+        """Paper cash and marked-to-market equity, including realized PnL."""
+        stats = self.db.trade_stats()
+        positions = self.broker.positions()
+        realized = float(stats["net_pnl"] or 0)
+        invested = sum(float(p["total_cost"] or 0) for p in positions)
+        cash = PAPER_BALANCE + realized - invested
+        floating = 0.0
+        missing = []
+        for position in positions:
+            symbol = str(position["symbol"])
+            try:
+                price = self.api.market_price(symbol)
+                floating += self.broker.pnl(position, price)
+            except Exception:
+                missing.append(symbol)
+
+        lines = [
+            "💰 رصيد المحفظة الوهمية (Paper Trading)",
+            "",
+            f"• رأس المال الابتدائي: {PAPER_BALANCE:,.2f} USDT",
+            f"• الرصيد النقدي المتاح: {cash:,.2f} USDT",
+            f"• المبلغ المستثمر حاليًا: {invested:,.2f} USDT",
+            f"• الأرباح المحققة: {realized:+,.2f} USDT",
+            f"• الصفقات المفتوحة: {len(positions)}/{MAX_OPEN_POSITIONS}",
+        ]
+        if missing:
+            lines += [
+                "• الأرباح/الخسائر العائمة: غير مكتملة (تعذر جلب بعض الأسعار)",
+                "• صافي قيمة المحفظة: غير متاح حتى تكتمل الأسعار",
+                f"• تعذر تسعير: {', '.join(missing)}",
+            ]
+        else:
+            equity = cash + invested + floating
+            lines += [
+                f"• الأرباح/الخسائر العائمة بعد رسوم البيع: {floating:+,.2f} USDT",
+                f"• صافي قيمة المحفظة: {equity:,.2f} USDT",
+                f"• صافي الربح/الخسارة الكلي: {equity - PAPER_BALANCE:+,.2f} USDT",
+            ]
+        lines.append("\nℹ️ القيم تقديرية على أسعار السوق الحالية وليست رصيدًا حقيقيًا.")
+        return "\n".join(lines)
+
     def _stats_text(self) -> str:
         row = self.db.trade_stats()
         positions = self.broker.positions()
@@ -4013,6 +4055,7 @@ class TelegramCommands:
                 "🤖 /status أو /الحالة — عرض حالة البوت والصفقة الحالية\n"
                 "📈 /trade أو /الصفقة — عرض حالة الصفقة الحالية\n"
                 "📊 /stats أو /الإحصائيات — عرض إحصائيات التداول والصفقة المفتوحة\n"
+                "💰 /balance أو /الرصيد — الرصيد المتاح وصافي قيمة المحفظة الوهمية\n"
                 "🌐 /market أو /السوق — Market Intelligence: BTC + BTC.D + الأخبار والمخاطر + قرار السوق\n"
                 "🧠 /learning [SYMBOLUSDT] — عرض ما تعلمه Learning V4 وتأثيره على الدخول\n"
                 "🔎 /scan أو /فحص — رادار مضاربة + تشخيص أسباب الرفض وأفضل المرشحين\n"
@@ -4029,6 +4072,8 @@ class TelegramCommands:
             self._reply(self._status_text())
         elif command in {"/stats", "/الإحصائيات"}:
             self._reply(self._stats_text())
+        elif command in {"/balance", "/الرصيد"}:
+            self._reply(self._balance_text())
         elif command in {"/market", "/السوق"}:
             self._reply(self._market_intelligence_text())
         elif command in {"/learning", "/تعلم"}:
