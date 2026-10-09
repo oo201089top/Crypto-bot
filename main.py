@@ -4,8 +4,8 @@ AI Spot Trader — Paper Trading V3
 
 مشروع مستقل عن بوت الإشارات:
 - تداول وهمي فقط.
-- رأس مال Paper إجمالي 10000 USDT.
-- حتى 10 صفقات مفتوحة بالتوازي.
+- رأس مال Paper إجمالي 30000 USDT.
+- حتى 30 صفقة مفتوحة بالتوازي.
 - لكل صفقة 1000 USDT كحد أقصى = 4 دفعات × 250 USDT.
 - الدخول الآلي Spot فقط؛ Binance Alpha Only مستبعدة من الصفقات مع بقاء التحليل اليدوي لها متاحًا.
 - حماية Unlock: منع الدخول عند وجود Cliff Unlock مؤكد خلال 7 أيام عبر Tokenomist.
@@ -49,8 +49,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/paper_trader.sqlite3")
 
-PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "10000"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "30000"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "30"))
 TRANCHE_SIZE = float(os.getenv("TRANCHE_SIZE", "250"))
 MAX_TRANCHES = int(os.getenv("MAX_TRANCHES", "4"))
 TARGET_NET_PROFIT = float(os.getenv("TARGET_NET_PROFIT", "10"))
